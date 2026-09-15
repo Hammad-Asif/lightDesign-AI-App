@@ -1,0 +1,14 @@
+import react from "@vitejs/plugin-react";
+import { defineConfig } from "vite";
+
+const api = { target: "http://127.0.0.1:8000", changeOrigin: true };
+
+export default defineConfig({
+  plugins: [react()],
+  server: {
+    port: 5173,
+    watch: { usePolling: true },
+    allowedHosts: true,
+    proxy: { "/auth": api, "/photos": api, "/files": api, "/health": api },
+  },
+});

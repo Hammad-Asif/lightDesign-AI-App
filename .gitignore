@@ -1,0 +1,20 @@
+.env
+storage/
+node_modules/
+dist/
+__pycache__/
+*.pyc
+.venv/
+.DS_Store
+tsconfig.tsbuildinfo
+
+# Claude Code session data
+.claude/
+
+# Test output and detection images
+detection-results/
+test-output/
+out/
+docs/
+CLAUDE.md
+Masking-Editor-Handbook.pdf

@@ -1,0 +1,255 @@
+import uuid
+
+import numpy as np
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+
+from app.config import get_settings
+from app.models import Region as RegionRow
+from app.providers.base import get_provider
+from app.schemas import CreateRegionRequest, DetectRequest, RefineRequest, Region, RegionPatch
+from app.services import detect, intent, occlusion, roofline
+from app.storage import Store, get_store, region_dict
+
+router = APIRouter(prefix="/photos/{photo_id}", tags=["regions"])
+
+SIDE_LABEL = {"front": "front", "left": "left side", "right": "right side"}
+EDGE_LABEL = {"eave": "Eave", "ridge": "Ridge"}
+
+
+def _blocks(kind: str) -> bool:
+    return kind in occlusion.BLOCKER_KINDS
+
+
+@router.post("/detect", response_model=list[Region])
+def run_detection(photo_id: str, body: DetectRequest, store: Store = Depends(get_store)):
+    photo = store.photo(photo_id)
+    image = store.load_image(photo)
+
+    parsed = intent.Intent()
+    if body.kinds:
+        selected = body.kinds
+    elif body.all_kinds:
+        selected = None
+    else:
+        parsed = intent.parse(photo.prompt)
+        selected = parsed.kinds or None
+
+    # This commit also closes the read transaction before the slow detection call.
+    store.update_photo(
+        photo,
+        interpreted={
+            "kinds": parsed.kinds,
+            "sides": parsed.sides,
+            "edges": parsed.edges,
+            "matched": parsed.matched,
+        },
+    )
+
+    small, _ = detect.working_copy(image, get_settings().detect_max_edge)
+    try:
+        detections = detect.run(small, get_provider(), selected)
+    except RuntimeError as exc:
+        raise HTTPException(503, str(exc))
+
+    for detection in detections:
+        detection.mask = detect.upscale_mask(detection.mask, image.size)
+
+    frame = (image.height, image.width)
+    blockers = occlusion.blocker_union([d.mask for d in detections if _blocks(d.kind)], frame)
+    fresh: list[RegionRow] = []
+
+    roof_masks = [d.mask for d in detections if d.kind == "roof"]
+    if roof_masks:
+        width = roof_masks[0].shape[1]
+        hybrid = get_settings().edge_extractor == "hybrid"
+        spans = roofline.dedupe(
+            [span for mask in roof_masks for span in roofline.plane_spans(mask, width, hybrid)],
+            width,
+        )
+        # A line a detected object splits in two is joined back up across that object.
+        spans = occlusion.bridge(spans, blockers, width)
+
+        if parsed.sides:
+            spans = [s for s in spans if s[1] in parsed.sides]
+        if parsed.edges:
+            spans = [s for s in spans if s[2] in parsed.edges]
+        for index, (polyline, side, edge) in enumerate(spans):
+            fresh.append(
+                RegionRow(
+                    kind="roof",
+                    label=f"{EDGE_LABEL[edge]} — {SIDE_LABEL[side]} {index + 1}",
+                    geometry="line",
+                    source="auto",
+                    color=detect.COLORS["roof"],
+                    score=0.5,
+                    visible=True,
+                    side=side,
+                    edge=edge,
+                    polyline=polyline,
+                    mask_url=None,
+                )
+            )
+
+    areas = [d for d in detections if d.kind != "roof"]
+    counts: dict[str, int] = {}
+    totals: dict[str, int] = {}
+    for item in areas:
+        totals[item.kind] = totals.get(item.kind, 0) + 1
+
+    for item in areas:
+        index = counts.get(item.kind, 0)
+        counts[item.kind] = index + 1
+        region_id = uuid.uuid4()
+        fresh.append(
+            RegionRow(
+                id=region_id,
+                kind=item.kind,
+                label=detect.label_for(item.kind, index, totals[item.kind]),
+                geometry="area",
+                source="auto",
+                color=detect.COLORS.get(item.kind, detect.COLORS["custom"]),
+                score=round(item.score, 3),
+                visible=True,
+                side=None,
+                edge=None,
+                polyline=None,
+                mask_url=store.write_mask(photo.id, region_id, item.mask),
+            )
+        )
+
+    store.replace_auto_regions(photo, fresh)
+    return [region_dict(region) for region in store.refresh_hidden(photo)]
+
+
+@router.post("/regions", response_model=Region)
+def create_region(photo_id: str, body: CreateRegionRequest, store: Store = Depends(get_store)):
+    photo = store.photo(photo_id)
+    if body.geometry == "line" and not body.polyline:
+        raise HTTPException(400, "A line region needs a polyline")
+
+    region = RegionRow(
+        id=uuid.uuid4(),
+        kind=body.kind,
+        label=body.label or detect.LABELS.get(body.kind, "Region"),
+        geometry=body.geometry,
+        source="manual",
+        color=body.color or detect.COLORS.get(body.kind, detect.COLORS["custom"]),
+        score=1.0,
+        visible=True,
+        side=body.side,
+        edge="eave" if body.geometry == "line" else None,
+        polyline=body.polyline,
+        mask_url=None,
+    )
+    if body.geometry == "area":
+        blank = np.zeros((photo.height, photo.width), dtype=bool)
+        region.mask_url = store.write_mask(photo.id, region.id, blank)
+
+    region = store.add_region(photo, region)
+    if region.geometry == "line" or _blocks(region.kind):
+        store.refresh_hidden(photo)
+    return region_dict(region)
+
+
+@router.patch("/regions/{region_id}", response_model=Region)
+def patch_region(
+    photo_id: str, region_id: str, body: RegionPatch, store: Store = Depends(get_store)
+):
+    photo = store.photo(photo_id)
+    region = store.region(photo, region_id, lock=True)
+
+    updates = body.model_dump(exclude_unset=True)
+    if "polyline" in updates and region.geometry != "line":
+        raise HTTPException(400, "Only line regions carry a polyline")
+    if "kind" in updates:
+        region.color = detect.COLORS.get(updates["kind"], detect.COLORS["custom"])
+    for name, value in updates.items():
+        setattr(region, name, value)
+
+    store.save()
+    if "polyline" in updates or "kind" in updates:
+        store.refresh_hidden(photo)
+    return region_dict(region)
+
+
+@router.put("/regions/{region_id}/mask", response_model=Region)
+def put_mask(
+    photo_id: str,
+    region_id: str,
+    file: UploadFile = File(...),
+    store: Store = Depends(get_store),
+):
+    photo = store.photo(photo_id)
+    region = store.region(photo, region_id, lock=True)
+    if region.geometry != "area":
+        raise HTTPException(400, "Only area regions carry a mask")
+
+    region.mask_url = store.write_mask_bytes(photo.id, region.id, file.file.read())
+    region.source = "manual"
+    store.save()
+    if _blocks(region.kind):
+        store.refresh_hidden(photo)
+    return region_dict(region)
+
+
+@router.post("/regions/refine", response_model=Region)
+def refine(photo_id: str, body: RefineRequest, store: Store = Depends(get_store)):
+    photo = store.photo(photo_id)
+    # Reject a bad target before the model call — every call to the hosted model is billed.
+    if body.region_id and store.region(photo, body.region_id).geometry != "area":
+        raise HTTPException(400, "Only area regions can be refined")
+
+    image = store.load_image(photo)
+    small, scale = detect.working_copy(image, get_settings().detect_max_edge)
+
+    if body.box is not None:
+        x0, y0, x1, y1 = (round(v / scale) for v in body.box)
+        if x1 <= x0 or y1 <= y0:
+            raise HTTPException(400, "Box must have positive width and height")
+        prompt = lambda provider: provider.segment_box(small, (x0, y0, x1, y1))  # noqa: E731
+    else:
+        point = tuple(round(v / scale) for v in body.point)
+        prompt = lambda provider: provider.segment_point(small, point)  # noqa: E731
+
+    store.release()
+    try:
+        mask = detect.upscale_mask(
+            detect.clean(prompt(get_provider()), small.width * small.height), image.size
+        )
+    except RuntimeError as exc:
+        raise HTTPException(503, str(exc))
+
+    if body.region_id:
+        region = store.region(photo, body.region_id, lock=True)
+        existing = store.read_mask(photo.id, region.id)
+        if existing is not None:
+            mask = np.logical_or(existing, mask)
+        region.mask_url = store.write_mask(photo.id, region.id, mask)
+        store.save()
+    else:
+        region = RegionRow(
+            id=uuid.uuid4(),
+            kind=body.kind,
+            label=detect.LABELS.get(body.kind, "Region"),
+            geometry="area",
+            source="auto",
+            color=detect.COLORS.get(body.kind, detect.COLORS["custom"]),
+            score=0.5,
+            visible=True,
+            side=None,
+            edge=None,
+            polyline=None,
+        )
+        region.mask_url = store.write_mask(photo.id, region.id, mask)
+        region = store.add_region(photo, region)
+
+    if _blocks(region.kind):
+        store.refresh_hidden(photo)
+    return region_dict(region)
+
+
+@router.delete("/regions/{region_id}", status_code=204)
+def delete_region(photo_id: str, region_id: str, store: Store = Depends(get_store)):
+    photo = store.photo(photo_id)
+    if _blocks(store.delete_region(photo, region_id).kind):
+        store.refresh_hidden(photo)
