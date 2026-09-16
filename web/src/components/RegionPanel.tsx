@@ -16,7 +16,7 @@ interface Props {
 }
 
 const SIDES: Side[] = ["front", "left", "right"];
-const EDGES: Edge[] = ["eave", "ridge", "rake", "unknown"];
+const EDGES: Edge[] = ["eave", "rake", "hip", "ridge", "junction", "unknown"];
 
 // Share of a line that passes behind objects, as a whole percentage.
 function hiddenShare(region: Region): number {
@@ -140,7 +140,7 @@ export function RegionPanel({
       )}
 
       {region.kind === "roof" && region.edge === "unknown" && (
-        <p className="small unknown-note">Edge type not identified. Choose eave, rake or ridge.</p>
+        <p className="small unknown-note">Edge type not identified. Choose eave, rake, hip or ridge.</p>
       )}
     </li>
   );

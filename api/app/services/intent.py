@@ -22,12 +22,41 @@ BOUNDARY_PHRASES = [
 ]
 
 SIDES = ["front", "left", "right"]
-EAVE_TERMS = ["eave", "fascia", "gutter", "roofline", "roof line", "roof edge"]
-# A gable front is lit along its rakes, the sloping edges, not along a ridge. "gable" used to
-# be a ridge term, which only worked while rakes were mislabelled "ridge"; once rakes carried
-# their own label it filtered every gable line out of a "light the gable" instruction.
-RAKE_TERMS = ["rake", "gable"]
-RIDGE_TERMS = ["ridge", "peak"]
+
+# What a customer means by "the roofline" or an unqualified "C9 on the roof": the whole
+# outline, eaves plus every sloped edge up to the peak, with the ridge left dark.
+OUTLINE_EDGES = ["eave", "rake", "hip"]
+OUTLINE_PATTERNS = [r"\broof ?lines?\b", r"\broof edges?\b", r"\boutline\b"]
+
+# Narrow phrasings keep their own meaning and are never widened to the outline. Whole words
+# only, so "leave" is not read as "eave". A gable front is lit along its rakes, the sloping
+# edges, not along a ridge: "gable" used to be a ridge term, which only worked while rakes
+# were mislabelled "ridge".
+EDGE_PATTERNS = {
+    "eave": [r"\beaves?\b", r"\bfascia\b", r"\bgutters?\b", r"\balong the bottom\b", r"\bbottom edges?\b"],
+    "rake": [r"\brakes?\b", r"\bgables?\b"],
+    "hip": [r"\bhips?\b"],
+    "ridge": [r"\bridges?\b", r"\bpeaks?\b", r"\balong the top\b", r"\btop edges?\b"],
+}
+EXCLUSIVE = r"\b(?:only|just)\b"
+
+
+def _edges(text: str, roof_requested: bool) -> list[str]:
+    """The roof edges an instruction asks for.
+
+    A narrow phrase on its own wins ("eaves only", "gutter line", "the ridge"). The outline
+    phrasing widens to eaves, rakes and hips and adds any other edge also named ("roofline
+    and the ridge"), unless "only" or "just" makes the narrow phrase exclusive. A roof
+    request that names no edge at all means the outline.
+    """
+    narrow = [edge for edge, patterns in EDGE_PATTERNS.items()
+              if any(re.search(pattern, text) for pattern in patterns)]
+    outline = any(re.search(pattern, text) for pattern in OUTLINE_PATTERNS)
+    if narrow and (not outline or re.search(EXCLUSIVE, text)):
+        return narrow
+    if outline:
+        return OUTLINE_EDGES + [edge for edge in narrow if edge not in OUTLINE_EDGES]
+    return list(OUTLINE_EDGES) if roof_requested else []
 
 
 @dataclass
@@ -67,15 +96,10 @@ def parse(prompt: str) -> Intent:
             kinds.append(kind)
 
     sides = [side for side in SIDES if re.search(rf"\b{side}\b", text)]
-    edges = []
-    if any(term in text for term in EAVE_TERMS):
-        edges.append("eave")
-    if any(term in text for term in RAKE_TERMS):
-        edges.append("rake")
-    if any(term in text for term in RIDGE_TERMS):
-        edges.append("ridge")
-
     ordered = [k for k in
                ["roof", "hedge", "shrub", "topiary", "palm_trunk", "palm_frond", "tree_canopy"]
                if k in kinds]
-    return Intent(kinds=ordered, sides=sides, edges=edges, matched=bool(ordered))
+    # Edges read from the scoped text, so a boundary like "the bottom of the fronds" is not
+    # taken for "along the bottom".
+    return Intent(kinds=ordered, sides=sides, edges=_edges(scoped, "roof" in ordered),
+                  matched=bool(ordered))

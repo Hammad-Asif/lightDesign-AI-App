@@ -113,8 +113,9 @@ def _gap_if_continues(
 def bridge(spans: list[tuple], blockers: np.ndarray | None, width: int) -> list[tuple]:
     """Join roofline pieces that continue behind a detected object.
 
-    `spans` are (points, side, edge). Pieces are joined end to end, shortest gap first; a
-    joined line is classified front/left/right afresh, the rest keep their side.
+    `spans` are (points, side, edge). Pieces are joined end to end, shortest gap first. A
+    joined line keeps its pieces' side when they agree — side belongs to the roof plane, not
+    to a line's slope — and is classified afresh only when they do not.
     """
     if blockers is None:
         return list(spans)
@@ -138,9 +139,10 @@ def bridge(spans: list[tuple], blockers: np.ndarray | None, width: int) -> list[
             break
 
         _, i, j = best
+        same = pieces[i]["side"] is not None and pieces[i]["side"] == pieces[j]["side"]
         joined = {
             "points": np.vstack([pieces[i]["points"], pieces[j]["points"]]),
-            "side": None,
+            "side": pieces[i]["side"] if same else None,
             "edge": pieces[i]["edge"],
             "joined": True,
         }
@@ -149,7 +151,7 @@ def bridge(spans: list[tuple], blockers: np.ndarray | None, width: int) -> list[
     return [
         (
             [[int(x), int(y)] for x, y in piece["points"]],
-            roofline._classify(piece["points"], width) if piece["joined"] else piece["side"],
+            piece["side"] if piece["side"] is not None else roofline._classify(piece["points"], width),
             piece["edge"],
         )
         for piece in pieces

@@ -28,7 +28,9 @@ Side = Literal["front", "left", "right"]
 # "rake" is the sloping edge of a gable end — lit like an eave, but not one, so it is not
 # folded into "ridge". "unknown" is emitted when adjacency cannot decide, rather than
 # fabricating a label the UI would present as fact.
-Edge = Literal["eave", "ridge", "rake", "unknown"]
+# "hip" is a sloping line where two roof planes meet; it is lit as part of the outline.
+# "junction" is where a lower roof runs into the wall above it: identified, and never lit.
+Edge = Literal["eave", "rake", "hip", "ridge", "junction", "unknown"]
 MaskingMode = Literal["manual", "automatic"]
 
 

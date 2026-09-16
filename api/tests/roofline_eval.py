@@ -19,8 +19,10 @@ import argparse
 import csv
 import json
 import os
+import re
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 
 API = Path(__file__).resolve().parents[1]
@@ -36,7 +38,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps  # noqa: E402
 import detect_eval as E  # noqa: E402  — reuses its cache, CachedFal and local-mask patch
 from app.config import get_settings  # noqa: E402
 from app.providers import prompts as P  # noqa: E402
-from app.services import detect, occlusion, roofline  # noqa: E402
+from app.services import detect, intent, occlusion, roofline  # noqa: E402
 
 OUT = REPO / "out" / "roofline-eval"
 OVERLAYS = OUT / "overlays"
@@ -424,6 +426,9 @@ def main() -> int:
     parser.add_argument("--context", action="store_true",
                         help=f"also prompt {CONTEXT_QUERIES} and label edges by adjacency "
                              f"(+{len(CONTEXT_QUERIES)} billed calls per photo)")
+    parser.add_argument("--prompt", action="append", default=[],
+                        help="apply /detect's instruction filters to the extracted spans and "
+                             "report what survives (repeatable; no extra calls)")
     args = parser.parse_args()
 
     folder = Path(args.photos).expanduser()
@@ -475,6 +480,8 @@ def main() -> int:
 
     write_csvs(results, per_photo)
     print_tables(results, per_photo, billed_total)
+    if args.prompt:
+        prompt_report(results, args.prompt)
     return 0
 
 
@@ -547,6 +554,68 @@ def write_csvs(results, per_photo):
                 sum(1 for p in r["plane_rows"] if p["path"] == "polygon"),
                 "", "", "", "", "", "", "", "", "",
             ])
+
+
+def _angle(points) -> float:
+    a, b = np.asarray(points[0], float), np.asarray(points[-1], float)
+    return float(np.degrees(np.arctan2(abs(b[1] - a[1]), max(abs(b[0] - a[0]), 1e-6))))
+
+
+def _short(name: str) -> str:
+    match = re.search(r"(\d+\.\d+\.\d+)", name)
+    return match.group(1) if match else name[:12]
+
+
+def prompt_report(results, prompts: list[str]):
+    """Which spans /detect's instruction filters keep, applied exactly as routers/regions.py
+    does: side first, then edge, with "unknown" edges kept for review. Measurement only."""
+    dump = {}
+    for prompt in prompts:
+        parsed = intent.parse(prompt)
+        print("\n" + "=" * 116)
+        print(f'PROMPT "{prompt}"   kinds={parsed.kinds}  sides={parsed.sides or "any"}  '
+              f'edges={parsed.edges or "any"}')
+        print("=" * 116)
+        print(f"{'photo':9s} {'spans':>5s} {'kept':>5s} | {'kept eave':>9s} {'rake':>5s} {'ridge':>6s} "
+              f"{'unk':>4s} | {'drop:side':>9s} {'drop:edge':>9s} | {'kept sloped':>11s} "
+              f"{'drop sloped':>11s} | {'kept off-mask':>13s}")
+        print("-" * 116)
+        dump[prompt] = {"sides": parsed.sides, "edges": parsed.edges, "photos": {}}
+        totals = Counter()
+        for r in results:
+            if not r["bridged"]:
+                continue
+            kept = Counter()
+            rows = []
+            for i, (points, side, edge) in enumerate(r["bridged"]):
+                side_ok = not parsed.sides or side in parsed.sides
+                edge_ok = not parsed.edges or edge in parsed.edges or edge == "unknown"
+                keep = side_ok and edge_ok
+                sloped = 15 <= _angle(points) <= 75
+                off = r["span_rows"][i]["on_roof_mask"] < ONMASK_LOW
+                kept["spans"] += 1
+                if keep:
+                    kept["kept"] += 1
+                    kept[f"kept_{edge}"] += 1
+                    kept["kept_sloped"] += sloped
+                    kept["kept_off"] += off
+                else:
+                    kept["drop_side" if not side_ok else "drop_edge"] += 1
+                    kept["drop_sloped"] += sloped
+                rows.append({"span": i, "side": side, "edge": edge, "angle": round(_angle(points), 1),
+                             "kept": keep, "dropped_by": None if keep else ("side" if not side_ok else "edge")})
+            totals.update(kept)
+            dump[prompt]["photos"][_short(r["photo"])] = rows
+            print(f"{_short(r['photo']):9s} {kept['spans']:>5d} {kept['kept']:>5d} | "
+                  f"{kept['kept_eave']:>9d} {kept['kept_rake']:>5d} {kept['kept_ridge']:>6d} "
+                  f"{kept['kept_unknown']:>4d} | {kept['drop_side']:>9d} {kept['drop_edge']:>9d} | "
+                  f"{kept['kept_sloped']:>11d} {kept['drop_sloped']:>11d} | {kept['kept_off']:>13d}")
+        print("-" * 116)
+        print(f"{'TOTAL':9s} {totals['spans']:>5d} {totals['kept']:>5d} | {totals['kept_eave']:>9d} "
+              f"{totals['kept_rake']:>5d} {totals['kept_ridge']:>6d} {totals['kept_unknown']:>4d} | "
+              f"{totals['drop_side']:>9d} {totals['drop_edge']:>9d} | {totals['kept_sloped']:>11d} "
+              f"{totals['drop_sloped']:>11d} | {totals['kept_off']:>13d}")
+    (OUT / "prompt_selection.json").write_text(json.dumps(dump, indent=1))
 
 
 def _counts(spans) -> dict:

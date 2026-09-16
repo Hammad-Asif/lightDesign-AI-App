@@ -5,6 +5,7 @@ import tempfile
 import uuid
 from pathlib import Path
 
+import cv2
 import numpy as np
 from fastapi.testclient import TestClient
 from PIL import Image
@@ -225,7 +226,7 @@ real = intent.parse(
 check("intent picks palm trunks and roof", real.kinds == ["roof", "palm_trunk"])
 check("intent excludes fronds used as a boundary", "palm_frond" not in real.kinds)
 check("intent picks front side only", real.sides == ["front"])
-check("intent picks the eave edge", real.edges == ["eave"])
+check("intent reads the entire front roofline as the full outline", real.edges == ["eave", "rake", "hip"])
 
 check("intent ignores unrelated prompt", intent.parse("make it look nice").matched is False)
 check("hedge prompt selects hedge only", intent.parse("mini lights in the hedges").kinds == ["hedge"])
@@ -233,6 +234,21 @@ check("gable maps to rake, not ridge", intent.parse("put C9 on the gable").edges
 check("rake is a roof term",
       intent.parse("C9 on the rakes").kinds == ["roof"] and intent.parse("C9 on the rakes").edges == ["rake"])
 check("ridge still maps to ridge", intent.parse("light the ridge").edges == ["ridge"])
+
+OUTLINE = ["eave", "rake", "hip"]
+for phrase in ("C9 on the roofline", "C9 on the roof", "outline the roof", "C9 along the roof line"):
+    check(f'"{phrase}" selects the full outline', intent.parse(phrase).edges == OUTLINE)
+for phrase, wanted in (
+    ("C9 on the eaves only", ["eave"]),
+    ("C9 along the gutter line", ["eave"]),
+    ("C9 along the bottom of the roof", ["eave"]),
+    ("C9 along the top of the roof", ["ridge"]),
+    ("C9 on the peak", ["ridge"]),
+):
+    check(f'"{phrase}" stays narrow ({"/".join(wanted)})', intent.parse(phrase).edges == wanted)
+check("roofline plus ridge adds the ridge to the outline",
+      intent.parse("C9 on the roofline and the ridge").edges == OUTLINE + ["ridge"])
+check('"leave" is not read as "eave"', "eave" not in intent.parse("leave the ridge dark").edges)
 
 intent_photo = client.post(
     "/photos",
@@ -266,6 +282,116 @@ check("a gable instruction keeps only rakes or edges it could not identify",
       bool(gable_lines) and all(r["edge"] in {"rake", "unknown"} for r in gable_lines))
 check("a ridge instruction no longer sweeps up rakes",
       not any(r["edge"] == "rake" for r in detected_lines("C9 along the ridge")))
+
+# Side belongs to the whole plane. A front gable's rakes slope left and right, but they are on
+# the front: a per-span slope test used to drop every one of them from "front roofline".
+front_gable = np.zeros((400, 800), dtype=bool)
+for x in range(100, 700):
+    front_gable[120 + abs(x - 400) // 3 : 300, x] = True
+check("a front gable plane faces the front", roofline.plane_side(front_gable, 800) == "front")
+gable_spans = roofline.plane_spans(front_gable, 800)
+check("every span on a front plane is front, rakes included",
+      {side for _, side, _ in gable_spans} == {"front"} and "rake" in {edge for *_, edge in gable_spans})
+
+bands = np.zeros((400, 800), dtype=bool)      # a gable masked only along its rakes
+for x in range(100, 700):
+    top = 120 + abs(x - 400) // 3
+    bands[top : top + 18, x] = True
+check("a gable masked only along its rakes still faces the front", roofline.plane_side(bands, 800) == "front")
+
+receding = np.zeros((400, 800), dtype=bool)   # a side plane in perspective: its eave climbs
+for x in range(40, 360):
+    receding[150 : 300 - (x - 40) // 3, x] = True
+check("a receding side plane keeps its own side", roofline.plane_side(receding, 800) in {"left", "right"})
+
+upper = np.zeros((400, 800), dtype=bool)
+lower = np.zeros((400, 800), dtype=bool)
+for x in range(100, 700):
+    border = 100 + (x - 100) // 2              # two planes meeting along a ~27 degree line
+    upper[60:border, x] = True
+    lower[border:360, x] = True
+corner = roofline.seam_ridges([upper, lower], 800)
+check("a sloping seam between two planes is a hip", bool(corner) and all(e == "hip" for *_, e in corner))
+
+# A lower roof whose top edges run up into the wall of the storey above has nothing to hang lights
+# on there. With sky above, the same edges are rakes and stay lit.
+lower_roof = np.zeros((400, 800), dtype=bool)
+for x in range(200, 600):
+    lower_roof[200 + abs(x - 400) // 3 : 330, x] = True
+storey_roof = np.zeros((400, 800), dtype=bool)
+storey_roof[120:190, 150:650] = True
+beside_roof = np.zeros((400, 800), dtype=bool)
+beside_roof[120:190, 620:780] = True
+abutting_roof = np.zeros((400, 800), dtype=bool)
+for x in range(200, 600):
+    abutting_roof[120 : 200 + abs(x - 400) // 3, x] = True
+
+
+def lower_edges(others: list[np.ndarray]) -> list[str]:
+    masks = [lower_roof] + others
+    planes = roofline.mark_junctions([roofline.plane_spans(m, 800) for m in masks], masks, 800)
+    return [edge for *_, edge in planes[0]]
+
+
+check("with sky above, a lower roof keeps its rakes",
+      "rake" in lower_edges([]) and "junction" not in lower_edges([]))
+check("under the wall of the storey above, its top edges are junctions",
+      "junction" in lower_edges([storey_roof]) and "rake" not in lower_edges([storey_roof]))
+check("a junction never takes the eave", lower_edges([storey_roof]).count("eave") == lower_edges([]).count("eave"))
+check("a roof beside it rather than above it changes nothing", lower_edges([beside_roof]) == lower_edges([]))
+check("a roof directly abutting above is a seam, not a junction", "junction" not in lower_edges([abutting_roof]))
+
+from app.routers.regions import roof_lines  # noqa: E402
+
+outline_lines = roof_lines([lower_roof, storey_roof], None, intent.parse("C9 on the roofline"), True)
+check("a roofline request leaves junctions dark", bool(outline_lines) and all(e != "junction" for *_, e in outline_lines))
+check("junctions are still returned when no edge is asked for",
+      "junction" in {e for *_, e in roof_lines([lower_roof, storey_roof], None, intent.Intent(), True)})
+
+# Simplifying an outline can cut straight across a concave edge. Such a side follows the mask.
+bowed = np.zeros((400, 800), dtype=bool)
+for x in range(100, 700):
+    bowed[150 : 300 - int(20 * (1 - ((x - 400) / 300) ** 2)), x] = True
+bowed_near = cv2.dilate(bowed.astype(np.uint8), np.ones((9, 9), np.uint8)).astype(bool)
+bowed_sides = roofline._polygon_spans(bowed, 800)
+check("an outline side that misses its plane is traced along the mask",
+      any(len(points) > 2 for points, *_ in bowed_sides)
+      and all(roofline._on_share(bowed_near, points) >= 0.9 for points, *_ in bowed_sides))
+check("a traced side keeps the corners it joins", [[100, 299], [699, 299]] == [
+    [points[0], points[-1]] for points, *_ in bowed_sides if len(points) > 2][0])
+check("sides already on the plane stay straight chords",
+      sum(len(points) == 2 for points, *_ in bowed_sides) == len(bowed_sides) - 1)
+
+
+def low_edge(degrees: float) -> set[str]:
+    plane = np.zeros((400, 800), dtype=bool)
+    for x in range(200, 600):
+        plane[100 : 250 + int((x - 200) * np.tan(np.radians(degrees))), x] = True
+    return {edge for points, _, edge in roofline.plane_spans(plane, 800) if points[0][1] > 200}
+
+
+check("a low edge tilted 12 degrees is an eave", low_edge(12) == {"eave"})
+check("a low edge tilted 20 degrees stays unidentified", low_edge(20) == {"unknown"})
+
+piece_a = ([[0, 0], [100, 0]], "front", "eave")
+piece_b = ([[100, 0], [200, 10]], "front", "eave")
+piece_c = ([[200, 10], [300, 60]], "front", "rake")
+piece_d = ([[300, 60], [400, 60]], "front", "rake")
+seam_line = ([[0, 100], [50, 150]], "front", "hip")
+joined_pieces = roofline.join_pieces([piece_a, piece_b, piece_c, piece_d, seam_line], [[piece_a, piece_b, piece_c], [piece_d]])
+check("pieces of one plane's edge that meet end to end become one line",
+      ([[0, 0], [100, 0], [200, 10]], "front", "eave") in joined_pieces)
+check("pieces are never joined across edge types or planes",
+      piece_c in joined_pieces and piece_d in joined_pieces and seam_line in joined_pieces and len(joined_pieces) == 4)
+check("plane-relative minimum length is staged off", roofline.PLANE_MIN_SPAN is False)
+
+front_lines = detected_lines("C9 on the front roofline")
+check("front roofline keeps the front plane's rakes as well as its eave",
+      {"eave", "rake"} <= {r["edge"] for r in front_lines})
+check("front roofline keeps only front spans",
+      bool(front_lines) and all(r["side"] == "front" for r in front_lines))
+check("front gable keeps the front plane's rakes",
+      any(r["edge"] == "rake" and r["side"] == "front" for r in detected_lines("put C9 on the front gable")))
 
 from app.providers.prompts import collapse_facade_boxes  # noqa: E402
 

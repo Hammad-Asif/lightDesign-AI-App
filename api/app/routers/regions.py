@@ -13,11 +13,44 @@ from app.storage import Store, get_store, region_dict
 router = APIRouter(prefix="/photos/{photo_id}", tags=["regions"])
 
 SIDE_LABEL = {"front": "front", "left": "left side", "right": "right side"}
-EDGE_LABEL = {"eave": "Eave", "ridge": "Ridge", "rake": "Rake", "unknown": "Unlabelled edge"}
+EDGE_LABEL = {
+    "eave": "Eave", "rake": "Rake", "hip": "Hip", "ridge": "Ridge", "junction": "Roof meets wall",
+    "unknown": "Unlabelled edge",
+}
 
 
 def _blocks(kind: str) -> bool:
     return kind in occlusion.BLOCKER_KINDS
+
+
+def roof_lines(
+    roof_masks: list[np.ndarray], blockers: np.ndarray | None, parsed: intent.Intent, hybrid: bool
+) -> list[tuple]:
+    """The roof lines detection returns for an instruction, as (polyline, side, edge)."""
+    width = roof_masks[0].shape[1]
+    planes = [roofline.plane_spans(mask, width, hybrid) for mask in roof_masks]
+    # A lower roof's top edge that runs into the wall of the storey above is not a rake.
+    planes = roofline.mark_junctions(planes, roof_masks, width)
+    spans = roofline.dedupe(
+        [span for spans in planes for span in spans]
+        # Ridges where two planes meet. Only abutting masks produce one; a plane whose own
+        # outline holds its ridge gets none, never a boundary segment called a ridge.
+        + roofline.seam_ridges(roof_masks, width),
+        width,
+    )
+    # Extraction splits an edge wherever it turns; a plane's pieces that meet end to end are rejoined.
+    spans = roofline.join_pieces(spans, planes)
+    # A line a detected object splits in two is joined back up across that object.
+    spans = occlusion.bridge(spans, blockers, width)
+
+    if parsed.sides:
+        spans = [s for s in spans if s[1] in parsed.sides]
+    if parsed.edges:
+        # "unknown" means the edge could not be identified, not that it was excluded. Keep
+        # it so the editor can flag it for review rather than silently drop a possible eave.
+        # A junction is identified — roof meeting wall — so an outline request leaves it dark.
+        spans = [s for s in spans if s[2] in parsed.edges or s[2] == "unknown"]
+    return spans
 
 
 @router.post("/detect", response_model=list[Region])
@@ -60,24 +93,7 @@ def run_detection(photo_id: str, body: DetectRequest, store: Store = Depends(get
 
     roof_masks = [d.mask for d in detections if d.kind == "roof"]
     if roof_masks:
-        width = roof_masks[0].shape[1]
-        hybrid = get_settings().edge_extractor == "hybrid"
-        spans = roofline.dedupe(
-            [span for mask in roof_masks for span in roofline.plane_spans(mask, width, hybrid)]
-            # Ridges where two planes meet. Only abutting masks produce one; a plane whose own
-            # outline holds its ridge gets none, never a boundary segment called a ridge.
-            + roofline.seam_ridges(roof_masks, width),
-            width,
-        )
-        # A line a detected object splits in two is joined back up across that object.
-        spans = occlusion.bridge(spans, blockers, width)
-
-        if parsed.sides:
-            spans = [s for s in spans if s[1] in parsed.sides]
-        if parsed.edges:
-            # "unknown" means the edge could not be identified, not that it was excluded. Keep
-            # it so the editor can flag it for review rather than silently drop a possible eave.
-            spans = [s for s in spans if s[2] in parsed.edges or s[2] == "unknown"]
+        spans = roof_lines(roof_masks, blockers, parsed, get_settings().edge_extractor == "hybrid")
         for index, (polyline, side, edge) in enumerate(spans):
             fresh.append(
                 RegionRow(

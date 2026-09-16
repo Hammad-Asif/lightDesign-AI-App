@@ -13,6 +13,18 @@ PROFILE_MIN_FRAC = 0.50
 POLY_EPSILON = 0.015
 POLY_MIN_LEN = 0.03
 
+# Simplifying the outline can cut a square corner with a diagonal across whatever stands
+# beside the plane — on the customer photo, across the stucco of an entry tower. A side that
+# mostly misses its own plane is traced along the mask outline between the same two corners.
+POLY_ON_MASK_MIN = 0.50
+POLY_ON_MASK_TOLERANCE = 4    # px; a straight chord along a jagged outline lands either side of it
+
+# Staged, off: minimum lengths measured against the plane's own width instead of the image's,
+# so a small plane or a piece between palm fronds is not dropped for being short next to the
+# whole photo. Recovers edges but adds short lines to clean up; not decided yet.
+PLANE_MIN_SPAN = False
+MIN_SPAN_FLOOR_PX = 40.0
+
 # Adjacency-based edge labelling. What sits just outside a plane's boundary says what that
 # boundary is: wall below it means an eave, sky beyond it means a ridge or a rake. Slope
 # alone cannot tell a rake from a ridge reliably, and it never distinguished either from an
@@ -20,6 +32,9 @@ POLY_MIN_LEN = 0.03
 OUTWARD_FRACTION = 0.012   # how far outside the plane to probe, as a share of image width
 ADJACENCY_MIN = 0.50       # share of probes that must agree before adjacency decides
 RIDGE_SLOPE_MAX = 0.18     # a sky-facing edge flatter than this, high on the plane, is a ridge
+# A low edge sloping less than this is an eave the camera angle tilted. Steeper, it could be
+# the foot of a rake, so it stays unidentified.
+EAVE_MAX_DEG = 15.0
 
 # A ridge or hip is where two planes MEET, so it only exists between two abutting masks.
 # Dilation grows each mask by kernel//2, so closing a gap of g needs a kernel of g+1.
@@ -30,9 +45,31 @@ SEAM_DILATE_FRACTION = 0.006
 SEAM_MAX_IOU = 0.10        # above this the two masks are duplicates, not neighbours
 SEAM_MIN_LEN = 0.03        # of image width
 
+# A seam sloping like a roof corner is a hip; a level one is a ridge. Steeper than HIP_MAX_DEG
+# it is a wall stepping between two roofs at different depths, not a roof line — measured, 3
+# such seams at 72-80 deg — so it stays "ridge" and an outline request leaves it dark.
+HIP_MIN_DEG = 15.0
+HIP_MAX_DEG = 60.0
+
+# A plane faces the front when its eave runs level. Checked two ways, because a gable front's
+# mask is often only the thin bands along its rakes: the chord between the lowest points at
+# the plane's two ends, or a level eave run covering this share of the plane's width.
+FRONT_EAVE_SHARE = 0.50
+
+# Roof-to-wall junctions. The slope rule calls every sloping top edge a rake, but a lower roof
+# whose top edge runs into the wall of the storey above has nothing there to hang lights on.
+# From the front the difference is what lies above the edge: sky above a real hip or rake;
+# above a junction, a band of wall and then the upper roof. Masks that overlap count as one
+# plane, or a plane's own duplicate would be read as the roof above it.
+JUNCTION_SNAP_FRACTION = 0.008   # of image width: how near a sample must be to its plane's top
+JUNCTION_GAP_FRACTION = 0.004    # of image width: wall needed between the edge and the roof above
+JUNCTION_REACH = 0.25            # of image height: how far up to look for that roof
+JUNCTION_MIN_SHARE = 0.50        # of the span's samples
+SAME_PLANE_CONTAINMENT = 0.50    # overlap as a share of the smaller mask
+
 # Which label survives when two near-duplicate spans disagree: a useful, known edge beats
 # an unknown one, so dedupe never drops a labelled span in favour of an unlabelled twin.
-EDGE_ORDER = {"eave": 0, "rake": 1, "ridge": 2, "unknown": 3}
+EDGE_ORDER = {"eave": 0, "rake": 1, "hip": 2, "ridge": 3, "junction": 4, "unknown": 5}
 
 
 def top_profile(mask: np.ndarray) -> np.ndarray:
@@ -122,7 +159,7 @@ def extract_spans(mask: np.ndarray, edge: str = "eave") -> list[tuple[list[list[
         return []
 
     height, width = mask.shape
-    minimum = MIN_SPAN_FRACTION * width
+    minimum = _minimum(MIN_SPAN_FRACTION, mask, width)
     result: list[tuple[list[list[int]], str]] = []
 
     for run in _runs(profile, width, height):
@@ -141,6 +178,59 @@ def _plane_width(mask: np.ndarray) -> int:
     return int(columns[-1] - columns[0] + 1) if columns.size else 0
 
 
+def _minimum(fraction: float, mask: np.ndarray, image_width: int) -> float:
+    """Shortest line kept: a share of the image width, or of the plane's width when staged."""
+    if PLANE_MIN_SPAN:
+        return max(MIN_SPAN_FLOOR_PX, fraction * _plane_width(mask))
+    return fraction * image_width
+
+
+def _along(points, step: float = 2.0) -> np.ndarray:
+    """Points every `step` pixels along a polyline, ends included."""
+    array = np.asarray(points, dtype=float)
+    coords = []
+    for a, b in zip(array[:-1], array[1:]):
+        length = float(np.linalg.norm(b - a))
+        for travelled in np.arange(0.0, length, step):
+            coords.append(a + (b - a) * (travelled / length))
+    coords.append(array[-1])
+    return np.asarray(coords)
+
+
+def _on_share(mask: np.ndarray, points) -> float:
+    height, width = mask.shape
+    coords = np.rint(_along(points)).astype(int)
+    xs = np.clip(coords[:, 0], 0, width - 1)
+    ys = np.clip(coords[:, 1], 0, height - 1)
+    return float(mask[ys, xs].mean())
+
+
+def _corner_positions(trace: np.ndarray, corners: np.ndarray) -> list[int]:
+    """Where each simplified corner sits on the full outline, in outline order.
+
+    Simplification keeps original outline points, so every corner is found exactly. An outline
+    can pass the same pixel twice where the mask is one pixel thin; the occurrence that follows
+    the previous corner is the one simplification kept.
+    """
+    positions: list[int] = []
+    for corner in corners:
+        matches = np.flatnonzero((trace == corner).all(axis=1))
+        if not positions:
+            positions.append(int(matches[0]))
+        else:
+            previous = positions[-1]
+            positions.append(int(min(matches, key=lambda i: (i - previous) % len(trace))))
+    return positions
+
+
+def _outline_between(trace: np.ndarray, start: int, end: int, image_width: int) -> list[list[int]]:
+    """The mask outline from one corner to the next, smoothed like a profile run."""
+    steps = (end - start) % len(trace)
+    path = trace[(start + np.arange(steps + 1)) % len(trace)]
+    epsilon = max(2.0, 0.004 * image_width)
+    return cv2.approxPolyDP(path.reshape(-1, 1, 2), epsilon, False).reshape(-1, 2).tolist()
+
+
 def _polygon_spans(mask: np.ndarray, image_width: int) -> list[tuple]:
     """Every side of the plane's outline, not just its top and bottom profiles."""
     contours, _ = cv2.findContours(
@@ -152,14 +242,25 @@ def _polygon_spans(mask: np.ndarray, image_width: int) -> list[tuple]:
     corners = cv2.approxPolyDP(
         outline, POLY_EPSILON * cv2.arcLength(outline, True), True
     ).reshape(-1, 2)
+    trace = outline.reshape(-1, 2)
+    positions = _corner_positions(trace, corners)
+    size = 2 * POLY_ON_MASK_TOLERANCE + 1
+    near = cv2.dilate(mask.astype(np.uint8), np.ones((size, size), np.uint8)).astype(bool)
+    minimum = _minimum(POLY_MIN_LEN, mask, image_width)
+
     # Side comes from the segment's own geometry and the edge type is decided later by
     # adjacency. Neither is stamped here: the old ("front", "eave") literal was fabricated
     # and every polygon-path span inherited it regardless of where it actually sat.
-    return [
-        ([a.tolist(), b.tolist()], _classify(np.stack([a, b]), image_width), "unknown")
-        for a, b in zip(corners, np.roll(corners, -1, axis=0))
-        if float(np.linalg.norm(b.astype(float) - a)) >= POLY_MIN_LEN * image_width
-    ]
+    spans = []
+    for index, (a, b) in enumerate(zip(corners, np.roll(corners, -1, axis=0))):
+        if float(np.linalg.norm(b.astype(float) - a)) < minimum:
+            continue
+        points = [a.tolist(), b.tolist()]
+        if _on_share(near, points) < POLY_ON_MASK_MIN:
+            following = positions[(index + 1) % len(corners)]
+            points = _outline_between(trace, positions[index], following, image_width)
+        spans.append((points, _classify(np.stack([a, b]), image_width), "unknown"))
+    return spans
 
 
 def _outward_probes(points, plane: np.ndarray, image_width: int) -> np.ndarray:
@@ -245,17 +346,45 @@ def _slope_edge(points, plane: np.ndarray) -> str:
     if rows.size == 0:
         return "unknown"
     high = float(array[:, 1].mean()) <= (float(rows[0]) + float(rows[-1])) / 2.0
-    if dy / max(dx, 1.0) >= RIDGE_SLOPE_MAX:
-        # A sloping edge high on the plane is a rake; lower down it is genuinely ambiguous.
-        return "rake" if high else "unknown"
+    slope = dy / max(dx, 1.0)
+    if slope >= RIDGE_SLOPE_MAX:
+        # A sloping edge high on the plane is a rake. Low on it, a gentle slope is an eave the
+        # camera angle tilted; anything steeper is genuinely ambiguous.
+        if high:
+            return "rake"
+        return "eave" if slope < np.tan(np.radians(EAVE_MAX_DEG)) else "unknown"
     return "ridge" if high else "eave"
 
 
+def plane_side(mask: np.ndarray, image_width: int) -> str:
+    """Which side of the house a whole roof plane faces.
+
+    Decided once per plane and shared by every span on it. A span-by-span slope test calls a
+    front gable's rakes "left" and "right" because they slope, so "front roofline" kept the
+    one level eave and dropped every sloped edge of the very plane the customer asked for.
+    """
+    profile = bottom_profile(mask)
+    if len(profile) < 2:
+        return "front"
+    ends = max(1, len(profile) // 20)
+    chord = np.stack([profile[:ends].mean(axis=0), profile[-ends:].mean(axis=0)])
+    if _classify(chord, image_width) == "front":
+        return "front"
+    eaves = [np.asarray(points) for points, _ in extract_spans(mask, "eave")]
+    if eaves:
+        longest = max(eaves, key=_length)
+        if (_classify(longest, image_width) == "front"
+                and _length(longest) >= FRONT_EAVE_SHARE * max(_plane_width(mask), 1)):
+            return "front"
+    return _classify(chord, image_width)
+
+
 def _label_spans(spans: list[tuple], plane: np.ndarray, context, image_width: int) -> list[tuple]:
-    """adjacency -> slope -> unknown. No label is kept that cannot be justified."""
+    """Side from the whole plane; edge by adjacency -> slope -> unknown."""
+    side = plane_side(plane, image_width)
     return [
         (points, side, _adjacent_edge(points, plane, context, image_width) or _slope_edge(points, plane))
-        for points, side, _ in spans
+        for points, _, _ in spans
     ]
 
 
@@ -264,13 +393,15 @@ def seam_ridges(masks: list[np.ndarray], image_width: int) -> list[tuple]:
 
     Only abutting pairs qualify. A mask whose own silhouette contains the apex holds its
     ridge in its interior, and no boundary segment of it is that ridge — those are left out
-    rather than manufactured.
+    rather than manufactured. A seam is a hip when it slopes like a roof corner and a ridge
+    when level (see HIP_MIN_DEG); its side comes from the planes it separates.
     """
     if len(masks) < 2:
         return []
     size = max(3, int(SEAM_DILATE_FRACTION * image_width)) | 1
     kernel = np.ones((size, size), np.uint8)
     grown = [cv2.dilate(mask.astype(np.uint8), kernel).astype(bool) for mask in masks]
+    sides: list[str | None] = [None] * len(masks)
 
     found: list[tuple] = []
     for i in range(len(masks)):
@@ -291,9 +422,21 @@ def seam_ridges(masks: list[np.ndarray], image_width: int) -> list[tuple]:
             if float(np.linalg.norm(end - start)) < SEAM_MIN_LEN * image_width:
                 continue
             span = np.stack([start, end])
+            slope = float(np.degrees(np.arctan2(abs(end[1] - start[1]), max(abs(end[0] - start[0]), 1e-6))))
+            edge = "hip" if HIP_MIN_DEG <= slope <= HIP_MAX_DEG else "ridge"
+            for k in (i, j):
+                if sides[k] is None:
+                    sides[k] = plane_side(masks[k], image_width)
+            # A seam bounds both planes. Front wins: in a front-view photo its hips and ridges
+            # belong to the face the customer is looking at.
+            if "front" in (sides[i], sides[j]):
+                side = "front"
+            elif sides[i] == sides[j]:
+                side = sides[i]
+            else:
+                side = _classify(span, image_width)
             found.append(
-                ([[int(start[0]), int(start[1])], [int(end[0]), int(end[1])]],
-                 _classify(span, image_width), "ridge")
+                ([[int(start[0]), int(start[1])], [int(end[0]), int(end[1])]], side, edge)
             )
     return found
 
@@ -324,6 +467,121 @@ def plane_spans(
     return _label_spans(_polygon_spans(mask, image_width), mask, context, image_width)
 
 
+def same_plane(index: int, masks: list[np.ndarray]) -> set[int]:
+    """The masks that are this plane: itself, its duplicates, and masks one holds inside the other."""
+    base = masks[index]
+    area = float(base.sum())
+    group = {index}
+    for other_index, other in enumerate(masks):
+        if other_index == index:
+            continue
+        shared = float((base & other).sum())
+        if not shared:
+            continue
+        if (shared / float((base | other).sum()) > SEAM_MAX_IOU
+                or shared / max(min(area, float(other.sum())), 1.0) > SAME_PLANE_CONTAINMENT):
+            group.add(other_index)
+    return group
+
+
+def junction_share(points, index: int, masks: list[np.ndarray], image_width: int) -> float:
+    """Share of a line's samples that sit on the plane's top edge with wall, then roof, above.
+
+    Looks straight up from the top of the plane (and its duplicates) in each sample's column.
+    A sample counts when another roof starts at least JUNCTION_GAP_FRACTION above that top and
+    within JUNCTION_REACH of it. Samples off the plane's top edge never count, so an eave with
+    the upper storey somewhere above it is not a junction.
+    """
+    group = same_plane(index, masks)
+    rest = [mask for k, mask in enumerate(masks) if k not in group]
+    if not rest:
+        return 0.0
+    plane = np.logical_or.reduce([masks[k] for k in group])
+    above = np.logical_or.reduce(rest)
+    height, width = plane.shape
+    tops = plane.argmax(axis=0)
+    filled = plane.any(axis=0)
+    snap = JUNCTION_SNAP_FRACTION * image_width
+    gap = JUNCTION_GAP_FRACTION * image_width
+    reach = int(JUNCTION_REACH * height)
+
+    samples = np.rint(_along(points)).astype(int)
+    hits = 0
+    for x, y in samples:
+        if not (0 <= x < width and 0 <= y < height) or not filled[x] or abs(int(tops[x]) - y) > snap:
+            continue
+        top = int(tops[x])
+        column = above[max(0, top - reach):top, x][::-1]
+        if column.any() and int(column.argmax()) >= gap:
+            hits += 1
+    return hits / len(samples)
+
+
+def mark_junctions(planes: list[list[tuple]], masks: list[np.ndarray], image_width: int) -> list[list[tuple]]:
+    """Relabel each plane's top-edge lines that run into a wall with roof above as "junction".
+
+    `planes[i]` holds the spans of `masks[i]`. Eaves are never tested: a junction is a top edge.
+    """
+    marked = []
+    for index, spans in enumerate(planes):
+        marked.append([
+            (points, side, "junction")
+            if edge != "eave" and junction_share(points, index, masks, image_width) >= JUNCTION_MIN_SHARE
+            else (points, side, edge)
+            for points, side, edge in spans
+        ])
+    return marked
+
+
+def _chain(first: list, second: list) -> list | None:
+    """One polyline from two that meet end to end, or None if no end meets another."""
+    if first[-1] == second[0]:
+        return first + second[1:]
+    if first[-1] == second[-1]:
+        return first + second[::-1][1:]
+    if first[0] == second[-1]:
+        return second + first[1:]
+    if first[0] == second[0]:
+        return second[::-1] + first[1:]
+    return None
+
+
+def _joinable(members: list[tuple]):
+    """The first two spans with the same side and edge that meet end to end, and their join."""
+    for i, first in enumerate(members):
+        for second in members[i + 1:]:
+            if first[1:] != second[1:]:
+                continue
+            # A closed outline has no free end left to extend.
+            if first[0][0] == first[0][-1] or second[0][0] == second[0][-1]:
+                continue
+            points = _chain(first[0], second[0])
+            if points is not None:
+                return first, second, points
+    return None
+
+
+def join_pieces(spans: list[tuple], planes: list[list[tuple]]) -> list[tuple]:
+    """Join pieces of one plane's edge that meet end to end into a single line.
+
+    Extraction splits an edge wherever it turns, so one hip or one eave arrives as several
+    panel entries. Only pieces of the same plane with the same side and edge type are joined,
+    and only where they share an exact endpoint; lines from no plane (seams) pass through.
+    `spans` must hold the very span objects in `planes` — what dedupe returns.
+    """
+    result = list(spans)
+    for plane in planes:
+        members = [span for span in result if any(span is own for own in plane)]
+        while (pair := _joinable(members)) is not None:
+            first, second, points = pair
+            if points[0][0] > points[-1][0]:
+                points = points[::-1]
+            joined = (points, first[1], first[2])
+            result = [joined if span is first else span for span in result if span is not second]
+            members = [joined if span is first else span for span in members if span is not second]
+    return result
+
+
 def _resample(points: list[list[int]], count: int = 12) -> np.ndarray:
     array = np.asarray(points, dtype=float)
     steps = np.linalg.norm(np.diff(array, axis=0), axis=1)
@@ -343,7 +601,7 @@ def dedupe(spans: list[tuple], width: int) -> list[tuple]:
     samples: list[np.ndarray] = []
     ordered = sorted(
         spans,
-        key=lambda item: (EDGE_ORDER.get(item[2], 3), -_length(np.asarray(item[0]))),
+        key=lambda item: (EDGE_ORDER.get(item[2], len(EDGE_ORDER)), -_length(np.asarray(item[0]))),
     )
     for span in ordered:
         sample = _resample(span[0])
