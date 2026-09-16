@@ -16,7 +16,7 @@ interface Props {
 }
 
 const SIDES: Side[] = ["front", "left", "right"];
-const EDGES: Edge[] = ["eave", "ridge"];
+const EDGES: Edge[] = ["eave", "ridge", "rake", "unknown"];
 
 // Share of a line that passes behind objects, as a whole percentage.
 function hiddenShare(region: Region): number {
@@ -128,8 +128,8 @@ export function RegionPanel({
           />
         )}
 
-        <span className="muted small">
-          {region.source === "auto" ? `auto · ${region.score.toFixed(2)}` : "manual"}
+        <span className="source">
+          {region.source === "auto" ? `auto ${Math.round(region.score * 100)}%` : "manual"}
         </span>
       </div>
 
@@ -138,23 +138,31 @@ export function RegionPanel({
           {hiddenShare(region)}% passes behind objects — no lights there
         </p>
       )}
+
+      {region.kind === "roof" && region.edge === "unknown" && (
+        <p className="small unknown-note">Edge type not identified. Choose eave, rake or ridge.</p>
+      )}
     </li>
   );
 
   return (
     <aside className="sidebar">
-      <h2>Lines · {lines.length}</h2>
+      <h2>
+        Lines <span className="count">{lines.length}</span>
+      </h2>
       {lines.length ? (
         <ul>{lines.map(row)}</ul>
       ) : (
-        <p className="muted small">None yet. Add one below and click along the path.</p>
+        <p className="muted small">Add one below, then click along the roofline to draw it.</p>
       )}
 
-      <h2>Areas · {areas.length}</h2>
+      <h2>
+        Areas <span className="count">{areas.length}</span>
+      </h2>
       {areas.length ? (
         <ul>{areas.map(row)}</ul>
       ) : (
-        <p className="muted small">None yet. Add one below and paint with the brush.</p>
+        <p className="muted small">Add one below, then paint it with the brush.</p>
       )}
 
       <h2>Add region</h2>

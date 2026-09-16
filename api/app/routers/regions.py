@@ -13,7 +13,7 @@ from app.storage import Store, get_store, region_dict
 router = APIRouter(prefix="/photos/{photo_id}", tags=["regions"])
 
 SIDE_LABEL = {"front": "front", "left": "left side", "right": "right side"}
-EDGE_LABEL = {"eave": "Eave", "ridge": "Ridge"}
+EDGE_LABEL = {"eave": "Eave", "ridge": "Ridge", "rake": "Rake", "unknown": "Unlabelled edge"}
 
 
 def _blocks(kind: str) -> bool:
@@ -63,7 +63,10 @@ def run_detection(photo_id: str, body: DetectRequest, store: Store = Depends(get
         width = roof_masks[0].shape[1]
         hybrid = get_settings().edge_extractor == "hybrid"
         spans = roofline.dedupe(
-            [span for mask in roof_masks for span in roofline.plane_spans(mask, width, hybrid)],
+            [span for mask in roof_masks for span in roofline.plane_spans(mask, width, hybrid)]
+            # Ridges where two planes meet. Only abutting masks produce one; a plane whose own
+            # outline holds its ridge gets none, never a boundary segment called a ridge.
+            + roofline.seam_ridges(roof_masks, width),
             width,
         )
         # A line a detected object splits in two is joined back up across that object.
@@ -72,7 +75,9 @@ def run_detection(photo_id: str, body: DetectRequest, store: Store = Depends(get
         if parsed.sides:
             spans = [s for s in spans if s[1] in parsed.sides]
         if parsed.edges:
-            spans = [s for s in spans if s[2] in parsed.edges]
+            # "unknown" means the edge could not be identified, not that it was excluded. Keep
+            # it so the editor can flag it for review rather than silently drop a possible eave.
+            spans = [s for s in spans if s[2] in parsed.edges or s[2] == "unknown"]
         for index, (polyline, side, edge) in enumerate(spans):
             fresh.append(
                 RegionRow(
@@ -137,7 +142,9 @@ def create_region(photo_id: str, body: CreateRegionRequest, store: Store = Depen
         score=1.0,
         visible=True,
         side=body.side,
-        edge="eave" if body.geometry == "line" else None,
+        # Eave, rake and ridge only mean something on a roof. A hand-drawn roofline is not known
+        # to be any of them, so say so; a driveway or fence line carries no edge type at all.
+        edge="unknown" if body.geometry == "line" and body.kind == "roof" else None,
         polyline=body.polyline,
         mask_url=None,
     )

@@ -35,12 +35,12 @@ export function Auth({ onSignedIn }: Props) {
   };
 
   return (
-    <form className="panel centered" onSubmit={submit}>
+    <form className="panel" onSubmit={submit}>
       <h1>{registering ? "Create your account" : "Sign in"}</h1>
-      <p className="muted">
+      <p className="lede">
         {registering
-          ? "Set up an account to start creating lighting mock-ups."
-          : "Sign in to your lighting mock-ups."}
+          ? "Your photos and designs stay private to your account."
+          : "Pick up where you left off."}
       </p>
 
       {registering && (
@@ -71,8 +71,8 @@ export function Auth({ onSignedIn }: Props) {
           required
           onChange={(event) => setPassword(event.target.value)}
         />
+        {registering && <span>At least 8 characters.</span>}
       </label>
-      {registering && <p className="muted small">At least 8 characters.</p>}
 
       {error && <p className="form-error">{error}</p>}
 

@@ -20,6 +20,8 @@ import {
 } from "./layers";
 
 const HISTORY_LIMIT = 20;
+// Halo under a roof line whose edge type could not be identified.
+const UNKNOWN_HALO = "rgba(244, 63, 94, 0.6)";
 
 export interface MaskCanvasHandle {
   undo: () => void;
@@ -51,6 +53,10 @@ type Snapshot =
 type Drag =
   | { mode: "stroke"; regionId: string; erase: boolean }
   | { mode: "vertex"; regionId: string; index: number }
+  | { mode: "translate"; regionId: string; start: number[]; origin: number[][] }
+  // Lengthening or shortening a run: the end slides along the line's own direction, so the
+  // line keeps its angle. `limit` stops the end being dragged back past its neighbour.
+  | { mode: "endpoint"; regionId: string; index: number; origin: number[][]; axis: number[]; limit: number }
   | { mode: "box"; start: number[] }
   | null;
 
@@ -130,15 +136,29 @@ export const MaskCanvas = forwardRef<MaskCanvasHandle, Props>(function MaskCanva
           : region.polyline;
       if (!points || points.length < 2) continue;
 
-      context.strokeStyle = region.color;
-      context.lineWidth = (isActive ? 4.5 : 2.5) / factor;
+      const trace = (path: number[][]) => {
+        context.beginPath();
+        path.forEach((p, i) => (i ? context.lineTo(p[0], p[1]) : context.moveTo(p[0], p[1])));
+      };
       context.lineJoin = "round";
       context.lineCap = "round";
-      context.beginPath();
-      points.forEach((p, i) =>
-        i ? context.lineTo(p[0], p[1]) : context.moveTo(p[0], p[1]),
-      );
+
+      // An edge we could not identify gets a warning halo and a dotted line, so it reads as
+      // "check this" at a glance rather than passing for a confirmed eave or rake.
+      const unidentified = region.kind === "roof" && region.edge === "unknown";
+      if (unidentified) {
+        context.strokeStyle = UNKNOWN_HALO;
+        context.lineWidth = (isActive ? 12 : 9) / factor;
+        trace(points);
+        context.stroke();
+        context.setLineDash([0.5 / factor, 7 / factor]);
+      }
+
+      context.strokeStyle = region.color;
+      context.lineWidth = (isActive ? 4.5 : 2.5) / factor;
+      trace(points);
       context.stroke();
+      context.setLineDash([]);
 
       // Stretches that pass behind an object are dashed. They are measured along the saved
       // line, so they are skipped while that line is being dragged.
@@ -422,6 +442,42 @@ export const MaskCanvas = forwardRef<MaskCanvasHandle, Props>(function MaskCanva
       return;
     }
 
+    if (region.geometry === "line" && tool === "move" && region.polyline && region.polyline.length >= 2) {
+      const hit = 12 / scale();
+      const points = region.polyline.map((p) => [...p]);
+      const last = points.length - 1;
+      const end = [0, last].find(
+        (i) => Math.hypot(points[i][0] - point[0], points[i][1] - point[1]) < hit * 1.6,
+      );
+      const onLine =
+        end === undefined &&
+        points.some(
+          (p, i) => i < last && distanceToSegment(point, p, points[i + 1]).distance < hit,
+        );
+      if (end === undefined && !onLine) return;
+
+      pushHistory(region.id, "poly");
+      const origin = points.map((p) => [...p]);
+      if (end !== undefined) {
+        const neighbour = points[end === 0 ? 1 : last - 1];
+        const away = [points[end][0] - neighbour[0], points[end][1] - neighbour[1]];
+        const length = Math.hypot(away[0], away[1]) || 1;
+        dragRef.current = {
+          mode: "endpoint",
+          regionId: region.id,
+          index: end,
+          origin,
+          axis: [away[0] / length, away[1] / length],
+          limit: -(length - 4),
+        };
+      } else {
+        dragRef.current = { mode: "translate", regionId: region.id, start: point, origin };
+      }
+      draftRef.current = { regionId: region.id, polyline: points };
+      requestDraw();
+      return;
+    }
+
     if (region.geometry === "line" && tool === "vertex" && region.polyline) {
       const hit = 10 / scale();
       const points = region.polyline.map((p) => [...p]);
@@ -462,6 +518,25 @@ export const MaskCanvas = forwardRef<MaskCanvasHandle, Props>(function MaskCanva
     if (drag?.mode === "stroke") paint(point, drag.erase);
     else if (drag?.mode === "vertex" && draftRef.current) {
       draftRef.current.polyline[drag.index] = [Math.round(point[0]), Math.round(point[1])];
+    } else if (drag?.mode === "translate" && draftRef.current) {
+      const dx = point[0] - drag.start[0];
+      const dy = point[1] - drag.start[1];
+      draftRef.current.polyline = drag.origin.map(([x, y]) => [
+        Math.round(x + dx),
+        Math.round(y + dy),
+      ]);
+    } else if (drag?.mode === "endpoint" && draftRef.current) {
+      const anchor = drag.origin[drag.index];
+      const travel = Math.max(
+        (point[0] - anchor[0]) * drag.axis[0] + (point[1] - anchor[1]) * drag.axis[1],
+        drag.limit,
+      );
+      const moved = drag.origin.map((p) => [...p]);
+      moved[drag.index] = [
+        Math.round(anchor[0] + drag.axis[0] * travel),
+        Math.round(anchor[1] + drag.axis[1] * travel),
+      ];
+      draftRef.current.polyline = moved;
     } else if (drag?.mode === "box") {
       boxRef.current = [
         Math.min(drag.start[0], point[0]),
@@ -479,7 +554,10 @@ export const MaskCanvas = forwardRef<MaskCanvasHandle, Props>(function MaskCanva
     event.currentTarget.releasePointerCapture(event.pointerId);
 
     if (drag?.mode === "stroke") void commitMask(drag.regionId);
-    else if (drag?.mode === "vertex" && draftRef.current) {
+    else if (
+      (drag?.mode === "vertex" || drag?.mode === "translate" || drag?.mode === "endpoint") &&
+      draftRef.current
+    ) {
       onPolylineCommit(drag.regionId, draftRef.current.polyline);
       draftRef.current = null;
     } else if (drag?.mode === "box" && boxRef.current) {

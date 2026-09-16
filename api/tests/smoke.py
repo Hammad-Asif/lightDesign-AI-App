@@ -229,6 +229,10 @@ check("intent picks the eave edge", real.edges == ["eave"])
 
 check("intent ignores unrelated prompt", intent.parse("make it look nice").matched is False)
 check("hedge prompt selects hedge only", intent.parse("mini lights in the hedges").kinds == ["hedge"])
+check("gable maps to rake, not ridge", intent.parse("put C9 on the gable").edges == ["rake"])
+check("rake is a roof term",
+      intent.parse("C9 on the rakes").kinds == ["roof"] and intent.parse("C9 on the rakes").edges == ["rake"])
+check("ridge still maps to ridge", intent.parse("light the ridge").edges == ["ridge"])
 
 intent_photo = client.post(
     "/photos",
@@ -245,6 +249,23 @@ check("detect keeps front spans only", all(
 everything = client.post(f"/photos/{intent_photo}/detect", json={"all_kinds": True}).json()
 check("all_kinds escape hatch still returns everything",
       len({r["kind"] for r in everything}) > len(scoped_kinds))
+
+# Rakes carry their own label, so an instruction naming the gable must keep them through the
+# edge filter. "gable" used to map to ridge, which silently returned no gable lines at all.
+def detected_lines(prompt: str) -> list[dict]:
+    photo = client.post(
+        "/photos", files={"file": ("h.png", sample_photo(), "image/png")}, data={"prompt": prompt}
+    ).json()["id"]
+    return [r for r in client.post(f"/photos/{photo}/detect", json={"kinds": None}).json()
+            if r["geometry"] == "line"]
+
+
+gable_lines = detected_lines("put C9 on the gable")
+check("a gable instruction keeps the rake spans", any(r["edge"] == "rake" for r in gable_lines))
+check("a gable instruction keeps only rakes or edges it could not identify",
+      bool(gable_lines) and all(r["edge"] in {"rake", "unknown"} for r in gable_lines))
+check("a ridge instruction no longer sweeps up rakes",
+      not any(r["edge"] == "rake" for r in detected_lines("C9 along the ridge")))
 
 from app.providers.prompts import collapse_facade_boxes  # noqa: E402
 

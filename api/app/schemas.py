@@ -25,7 +25,10 @@ RegionKind = Literal[
 ]
 GeometryType = Literal["line", "area"]
 Side = Literal["front", "left", "right"]
-Edge = Literal["eave", "ridge"]
+# "rake" is the sloping edge of a gable end — lit like an eave, but not one, so it is not
+# folded into "ridge". "unknown" is emitted when adjacency cannot decide, rather than
+# fabricating a label the UI would present as fact.
+Edge = Literal["eave", "ridge", "rake", "unknown"]
 MaskingMode = Literal["manual", "automatic"]
 
 

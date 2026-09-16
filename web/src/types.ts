@@ -19,9 +19,9 @@ export type RegionKind =
 
 export type Geometry = "line" | "area";
 export type Side = "front" | "left" | "right";
-export type Edge = "eave" | "ridge";
+export type Edge = "eave" | "ridge" | "rake" | "unknown";
 export type MaskingMode = "manual" | "automatic";
-export type Tool = "brush" | "erase" | "vertex" | "box" | "line" | "click";
+export type Tool = "brush" | "erase" | "vertex" | "move" | "box" | "line" | "click";
 
 export interface Region {
   id: string;

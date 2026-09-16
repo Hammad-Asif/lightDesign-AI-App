@@ -4,6 +4,7 @@ import * as api from "./api";
 import { MaskCanvas, type MaskCanvasHandle } from "./canvas/MaskCanvas";
 import { Auth } from "./components/Auth";
 import { ModeChooser } from "./components/ModeChooser";
+import { ThemeToggle, type Theme } from "./components/ThemeToggle";
 import { RegionPanel } from "./components/RegionPanel";
 import { Toolbar } from "./components/Toolbar";
 import { Upload } from "./components/Upload";
@@ -13,6 +14,10 @@ import type { MaskingMode, PhotoDetail, Region, RegionKind, Tool, User } from ".
 export default function App() {
   const [user, setUser] = useState<User | null>(null);
   const [checkingSession, setCheckingSession] = useState(true);
+  // index.html picks the first theme before paint; this keeps it in step after that.
+  const [theme, setTheme] = useState<Theme>(
+    () => (document.documentElement.dataset.theme as Theme) || "light",
+  );
   const [photo, setPhoto] = useState<PhotoDetail | null>(null);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [tool, setTool] = useState<Tool>("brush");
@@ -24,6 +29,15 @@ export default function App() {
   const [drawingKind, setDrawingKind] = useState<RegionKind | null>(null);
 
   const canvasRef = useRef<MaskCanvasHandle>(null);
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    try {
+      localStorage.setItem("ld-theme", theme);
+    } catch {
+      // A browser with storage blocked still gets the theme, just not remembered.
+    }
+  }, [theme]);
 
   useEffect(() => {
     api
@@ -236,9 +250,11 @@ export default function App() {
         event.shiftKey ? canvasRef.current?.redo() : canvasRef.current?.undo();
         return;
       }
-      if (event.key === "b") setTool("brush");
-      if (event.key === "e") setTool("erase");
-      if (event.key === "v") setTool("vertex");
+      // chooseTool, not setTool: it also clears a half-drawn line, which setTool left stranded.
+      if (event.key === "b") chooseTool("brush");
+      if (event.key === "e") chooseTool("erase");
+      if (event.key === "v") chooseTool("vertex");
+      if (event.key === "m") chooseTool("move");
       if (event.key === "[") setBrushSize((size) => Math.max(4, size - 6));
       if (event.key === "]") setBrushSize((size) => Math.min(200, size + 6));
     };
@@ -250,8 +266,9 @@ export default function App() {
 
   useEffect(() => {
     if (!active || drawingKind) return;
-    if (active.geometry === "line" && tool !== "vertex" && tool !== "box") setTool("vertex");
-    if (active.geometry === "area" && tool === "vertex") setTool("brush");
+    if (active.geometry === "line" && tool !== "vertex" && tool !== "move" && tool !== "box")
+      setTool("vertex");
+    if (active.geometry === "area" && (tool === "vertex" || tool === "move")) setTool("brush");
   }, [activeId]);
 
   if (checkingSession) return <div className="app" />;
@@ -259,7 +276,14 @@ export default function App() {
   if (!user) {
     return (
       <div className="app">
-        <Auth onSignedIn={setUser} />
+        <div className="topbar">
+          <span className="brand">Light Design</span>
+          <div className="spacer" />
+          <ThemeToggle theme={theme} onChange={setTheme} />
+        </div>
+        <main className="entry">
+          <Auth onSignedIn={setUser} />
+        </main>
       </div>
     );
   }
@@ -273,29 +297,41 @@ export default function App() {
       )}
 
       {!(photo && photo.mode) && (
-        <div className="account-bar">
-          <span className="muted small">{user.email}</span>
-          <button onClick={handleSignOut}>Sign out</button>
-        </div>
+        <>
+          <div className="account-bar">
+            <span className="brand">Light Design</span>
+            <div className="spacer" />
+            <span className="muted small">{user.email}</span>
+            <ThemeToggle theme={theme} onChange={setTheme} />
+            <button onClick={handleSignOut}>Sign out</button>
+          </div>
+          <main className="entry">
+            {photo ? (
+              <ModeChooser busy={busy} onChoose={handleMode} />
+            ) : (
+              <Upload busy={busy} onSubmit={handleUpload} />
+            )}
+          </main>
+        </>
       )}
-
-      {!photo && <Upload busy={busy} onSubmit={handleUpload} />}
-
-      {photo && !photo.mode && <ModeChooser busy={busy} onChoose={handleMode} />}
 
       {photo && photo.mode && (
         <div className="workspace">
           <header className="header">
-            <div>
-              <strong>Approved mask set</strong>
+            <div className="header-title">
+              <strong>Light Design</strong>
               {photo.approved ? (
-                <span className="badge ok">locked · {photo.regions.length} regions</span>
+                <span className="badge ok">Locked</span>
               ) : (
-                <span className="badge">draft · {photo.regions.length} regions</span>
+                <span className="badge">Draft</span>
               )}
+              <span className="muted small">
+                {photo.regions.length} {photo.regions.length === 1 ? "region" : "regions"}
+              </span>
             </div>
             <div className="header-actions">
               <span className="muted small">{user.email}</span>
+              <ThemeToggle theme={theme} onChange={setTheme} />
               {photo.approved && <button onClick={handleReopen}>Reopen for correction</button>}
               <button
                 onClick={() => {

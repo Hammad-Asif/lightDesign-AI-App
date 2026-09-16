@@ -2,7 +2,7 @@ import re
 from dataclasses import dataclass, field
 
 KIND_TERMS: dict[str, list[str]] = {
-    "roof": ["roofline", "roof line", "roof", "eave", "fascia", "gutter", "gable", "ridge", "peak"],
+    "roof": ["roofline", "roof line", "roof", "eave", "fascia", "gutter", "gable", "rake", "ridge", "peak"],
     "hedge": ["hedge"],
     "shrub": ["shrub", "bush"],
     "topiary": ["topiary", "topiaries"],
@@ -23,7 +23,11 @@ BOUNDARY_PHRASES = [
 
 SIDES = ["front", "left", "right"]
 EAVE_TERMS = ["eave", "fascia", "gutter", "roofline", "roof line", "roof edge"]
-RIDGE_TERMS = ["ridge", "peak", "gable"]
+# A gable front is lit along its rakes, the sloping edges, not along a ridge. "gable" used to
+# be a ridge term, which only worked while rakes were mislabelled "ridge"; once rakes carried
+# their own label it filtered every gable line out of a "light the gable" instruction.
+RAKE_TERMS = ["rake", "gable"]
+RIDGE_TERMS = ["ridge", "peak"]
 
 
 @dataclass
@@ -66,6 +70,8 @@ def parse(prompt: str) -> Intent:
     edges = []
     if any(term in text for term in EAVE_TERMS):
         edges.append("eave")
+    if any(term in text for term in RAKE_TERMS):
+        edges.append("rake")
     if any(term in text for term in RIDGE_TERMS):
         edges.append("ridge")
 

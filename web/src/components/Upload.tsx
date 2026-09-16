@@ -10,9 +10,9 @@ export function Upload({ busy, onSubmit }: Props) {
   const [prompt, setPrompt] = useState("");
 
   return (
-    <div className="panel centered">
+    <div className="panel">
       <h1>New mock-up</h1>
-      <p className="muted">Upload the customer photo and describe the lighting.</p>
+      <p className="lede">Start with a daytime photo of the house, taken before any lights go up.</p>
 
       <label className="dropzone">
         <input
@@ -23,15 +23,16 @@ export function Upload({ busy, onSubmit }: Props) {
         <span>{file ? file.name : "Choose a photo (JPG, PNG or WEBP)"}</span>
       </label>
 
-      <textarea
-        rows={4}
-        value={prompt}
-        placeholder="e.g. C9 warm white on the front roofline at 12 inch spacing, mini lights in the hedges"
-        onChange={(event) => setPrompt(event.target.value)}
-      />
-      <p className="muted small">
-        The instruction is stored now and interpreted in Milestone 2.
-      </p>
+      <label className="field">
+        <span>Where do the lights go?</span>
+        <textarea
+          rows={4}
+          value={prompt}
+          placeholder="C9 warm white on the front roofline at 12 inch spacing, mini lights in the hedges"
+          onChange={(event) => setPrompt(event.target.value)}
+        />
+        <span>Only the areas you mention get masked. You can change any of them afterwards.</span>
+      </label>
 
       <button className="primary" disabled={!file || busy} onClick={() => file && onSubmit(file, prompt)}>
         {busy ? "Uploading…" : "Continue"}

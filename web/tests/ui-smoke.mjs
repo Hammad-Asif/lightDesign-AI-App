@@ -136,7 +136,9 @@ check("roofline side set to front", (await sideSelect.inputValue()) === "front")
 
 await page.getByRole("button", { name: "Approve mask set" }).click();
 await page.waitForSelector(".badge.ok", { timeout: 10000 });
-check("mask set locks on approve", (await page.locator(".badge.ok").innerText()).includes("locked"));
+// Case-insensitive: the badge reads "Locked"; what matters is that it locks.
+check("mask set locks on approve",
+  (await page.locator(".badge.ok").innerText()).toLowerCase().includes("locked"));
 await page.screenshot({ path: `${OUT}/05-approved.png` });
 
 check("no console errors", errors.length === 0);

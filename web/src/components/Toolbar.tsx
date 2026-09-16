@@ -20,6 +20,7 @@ const TOOLS: { id: Tool; label: string; hint: string }[] = [
   { id: "brush", label: "Brush", hint: "Add to the selected area mask" },
   { id: "erase", label: "Erase", hint: "Remove from the selected area mask" },
   { id: "vertex", label: "Vertices", hint: "Drag roofline points, click a segment to add, alt-click to delete" },
+  { id: "move", label: "Move / extend", hint: "Drag a line to move it whole, or drag either end to lengthen or shorten it" },
   { id: "box", label: "Re-segment", hint: "Drag a box to re-run segmentation on that area" },
   { id: "click", label: "Click object", hint: "Click an object to mask it, alt-click a mask to remove it" },
 ];
@@ -46,7 +47,7 @@ export function Toolbar({
       <div className="tools">
         {TOOLS.map((item) => {
           const disabled =
-            (item.id === "vertex" && !isLine) ||
+            ((item.id === "vertex" || item.id === "move") && !isLine) ||
             ((item.id === "brush" || item.id === "erase") && active?.geometry !== "area");
           return (
             <button

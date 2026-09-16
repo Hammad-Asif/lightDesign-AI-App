@@ -1,3 +1,9 @@
+"""Standalone scorer: measures any set of roofline polylines against the annotations.
+
+Independent of the detection pipeline, so it can compare different detector builds.
+
+    from tests.score import load_targets, score, PAIRS
+"""
 import re
 from pathlib import Path
 
