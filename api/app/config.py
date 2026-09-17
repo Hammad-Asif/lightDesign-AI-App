@@ -42,6 +42,18 @@ class Settings(BaseSettings):
     # the top/bottom-profile-only behaviour exactly, without a code rollback.
     edge_extractor: str = "hybrid"
 
+    # Move each extracted roof line onto the image edge it follows (services/snap.py). Measured
+    # on the annotated houses: mean F1 49.6 -> 54.8, and a drawn line sits 3.1px from the true
+    # gutter instead of 4.8px. Set false to keep lines exactly where the mask put them.
+    snap_to_edges: bool = True
+
+    # Off: draw hips that fall inside a single mask, where two roof planes came back merged and
+    # no mask boundary runs along the line between them. The candidates are real geometry (apex
+    # to eave corner) but the photo does not confirm them: measured on the eval set, every
+    # candidate sat on image evidence weaker than the lines we already draw, so none survive the
+    # check and turning this on would mean drawing them on shape alone. See services/roofline.py.
+    interior_hips: bool = False
+
     google_api_key: str = ""
     gemini_model: str = "gemini-2.5-flash-image"
 

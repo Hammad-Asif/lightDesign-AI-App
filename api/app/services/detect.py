@@ -12,6 +12,7 @@ DEFAULT_KINDS = [
     "shrub",
     "topiary",
     "palm_trunk",
+    "palm_collar",
     "palm_frond",
     "tree_canopy",
 ]
@@ -30,6 +31,7 @@ COLORS = {
     "shrub": "#84cc16",
     "topiary": "#14b8a6",
     "palm_trunk": "#f59e0b",
+    "palm_collar": "#e11d48",
     "palm_frond": "#a3e635",
     "tree_canopy": "#059669",
     "obstruction": "#94a3b8",
@@ -50,6 +52,7 @@ LABELS = {
     "shrub": "Shrub",
     "topiary": "Topiary",
     "palm_trunk": "Palm trunk",
+    "palm_collar": "Palm collar",
     "palm_frond": "Palm fronds",
     "tree_canopy": "Tree canopy",
     "obstruction": "Obstruction",
@@ -87,17 +90,12 @@ def expand_palms(detections: list[Detection]) -> list[Detection]:
         parts = palm.split(item.mask, item.box)
         if parts is None:
             continue
-        trunk, frond = parts
-        if trunk.any():
-            result.append(
-                Detection(kind="palm_trunk", label="palm trunk", mask=trunk,
-                          score=item.score, box=item.box)
-            )
-        if frond.any():
-            result.append(
-                Detection(kind="palm_frond", label="palm fronds", mask=frond,
-                          score=item.score, box=item.box)
-            )
+        # Three zones lit independently: a warm white trunk, a red collar, green fronds.
+        for kind, label, mask in zip(
+            ("palm_trunk", "palm_collar", "palm_frond"), ("palm trunk", "palm collar", "palm fronds"), parts
+        ):
+            if mask.any():
+                result.append(Detection(kind=kind, label=label, mask=mask, score=item.score, box=item.box))
     return result
 
 
@@ -115,11 +113,17 @@ def upscale_mask(mask: np.ndarray, size: tuple[int, int]) -> np.ndarray:
     return cv2.resize(mask.astype(np.uint8), size, interpolation=cv2.INTER_NEAREST).astype(bool)
 
 
+# What can stand between the camera and a roofline. Asked for alongside any roof request, so a
+# line that disappears behind a palm can be joined up and the hidden stretch reported. They are
+# detected as evidence, not as lighting targets: routers/regions.py stores them as blockers.
+ROOF_BLOCKERS = ["obstruction", "palm_trunk", "tree_canopy"]
+
+
 def queried_kinds(selected: list[str]) -> list[str]:
     """What a request asks the model for: rooflines also look for things standing in front."""
     kinds = list(selected)
-    if "roof" in kinds and "obstruction" not in kinds:
-        kinds.append("obstruction")
+    if "roof" in kinds:
+        kinds += [kind for kind in ROOF_BLOCKERS if kind not in kinds]
     return kinds
 
 

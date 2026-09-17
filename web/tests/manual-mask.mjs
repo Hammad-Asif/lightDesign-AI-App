@@ -112,6 +112,26 @@ const polylines = async () =>
 const toClient = (box, p) => [box.x + (p[0] / 1200) * box.width, box.y + (p[1] / 700) * box.height];
 const same = (a, b, slack = 8) => Math.abs(a - b) <= slack;
 
+// Clicking a region on the photo selects it, instead of hunting for its row in the panel.
+await page.getByRole("button", { name: "Select" }).click();
+const selectBox = await canvas.boundingBox();
+const firstLine = (await polylines())[0];
+const mid = toClient(selectBox, [
+  (firstLine[0][0] + firstLine[1][0]) / 2,
+  (firstLine[0][1] + firstLine[1][1]) / 2,
+]);
+await page.mouse.click(mid[0], mid[1]);
+await page.waitForTimeout(400);
+check("clicking a line on the photo selects it",
+  (await page.locator(".region.active[data-geometry='line']").count()) === 1);
+// Below the roofline, which would otherwise win the click: a line takes priority over a mask.
+await page.mouse.click(selectBox.x + selectBox.width * 0.315, selectBox.y + selectBox.height * 0.42);
+await page.waitForTimeout(400);
+check("clicking a painted area on the photo selects it",
+  (await page.locator(".region.active[data-geometry='area']").count()) === 1);
+await page.screenshot({ path: `${OUT}/12c-select.png` });
+
+
 // Painting the obstruction made that area active; Move / extend needs a line selected.
 // Click the swatch, not the row: the row's label input stops propagation, and Playwright
 // clicks an element's centre, which lands on that input.

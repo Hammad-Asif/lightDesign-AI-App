@@ -4,7 +4,7 @@ from sqlalchemy import text
 
 from app.config import get_settings
 from app.db import engine
-from app.routers import auth, files, photos, regions
+from app.routers import auth, files, photos, products, regions
 
 settings = get_settings()
 (settings.storage_dir / "photos").mkdir(parents=True, exist_ok=True)
@@ -20,6 +20,7 @@ app.add_middleware(
 app.include_router(auth.router)
 app.include_router(photos.router)
 app.include_router(regions.router)
+app.include_router(products.router)
 app.include_router(files.router)
 
 

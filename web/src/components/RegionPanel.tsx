@@ -1,3 +1,5 @@
+import { useEffect, useRef } from "react";
+
 import { polylineLength } from "../canvas/layers";
 import { AREA_KINDS, KIND_COLORS, KIND_GROUPS, KIND_LABELS, LINE_KINDS } from "../types";
 import type { Edge, Region, RegionKind, Side } from "../types";
@@ -35,14 +37,23 @@ export function RegionPanel({
   onDelete,
   onAdd,
 }: Props) {
-  const lines = regions.filter((region) => region.geometry === "line");
-  const areas = regions.filter((region) => region.geometry === "area");
+  const lines = regions.filter((region) => region.geometry === "line" && region.role !== "blocker");
+  const areas = regions.filter((region) => region.geometry === "area" && region.role !== "blocker");
+  const blockers = regions.filter((region) => region.role === "blocker");
+
+  // Selecting on the photo has to show up here, even when the row is scrolled out of sight.
+  const activeRow = useRef<HTMLLIElement | null>(null);
+  useEffect(() => {
+    activeRow.current?.scrollIntoView({ block: "nearest" });
+  }, [activeId]);
 
   const row = (region: Region) => (
     <li
       key={region.id}
+      ref={region.id === activeId ? activeRow : undefined}
       className={region.id === activeId ? "region active" : "region"}
       data-geometry={region.geometry}
+      data-role={region.role}
       data-edge={region.edge ?? ""}
       onClick={() => onSelect(region.id)}
     >
@@ -163,6 +174,19 @@ export function RegionPanel({
         <ul>{areas.map(row)}</ul>
       ) : (
         <p className="muted small">Add one below, then paint it with the brush.</p>
+      )}
+
+      {blockers.length > 0 && (
+        <>
+          <h2>
+            In front of the house <span className="count">{blockers.length}</span>
+          </h2>
+          <p className="muted small">
+            Not lit. Lines passing behind these are joined up and reported as hidden — correct one
+            with the brush and every line behind it follows.
+          </p>
+          <ul>{blockers.map(row)}</ul>
+        </>
       )}
 
       <h2>Add region</h2>

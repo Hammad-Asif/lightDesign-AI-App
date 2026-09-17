@@ -42,7 +42,7 @@ COMPETING = [
 NESTED = [("hedge", "shrub"), ("hedge", "topiary")]
 NESTED_SHARE = 0.8
 
-PALM_KINDS = {"palm_trunk", "palm_frond"}
+PALM_KINDS = {"palm_trunk", "palm_collar", "palm_frond"}
 
 
 def query_kinds(kinds: list[str]) -> list[str]:

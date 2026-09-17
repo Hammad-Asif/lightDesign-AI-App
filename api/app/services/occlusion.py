@@ -21,7 +21,8 @@ from app.services import roofline
 
 # Kinds that can stand between the camera and the house.
 BLOCKER_KINDS = {
-    "obstruction", "palm_trunk", "palm_frond", "tree_canopy", "hedge", "shrub", "topiary",
+    "obstruction", "palm_trunk", "palm_collar", "palm_frond", "tree_canopy", "hedge", "shrub",
+    "topiary",
 }
 
 MAX_GAP_FRACTION = 0.25        # of image width

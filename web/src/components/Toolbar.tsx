@@ -17,6 +17,7 @@ interface Props {
 }
 
 const TOOLS: { id: Tool; label: string; hint: string }[] = [
+  { id: "select", label: "Select", hint: "Click a region on the photo to select it" },
   { id: "brush", label: "Brush", hint: "Add to the selected area mask" },
   { id: "erase", label: "Erase", hint: "Remove from the selected area mask" },
   { id: "vertex", label: "Vertices", hint: "Drag roofline points, click a segment to add, alt-click to delete" },

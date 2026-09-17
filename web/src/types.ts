@@ -12,6 +12,7 @@ export type RegionKind =
   | "shrub"
   | "topiary"
   | "palm_trunk"
+  | "palm_collar"
   | "palm_frond"
   | "tree_canopy"
   | "obstruction"
@@ -21,11 +22,16 @@ export type Geometry = "line" | "area";
 export type Side = "front" | "left" | "right";
 export type Edge = "eave" | "rake" | "hip" | "ridge" | "junction" | "unknown";
 export type MaskingMode = "manual" | "automatic";
-export type Tool = "brush" | "erase" | "vertex" | "move" | "box" | "line" | "click";
+export type Tool = "select" | "brush" | "erase" | "vertex" | "move" | "box" | "line" | "click";
+
+// "blocker" is something standing in front of the house — a palm, a tree, a car. It is detected
+// so a line passing behind it can be joined up and reported, and it is never lit itself.
+export type RegionRole = "target" | "blocker";
 
 export interface Region {
   id: string;
   kind: RegionKind;
+  role: RegionRole;
   label: string;
   geometry: Geometry;
   source: "auto" | "manual";
@@ -76,6 +82,7 @@ export const KIND_LABELS: Record<RegionKind, string> = {
   shrub: "Shrub",
   topiary: "Topiary",
   palm_trunk: "Palm trunk",
+  palm_collar: "Palm collar",
   palm_frond: "Palm fronds",
   tree_canopy: "Tree canopy",
   obstruction: "Obstruction",
@@ -96,6 +103,7 @@ export const KIND_COLORS: Record<RegionKind, string> = {
   shrub: "#84cc16",
   topiary: "#14b8a6",
   palm_trunk: "#f59e0b",
+  palm_collar: "#e11d48",
   palm_frond: "#a3e635",
   tree_canopy: "#059669",
   obstruction: "#94a3b8",
@@ -114,6 +122,7 @@ export const AREA_KINDS: RegionKind[] = [
   "shrub",
   "topiary",
   "palm_trunk",
+  "palm_collar",
   "palm_frond",
   "tree_canopy",
   "obstruction",
@@ -125,6 +134,7 @@ export const AREA_KINDS: RegionKind[] = [
 export const BLOCKER_KINDS: RegionKind[] = [
   "obstruction",
   "palm_trunk",
+  "palm_collar",
   "palm_frond",
   "tree_canopy",
   "hedge",
@@ -137,7 +147,7 @@ export const KIND_GROUPS: { title: string; kinds: RegionKind[] }[] = [
   { title: "House — paint an area", kinds: ["column", "window", "door", "garage_door", "wreath"] },
   {
     title: "Landscape",
-    kinds: ["hedge", "shrub", "topiary", "palm_trunk", "palm_frond", "tree_canopy"],
+    kinds: ["hedge", "shrub", "topiary", "palm_trunk", "palm_collar", "palm_frond", "tree_canopy"],
   },
   { title: "Other", kinds: ["obstruction", "custom"] },
 ];

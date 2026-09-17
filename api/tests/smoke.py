@@ -106,7 +106,7 @@ check("area regions produced", len(areas) > 0)
 check("area regions carry a mask", all(r["mask_url"] for r in areas))
 
 kinds = {r["kind"] for r in regions}
-for required in ["roof", "hedge", "shrub", "topiary", "palm_trunk", "palm_frond", "tree_canopy"]:
+for required in ["roof", "hedge", "shrub", "topiary", "palm_trunk", "palm_collar", "palm_frond", "tree_canopy"]:
     check(f"detected {required}", required in kinds)
 
 mask_url = areas[0]["mask_url"].split("?")[0]
@@ -119,6 +119,13 @@ frond_mask = np.array(Image.open(io.BytesIO(client.get(frond["mask_url"].split("
 trunk_top = np.where(trunk_mask > 127)[0].min()
 frond_bottom = np.where(frond_mask > 127)[0].max()
 check("palm trunk truncated at husk base", trunk_top >= frond_bottom)
+collar = next(r for r in regions if r["kind"] == "palm_collar")
+collar_mask = np.array(Image.open(io.BytesIO(client.get(collar["mask_url"].split("?")[0]).content))) > 127
+collar_rows = np.where(collar_mask.any(axis=1))[0]
+check("palm collar sits between the fronds and the trunk",
+      frond_bottom < collar_rows.min() and collar_rows.max() < trunk_top)
+check("palm zones do not overlap", not (collar_mask & (trunk_mask > 127)).any()
+      and not (collar_mask & (frond_mask > 127)).any())
 
 polyline = [[10, 10], [400, 12], [800, 15]]
 created = client.post(
@@ -224,6 +231,10 @@ real = intent.parse(
     "spacing along the entire front roofline edge."
 )
 check("intent picks palm trunks and roof", real.kinds == ["roof", "palm_trunk"])
+check("a palm named without a part lights all three zones",
+      intent.parse("mini lights on the palms").kinds == ["palm_trunk", "palm_collar", "palm_frond"])
+check("a collar instruction selects the collar alone",
+      intent.parse("red collar on the palm trees").kinds == ["palm_collar"])
 check("intent excludes fronds used as a boundary", "palm_frond" not in real.kinds)
 check("intent picks front side only", real.sides == ["front"])
 check("intent reads the entire front roofline as the full outline", real.edges == ["eave", "rake", "hip"])
@@ -255,9 +266,20 @@ intent_photo = client.post(
     files={"file": ("h.png", sample_photo(), "image/png")},
     data={"prompt": "wrap the palm trunks, C9 on the front roofline"},
 ).json()["id"]
+from app.services import detect  # noqa: E402
+
 scoped = client.post(f"/photos/{intent_photo}/detect", json={"kinds": None}).json()
-scoped_kinds = {r["kind"] for r in scoped}
+scoped_kinds = {r["kind"] for r in scoped if r["role"] == "target"}
 check("detect honours the prompt", scoped_kinds == {"roof", "palm_trunk"})
+# A roofline request also looks for what stands in front of the house, so a line that disappears
+# behind a palm can be joined back up. Those are evidence, not lighting targets.
+check("things in front of the house come back as blockers",
+      {r["kind"] for r in scoped if r["role"] == "blocker"} <= set(detect.ROOF_BLOCKERS) | {"palm_collar", "palm_frond"})
+check("a roof request asks for palms, trees and cars as well",
+      set(detect.queried_kinds(["roof"])) == {"roof", *detect.ROOF_BLOCKERS})
+check("a request with no roof asks for nothing extra", detect.queried_kinds(["hedge"]) == ["hedge"])
+check("manual regions are lighting targets", all(
+    r["role"] == "target" for r in client.get(f"/photos/{photo_id}").json()["regions"] if r["source"] == "manual"))
 check("detect keeps front spans only", all(
     r["side"] == "front" for r in scoped if r["geometry"] == "line"
 ))
@@ -385,6 +407,61 @@ check("pieces are never joined across edge types or planes",
       piece_c in joined_pieces and piece_d in joined_pieces and seam_line in joined_pieces and len(joined_pieces) == 4)
 check("plane-relative minimum length is staged off", roofline.PLANE_MIN_SPAN is False)
 
+# ---- snapping a line onto the edge it follows ----------------------------------------------
+from app.config import get_settings  # noqa: E402
+from app.services import occlusion, snap  # noqa: E402
+
+photo_edge = np.full((200, 400, 3), 30, dtype=np.uint8)
+photo_edge[120:, :] = 220
+edged = snap.field(Image.fromarray(photo_edge))
+check("a line above the edge is pulled onto it",
+      snap.line([[20, 112], [380, 112]], edged[:2], edged[2])[0][1] in range(118, 123))
+check("a line below the edge is pulled up onto it",
+      snap.line([[20, 128], [380, 128]], edged[:2], edged[2])[0][1] in range(118, 123))
+check("an edge outside the search band is left alone",
+      snap.line([[20, 90], [380, 90]], edged[:2], edged[2]) == [[20, 90], [380, 90]])
+flat = snap.field(Image.new("RGB", (300, 200), (120, 140, 160)))
+check("a photo with no edges moves nothing",
+      snap.line([[20, 100], [280, 100]], flat[:2], flat[2]) == [[20, 100], [280, 100]])
+bent = snap.line([[20, 60], [200, 118], [380, 60]], edged[:2], edged[2])
+check("a line that turns keeps its corner", len(bent) == 3 and bent[1][1] > bent[0][1] < 200)
+check("snapping never changes a line's side or edge type",
+      [s[1:] for s in snap.lines([([[20, 112], [380, 112]], "front", "eave")], edged[:2], edged[2])]
+      == [("front", "eave")])
+check("snapping is on by default, interior hips are not",
+      get_settings().snap_to_edges and not get_settings().interior_hips)
+
+# ---- a run that stops at a blocker survives, if it joins up ---------------------------------
+split_roof = np.zeros((400, 800), dtype=bool)
+split_roof[150:300, 60:260] = True        # 200px of eave
+split_roof[150:300, 330:520] = True       # and 190px more, with a gap between
+palm = np.zeros((400, 800), dtype=bool)
+palm[100:350, 255:335] = True
+palm_union = occlusion.blocker_union([palm], (400, 800))
+alone = roofline.extract_spans(split_roof, "eave")
+beside = roofline.extract_spans(split_roof, "eave", palm_union)
+check("pieces long enough on their own are found either way", len(alone) == len(beside) == 2)
+check("a plane's own lines do not change when something stands in front of it",
+      roofline.plane_spans(split_roof, 800) == roofline.plane_spans(split_roof, 800))
+
+nibbled = np.zeros((400, 800), dtype=bool)
+nibbled[150:300, 60:100] = True           # 40px: under the 48px minimum for this width
+nibbled[150:300, 180:220] = True
+covering = occlusion.blocker_union([np.pad(np.ones((250, 80), dtype=bool), ((100, 50), (100, 620)))], (400, 800))
+check("a short piece away from anything is dropped", roofline.extract_spans(nibbled, "eave") == [])
+check("a short piece that stops at a blocker is kept",
+      len(roofline.extract_spans(nibbled, "eave", covering)) == 2)
+check("blocker pieces are offered on top of the plane's own lines",
+      len(roofline.blocker_pieces(nibbled, 800, covering)) == 4
+      and roofline.blocker_pieces(nibbled, 800, None) == [])
+joined_over = [s for s in roof_lines([nibbled], covering, intent.Intent(), True) if s[2] == "eave"]
+check("and is only kept if it joins up across the blocker",
+      len(joined_over) == 1 and joined_over[0][0][0][0] < 100 < joined_over[0][0][-1][0])
+elsewhere = occlusion.blocker_union([np.pad(np.ones((250, 20), dtype=bool), ((100, 50), (0, 780)))], (400, 800))
+check("a stub that never joins is dropped", all(
+    min(p[0] for p in span) >= 100
+    for span, *_ in roof_lines([nibbled], elsewhere, intent.Intent(), True)))
+
 front_lines = detected_lines("C9 on the front roofline")
 check("front roofline keeps the front plane's rakes as well as its eave",
       {"eave", "rake"} <= {r["edge"] for r in front_lines})
@@ -407,8 +484,6 @@ stacked = (0.5, (10, 10, 200, 40))
 lower = (0.5, (10, 120, 200, 200))
 check("boxes with different tops are not collapsed",
       len(collapse_facade_boxes([stacked, lower], 400)) == 2)
-from app.services import detect  # noqa: E402
-
 check("every kind has a colour", set(detect.COLORS) == set(detect.LABELS))
 check("colours are unique per kind", len(set(detect.COLORS.values())) == len(detect.COLORS))
 check("house kinds present", {"window", "door", "garage_door", "column", "wreath"} <= set(detect.COLORS))
@@ -562,6 +637,103 @@ check("files require sign-in",
       TestClient(app).get(f"/files/photos/{photo_id}/original.png").status_code == 401)
 check("path traversal refused",
       client.get(f"/files/photos/{photo_id}/..%2f..%2f..%2fetc%2fpasswd").status_code == 404)
+
+# ---- product library ----------------------------------------------------------------------
+catalogue = client.get("/products").json()
+check("built-in catalogue covers every product type",
+      {p["category"] for p in catalogue if p["builtin"]} == {"c9", "c7", "mini", "icicle", "wreath", "garland"})
+check("mixed-colour mini strands are products with their colour sequence",
+      any(p["category"] == "mini" and p["colours"] == ["warm_white", "cool_white"] for p in catalogue))
+check("twinkle is product data for both C9 and mini lights",
+      {p["category"] for p in catalogue if p["twinkle"]} >= {"c9", "mini"})
+check("category filter", {p["category"] for p in client.get("/products?category=wreath").json()} == {"wreath"})
+palette = {c["key"] for c in client.get("/products/palette").json()}
+check("palette offers the whites and the common colours", {"warm_white", "cool_white", "red", "green"} <= palette)
+check("products require sign-in", TestClient(app).get("/products").status_code == 401)
+
+strand = client.post("/products", json={
+    "category": "mini", "name": "Mini, red/white/green", "bulb_diameter_in": 0.2, "spacing_in": 4,
+    "strand_length_ft": 24, "bulb_count": 70, "colours": ["red", "pure_white", "green"],
+})
+check("a custom mixed strand can be added", strand.status_code == 201 and not strand.json()["builtin"])
+strand_id = strand.json()["id"]
+check("a socket line refuses built-in colours", client.post("/products", json={
+    "category": "c9", "name": "Bad C9", "bulb_diameter_in": 1.125, "spacing_in": 12, "colours": ["red"],
+}).status_code == 422)
+check("a strand must say its spacing", client.post("/products", json={
+    "category": "mini", "name": "No spacing", "bulb_diameter_in": 0.2, "strand_length_ft": 24, "colours": ["red"],
+}).status_code == 422)
+check("unknown colours are refused", client.post("/products", json={
+    "category": "wreath", "name": "Wreath", "diameter_in": 24, "colours": ["chartreuse"],
+}).status_code == 422)
+check("a default spacing outside the offered spacings is refused", client.post("/products", json={
+    "category": "c7", "name": "C7", "bulb_diameter_in": 0.875, "spacing_in": 10, "spacing_options_in": [12, 18],
+}).status_code == 422)
+check("own product can be edited", client.patch(f"/products/{strand_id}", json={"spacing_in": 6}).json()["spacing_in"] == 6)
+check("an edit is checked as the whole product it makes",
+      client.patch(f"/products/{strand_id}", json={"category": "c9"}).status_code == 422)
+builtin_id = next(p["id"] for p in catalogue if p["builtin"])
+check("built-in products cannot be edited", client.patch(f"/products/{builtin_id}", json={"name": "x"}).status_code == 403)
+check("built-in products cannot be deleted", client.delete(f"/products/{builtin_id}").status_code == 403)
+check("another user sees the built-in catalogue", any(p["id"] == builtin_id for p in intruder.get("/products").json()))
+check("another user cannot see my products", intruder.get(f"/products/{strand_id}").status_code == 404
+      and all(p["id"] != strand_id for p in intruder.get("/products").json()))
+check("own product can be deleted", client.delete(f"/products/{strand_id}").status_code == 204)
+check("a deleted product is gone", client.get(f"/products/{strand_id}").status_code == 404)
+
+# ---- colour patterns ----------------------------------------------------------------------
+from types import SimpleNamespace  # noqa: E402
+
+from app.schemas import LightingSettings, Pattern  # noqa: E402
+from app.services import patterns  # noqa: E402
+
+red_white = Pattern(steps=[{"colour": "red"}, {"colour": "pure_white"}])
+check("a two-colour sequence repeats", patterns.colours(red_white, 5) == ["red", "pure_white"] * 2 + ["red"])
+three = Pattern(steps=[{"colour": "red", "count": 2}, {"colour": "green"}, {"colour": "pure_white"}])
+check("steps can repeat a colour", patterns.colours(three, 6) == ["red", "red", "green", "pure_white", "red", "red"])
+check("offset shifts where the sequence starts",
+      patterns.colours(Pattern(steps=red_white.steps, offset=1), 3) == ["pure_white", "red", "pure_white"])
+check("reverse starts the sequence at the far end",
+      patterns.colours(Pattern(steps=three.steps, direction="reverse"), 3) == ["green", "red", "red"])
+
+c9 = SimpleNamespace(name="C9 LED", category="c9", colours=[], spacing_in=12.0,
+                     spacing_options_in=[12.0, 15.0, 18.0, 24.0, 36.0], twinkle=False)
+mixed = SimpleNamespace(name="Mini WW/CW", category="mini", colours=["warm_white", "cool_white"],
+                        spacing_in=4.0, spacing_options_in=[], twinkle=True)
+product_id = uuid.uuid4()
+candy_cane = LightingSettings(product_id=product_id, pattern={
+    "steps": [{"colour": "red"}, {"colour": "pure_white"}], "unit": "turn"}, wrap={"start": 0.1, "stop": 0.9})
+check("a candy-cane trunk wrap is valid", patterns.problems(candy_cane, c9, "palm_trunk") == [])
+check("per-turn colours need a wrapped zone", patterns.problems(candy_cane.model_copy(update={"wrap": None}), c9, "roof") != [])
+check("only trunks and collars are wrapped",
+      any("wrapped" in p for p in patterns.problems(candy_cane, c9, "tree_canopy")))
+canopy = LightingSettings(product_id=product_id, spacing_in=18, pattern={
+    "steps": [{"colour": "red"}, {"colour": "green"}, {"colour": "pure_white"}]})
+check("a canopy in three C9 colours at 18 inch spacing is valid", patterns.problems(canopy, c9, "tree_canopy") == [])
+check("a spacing the product is not sold at is refused",
+      patterns.problems(canopy.model_copy(update={"spacing_in": 10}), c9, "tree_canopy") != [])
+check("a socket line needs a pattern", patterns.problems(LightingSettings(product_id=product_id), c9, "roof") != [])
+check("a mixed strand keeps its own colours",
+      patterns.problems(LightingSettings(product_id=product_id, pattern=red_white.model_dump()), mixed, "hedge") != [])
+pattern, spacing, twinkle, wrap = patterns.resolve(LightingSettings(product_id=product_id), mixed, "palm_frond")
+check("a mixed strand lights with its built-in sequence and twinkle",
+      patterns.colours(pattern, 3) == ["warm_white", "cool_white", "warm_white"] and twinkle and spacing == 4.0)
+check("a trunk with no wrap given is wrapped top to bottom",
+      patterns.resolve(candy_cane.model_copy(update={"wrap": None}), c9, "palm_trunk")[3].stop == 1.0)
+check("wreaths only go on wreath regions",
+      patterns.problems(LightingSettings(product_id=product_id), SimpleNamespace(
+          name="Wreath", category="wreath", colours=["warm_white"], spacing_in=None, spacing_options_in=[],
+          twinkle=False), "roof") != [])
+try:
+    Pattern(steps=[{"colour": "chartreuse"}])
+    check("patterns refuse colours outside the palette", False)
+except ValueError:
+    check("patterns refuse colours outside the palette", True)
+try:
+    LightingSettings(product_id=product_id, wrap={"start": 0.8, "stop": 0.2})
+    check("a wrap cannot stop below its start", False)
+except ValueError:
+    check("a wrap cannot stop below its start", True)
 
 check("logout succeeds", client.post("/auth/logout").status_code == 204)
 check("session is gone after logout",

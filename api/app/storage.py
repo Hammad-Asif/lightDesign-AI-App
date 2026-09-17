@@ -6,17 +6,17 @@ from pathlib import Path
 import numpy as np
 from fastapi import Depends, HTTPException
 from PIL import Image, ImageOps
-from sqlalchemy import delete, select
+from sqlalchemy import delete, or_, select
 from sqlalchemy.orm import Session
 
 from app.auth import current_user
 from app.config import get_settings
 from app.db import get_db
-from app.models import Photo, Region, User
+from app.models import DesignRegion, Photo, Product, Region, User
 from app.services import occlusion
 
 REGION_FIELDS = (
-    "kind", "label", "geometry", "source", "color", "score",
+    "kind", "role", "label", "geometry", "source", "color", "score",
     "visible", "side", "edge", "polyline", "mask_url", "hidden",
 )
 
@@ -43,6 +43,20 @@ def photo_dict(photo: Photo) -> dict:
 
 def region_dict(region: Region) -> dict:
     return {"id": str(region.id), **{name: getattr(region, name) for name in REGION_FIELDS}}
+
+
+PRODUCT_FIELDS = (
+    "category", "name", "bulb_diameter_in", "spacing_in", "spacing_options_in", "strand_length_ft",
+    "diameter_in", "bulb_count", "drops_in", "colours", "twinkle",
+)
+
+
+def product_fields(product: Product) -> dict:
+    return {name: getattr(product, name) for name in PRODUCT_FIELDS}
+
+
+def product_dict(product: Product) -> dict:
+    return {"id": str(product.id), "builtin": product.owner_id is None, **product_fields(product)}
 
 
 class Store:
@@ -184,6 +198,52 @@ class Store:
             line.hidden = occlusion.hidden_stretches(line.polyline, blockers, photo.width) or None
         self.db.commit()
         return regions
+
+    # -- products --------------------------------------------------------------
+
+    def _products(self):
+        """The one query deciding which products a user sees: the built-in catalogue and their own."""
+        return select(Product).where(or_(Product.owner_id.is_(None), Product.owner_id == self.user.id))
+
+    def products(self, category: str | None = None) -> list[Product]:
+        query = self._products()
+        if category:
+            query = query.where(Product.category == category)
+        return list(self.db.scalars(query.order_by(Product.owner_id.is_not(None), Product.category, Product.name)))
+
+    def product(self, product_id: str, *, editable: bool = False) -> Product:
+        product = self.db.scalar(
+            self._products().where(Product.id == _uuid(product_id, "Product not found"))
+        )
+        if product is None:
+            raise HTTPException(404, "Product not found")
+        if editable and product.owner_id is None:
+            raise HTTPException(403, "Built-in products can't be changed. Add your own product instead.")
+        return product
+
+    def add_product(self, fields: dict) -> Product:
+        product = Product(id=uuid.uuid4(), owner_id=self.user.id, **fields)
+        self.db.add(product)
+        self.db.commit()
+        return product
+
+    def update_product(self, product: Product, fields: dict) -> Product:
+        for name, value in fields.items():
+            setattr(product, name, value)
+        self.db.commit()
+        return product
+
+    def delete_product(self, product: Product) -> None:
+        # Settings reference products by id inside JSON, where no foreign key can guard them.
+        used = self.db.scalar(
+            select(DesignRegion.id)
+            .where(DesignRegion.settings["product_id"].astext == str(product.id))
+            .limit(1)
+        )
+        if used is not None:
+            raise HTTPException(409, "This product is used in a design")
+        self.db.delete(product)
+        self.db.commit()
 
     # -- files -----------------------------------------------------------------
 

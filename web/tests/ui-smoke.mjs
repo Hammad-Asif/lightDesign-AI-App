@@ -75,7 +75,7 @@ check("interpreted banner names only the requested areas",
 check("interpreted banner excludes what was not asked for",
   !banner.includes("Topiary") && !banner.includes("Tree canopy"));
 
-const kinds = await page.locator(".region[data-geometry='area'] select").evaluateAll(
+const kinds = await page.locator(".region[data-geometry='area'][data-role='target'] select").evaluateAll(
   (nodes) => [...new Set(nodes.map((n) => n.value))],
 );
 check(`only requested area kinds masked (${kinds.join(",")})`,

@@ -37,6 +37,7 @@ interface Props {
   zoom: number;
   onMaskCommit: (regionId: string, blob: Blob) => Promise<Region>;
   onPolylineCommit: (regionId: string, polyline: number[][]) => void;
+  onSelect: (regionId: string) => void;
   onBox: (box: number[]) => void;
   onPoint: (point: number[]) => void;
   onRemoveAt: (regionId: string) => void;
@@ -70,6 +71,7 @@ export const MaskCanvas = forwardRef<MaskCanvasHandle, Props>(function MaskCanva
     zoom,
     onMaskCommit,
     onPolylineCommit,
+    onSelect,
     onBox,
     onPoint,
     onRemoveAt,
@@ -393,6 +395,40 @@ export const MaskCanvas = forwardRef<MaskCanvasHandle, Props>(function MaskCanva
 
   const activeRegion = () => regionsRef.current.find((item) => item.id === activeRef.current);
 
+  const areaAt = (point: number[]) =>
+    [...regionsRef.current].reverse().find((region) => {
+      if (!region.visible || region.geometry !== "area") return false;
+      const layer = layers.current.get(region.id);
+      if (!layer) return false;
+      const x = Math.round(point[0]);
+      const y = Math.round(point[1]);
+      if (x < 0 || y < 0 || x >= layer.width || y >= layer.height) return false;
+      return ctx2d(layer).getImageData(x, y, 1, 1).data[3] > 8;
+    });
+
+  /** The region a click lands on: the nearest line within reach, else the area painted under it.
+   *  Lines win, because a line drawn over a mask is only a few pixels wide to aim at. */
+  const regionAt = (point: number[]) => {
+    const reach = 10 / scale();
+    let nearest: { region: Region; distance: number } | undefined;
+    for (const region of regionsRef.current) {
+      if (!region.visible || region.geometry !== "line" || !region.polyline) continue;
+      for (let i = 0; i < region.polyline.length - 1; i += 1) {
+        const { distance } = distanceToSegment(point, region.polyline[i], region.polyline[i + 1]);
+        if (distance <= reach && (!nearest || distance < nearest.distance)) {
+          nearest = { region, distance };
+        }
+      }
+    }
+    return nearest?.region ?? areaAt(point);
+  };
+
+  /** Clicking away from the region being edited picks whatever was clicked instead. */
+  const selectUnder = (point: number[]) => {
+    const hit = regionAt(point);
+    if (hit && hit.id !== activeRef.current) onSelect(hit.id);
+  };
+
   const onPointerDown = (event: ReactPointerEvent<HTMLCanvasElement>) => {
     const point = toImage(event);
     pointerRef.current = point;
@@ -404,18 +440,13 @@ export const MaskCanvas = forwardRef<MaskCanvasHandle, Props>(function MaskCanva
       return;
     }
 
+    if (tool === "select") {
+      selectUnder(point);
+      return;
+    }
+
     if (tool === "click") {
-      const hit = [...regionsRef.current]
-        .reverse()
-        .find((region) => {
-          if (!region.visible || region.geometry !== "area") return false;
-          const layer = layers.current.get(region.id);
-          if (!layer) return false;
-          const x = Math.round(point[0]);
-          const y = Math.round(point[1]);
-          if (x < 0 || y < 0 || x >= layer.width || y >= layer.height) return false;
-          return ctx2d(layer).getImageData(x, y, 1, 1).data[3] > 8;
-        });
+      const hit = areaAt(point);
       if (event.altKey) {
         if (hit) onRemoveAt(hit.id);
       } else {
@@ -432,7 +463,10 @@ export const MaskCanvas = forwardRef<MaskCanvasHandle, Props>(function MaskCanva
     }
 
     const region = activeRegion();
-    if (!region) return;
+    if (!region) {
+      selectUnder(point);
+      return;
+    }
 
     if (region.geometry === "area" && (tool === "brush" || tool === "erase")) {
       pushHistory(region.id, "mask");
@@ -454,7 +488,10 @@ export const MaskCanvas = forwardRef<MaskCanvasHandle, Props>(function MaskCanva
         points.some(
           (p, i) => i < last && distanceToSegment(point, p, points[i + 1]).distance < hit,
         );
-      if (end === undefined && !onLine) return;
+      if (end === undefined && !onLine) {
+        selectUnder(point);
+        return;
+      }
 
       pushHistory(region.id, "poly");
       const origin = points.map((p) => [...p]);
@@ -507,6 +544,7 @@ export const MaskCanvas = forwardRef<MaskCanvasHandle, Props>(function MaskCanva
           return;
         }
       }
+      selectUnder(point);
     }
   };
 

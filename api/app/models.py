@@ -89,6 +89,9 @@ class Region(Timestamped, Base):
     # Creation order — the editor lists regions in the order they were made.
     seq: Mapped[int] = mapped_column(BigInteger, Identity(), unique=True)
     kind: Mapped[str] = mapped_column(String(32))
+    # target = something to light. blocker = something standing in front of the house, detected
+    # so a line behind it can be joined and its hidden stretch reported; never lit itself.
+    role: Mapped[str] = mapped_column(String(8), default="target", server_default="target")
     label: Mapped[str] = mapped_column(String(200))
     geometry: Mapped[str] = mapped_column(String(8))
     source: Mapped[str] = mapped_column(String(8))
@@ -102,6 +105,37 @@ class Region(Timestamped, Base):
     # Lines only: [start, end] pixel distances along the polyline that pass behind an object.
     # Derived from the blocking objects' masks by Store.refresh_hidden, never set directly.
     hidden: Mapped[list | None] = mapped_column(JSONB)
+
+
+class Product(Timestamped, Base):
+    """A lighting product. See services/products.py for what each category must describe."""
+
+    __tablename__ = "products"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    # None for the built-in catalogue, which every user reads and nobody edits; otherwise the
+    # user who added it, and only they see it.
+    owner_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
+    category: Mapped[str] = mapped_column(String(16), index=True)
+    name: Mapped[str] = mapped_column(String(120))
+    bulb_diameter_in: Mapped[float | None] = mapped_column(Float)
+    # Centre to centre along the wire; for icicles, between drops.
+    spacing_in: Mapped[float | None] = mapped_column(Float)
+    # Socket lines can be ordered at several spacings; empty means spacing_in is fixed.
+    spacing_options_in: Mapped[list] = mapped_column(
+        JSONB, default=list, server_default=text("'[]'::jsonb")
+    )
+    strand_length_ft: Mapped[float | None] = mapped_column(Float)
+    # Wreath diameter, or a garland's thickness.
+    diameter_in: Mapped[float | None] = mapped_column(Float)
+    bulb_count: Mapped[int | None]
+    drops_in: Mapped[list] = mapped_column(JSONB, default=list, server_default=text("'[]'::jsonb"))
+    # The colour sequence built into the product, repeating along it. Empty for socket lines,
+    # whose bulbs are chosen per design.
+    colours: Mapped[list] = mapped_column(JSONB, default=list, server_default=text("'[]'::jsonb"))
+    twinkle: Mapped[bool] = mapped_column(default=False, server_default=text("false"))
 
 
 class Design(Timestamped, Base):

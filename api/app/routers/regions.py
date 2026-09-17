@@ -7,7 +7,7 @@ from app.config import get_settings
 from app.models import Region as RegionRow
 from app.providers.base import get_provider
 from app.schemas import CreateRegionRequest, DetectRequest, RefineRequest, Region, RegionPatch
-from app.services import detect, intent, occlusion, roofline
+from app.services import detect, intent, occlusion, roofline, snap
 from app.storage import Store, get_store, region_dict
 
 router = APIRouter(prefix="/photos/{photo_id}", tags=["regions"])
@@ -23,16 +23,41 @@ def _blocks(kind: str) -> bool:
     return kind in occlusion.BLOCKER_KINDS
 
 
+def _key(span) -> tuple:
+    return tuple(map(tuple, span[0]))
+
+
 def roof_lines(
-    roof_masks: list[np.ndarray], blockers: np.ndarray | None, parsed: intent.Intent, hybrid: bool
+    roof_masks: list[np.ndarray],
+    blockers: np.ndarray | None,
+    parsed: intent.Intent,
+    hybrid: bool,
+    edges=None,
+    interior: bool = False,
 ) -> list[tuple]:
-    """The roof lines detection returns for an instruction, as (polyline, side, edge)."""
+    """The roof lines detection returns for an instruction, as (polyline, side, edge).
+
+    `edges` is the photo's gradient field from services/snap.field; with it, every line that
+    survives is pulled onto the image edge it follows.
+    """
     width = roof_masks[0].shape[1]
     planes = [roofline.plane_spans(mask, width, hybrid) for mask in roof_masks]
+    # Pieces a palm or a car cut short are offered as well, so the two sides of a blocker can be
+    # joined back up. They have to earn their place: anything still a stub after bridging goes.
+    extra = [roofline.blocker_pieces(mask, width, blockers) for mask in roof_masks]
+    short = {_key(span) for pieces in extra for span in pieces}
+    planes = [plane + pieces for plane, pieces in zip(planes, extra)]
     # A lower roof's top edge that runs into the wall of the storey above is not a rake.
     planes = roofline.mark_junctions(planes, roof_masks, width)
+    # Hips inside a merged mask, if they can be confirmed against the photo.
+    inside: list[tuple] = []
+    if interior and edges is not None:
+        gradients, floor = edges[:2], edges[2]
+        inside = [h for mask in roof_masks for h in roofline.interior_hips(mask, width, gradients, floor)]
+
     spans = roofline.dedupe(
         [span for spans in planes for span in spans]
+        + inside
         # Ridges where two planes meet. Only abutting masks produce one; a plane whose own
         # outline holds its ridge gets none, never a boundary segment called a ridge.
         + roofline.seam_ridges(roof_masks, width),
@@ -40,8 +65,12 @@ def roof_lines(
     )
     # Extraction splits an edge wherever it turns; a plane's pieces that meet end to end are rejoined.
     spans = roofline.join_pieces(spans, planes)
+
     # A line a detected object splits in two is joined back up across that object.
     spans = occlusion.bridge(spans, blockers, width)
+    # A piece kept only because it stopped at a blocker, and still not joined to anything, is
+    # the noise the minimum length exists to remove.
+    spans = [s for s in spans if _key(s) not in short]
 
     if parsed.sides:
         spans = [s for s in spans if s[1] in parsed.sides]
@@ -50,6 +79,12 @@ def roof_lines(
         # it so the editor can flag it for review rather than silently drop a possible eave.
         # A junction is identified — roof meeting wall — so an outline request leaves it dark.
         spans = [s for s in spans if s[2] in parsed.edges or s[2] == "unknown"]
+
+    # Last: the mask decides which lines exist and what they are; the photo decides exactly
+    # where each one sits.
+    if edges is not None:
+        gx, gy, minimum = edges
+        spans = snap.lines(spans, (gx, gy), minimum)
     return spans
 
 
@@ -93,7 +128,15 @@ def run_detection(photo_id: str, body: DetectRequest, store: Store = Depends(get
 
     roof_masks = [d.mask for d in detections if d.kind == "roof"]
     if roof_masks:
-        spans = roof_lines(roof_masks, blockers, parsed, get_settings().edge_extractor == "hybrid")
+        settings = get_settings()
+        spans = roof_lines(
+            roof_masks,
+            blockers,
+            parsed,
+            settings.edge_extractor == "hybrid",
+            snap.field(image) if settings.snap_to_edges or settings.interior_hips else None,
+            settings.interior_hips,
+        )
         for index, (polyline, side, edge) in enumerate(spans):
             fresh.append(
                 RegionRow(
@@ -111,6 +154,9 @@ def run_detection(photo_id: str, body: DetectRequest, store: Store = Depends(get
                 )
             )
 
+    # Anything detected that the instruction did not ask for is here as evidence of what
+    # stands in front of the house, not as something to light.
+    targets = set(selected or detect.DEFAULT_KINDS)
     areas = [d for d in detections if d.kind != "roof"]
     counts: dict[str, int] = {}
     totals: dict[str, int] = {}
@@ -125,6 +171,7 @@ def run_detection(photo_id: str, body: DetectRequest, store: Store = Depends(get
             RegionRow(
                 id=region_id,
                 kind=item.kind,
+                role="target" if item.kind in targets else "blocker",
                 label=detect.label_for(item.kind, index, totals[item.kind]),
                 geometry="area",
                 source="auto",

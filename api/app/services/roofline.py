@@ -19,6 +19,12 @@ POLY_MIN_LEN = 0.03
 POLY_ON_MASK_MIN = 0.50
 POLY_ON_MASK_TOLERANCE = 4    # px; a straight chord along a jagged outline lands either side of it
 
+# A run cut short by something standing in front of the house is evidence, not noise. A piece
+# that ends at a detected blocker survives the minimum length, so both sides of a palm exist for
+# occlusion.bridge to join. Nothing shorter than the floor survives either way.
+BLOCKER_REACH_FRACTION = 0.004   # of image width: how close an end must be to the blocker
+SHORT_FLOOR_FRACTION = 0.015     # of image width
+
 # Staged, off: minimum lengths measured against the plane's own width instead of the image's,
 # so a small plane or a piece between palm fronds is not dropped for being short next to the
 # whole photo. Recovers edges but adds short lines to clean up; not decided yet.
@@ -153,7 +159,29 @@ def _split_run(run: np.ndarray, width: int) -> list[np.ndarray]:
     return spans
 
 
-def extract_spans(mask: np.ndarray, edge: str = "eave") -> list[tuple[list[list[int]], str]]:
+def _at_blocker(points, blockers: np.ndarray, image_width: int) -> bool:
+    """Does either end of this piece stop at something standing in front of the house?"""
+    reach = max(3, int(BLOCKER_REACH_FRACTION * image_width))
+    height, width = blockers.shape
+    for x, y in (points[0], points[-1]):
+        x, y = int(x), int(y)
+        if blockers[max(0, y - reach):y + reach + 1, max(0, x - reach):x + reach + 1].any():
+            return True
+    return False
+
+
+def _long_enough(points, minimum: float, blockers, image_width: int) -> bool:
+    length = _length(np.asarray(points))
+    if length >= minimum:
+        return True
+    if blockers is None or length < SHORT_FLOOR_FRACTION * image_width:
+        return False
+    return _at_blocker(points, blockers, image_width)
+
+
+def extract_spans(
+    mask: np.ndarray, edge: str = "eave", blockers=None
+) -> list[tuple[list[list[int]], str]]:
     profile = bottom_profile(mask) if edge == "eave" else top_profile(mask)
     if len(profile) < 2:
         return []
@@ -163,10 +191,10 @@ def extract_spans(mask: np.ndarray, edge: str = "eave") -> list[tuple[list[list[
     result: list[tuple[list[list[int]], str]] = []
 
     for run in _runs(profile, width, height):
-        if len(run) < 2 or _length(run) < minimum:
+        if len(run) < 2 or not _long_enough(run, minimum, blockers, width):
             continue
         for span in _split_run(run, width):
-            if len(span) >= 2 and _length(span) >= minimum:
+            if len(span) >= 2 and _long_enough(span, minimum, blockers, width):
                 result.append(
                     ([[int(x), int(y)] for x, y in span], _classify(span, width))
                 )
@@ -441,6 +469,79 @@ def seam_ridges(masks: list[np.ndarray], image_width: int) -> list[tuple]:
     return found
 
 
+# A hip or ridge inside one mask. SAM often returns two planes of a hip roof as a single mask,
+# and the line where they meet is then interior: no mask boundary runs along it, so seam_ridges
+# cannot find it. What is left is the silhouette's own corners — the apex on the top profile and
+# the turn of the eave below it — plus the photo, which has to show an edge along the candidate
+# before it is drawn. Without that confirmation the line is a guess about a roof shape.
+INTERIOR_INSIDE = 0.95         # share of the candidate that must lie on the mask
+INTERIOR_SUPPORT = 0.55        # share of it that must sit on an image edge
+INTERIOR_CORNER_DEG = 20.0     # how sharply the profile must turn to count as a corner
+
+
+def _corners(profile: np.ndarray, image_width: int, peak: bool) -> list[np.ndarray]:
+    """Turning points of a profile: apexes of the top edge, or the bends of the eave below."""
+    if len(profile) < 3:
+        return []
+    simplified = cv2.approxPolyDP(
+        profile.reshape(-1, 1, 2), max(2.0, 0.004 * image_width), False
+    ).reshape(-1, 2)
+    found = []
+    for before, point, after in zip(simplified, simplified[1:], simplified[2:]):
+        turn = np.degrees(abs(_angle(point, after) - _angle(before, point)))
+        rises = before[1] > point[1] < after[1] if peak else before[1] < point[1] > after[1]
+        if rises and turn >= INTERIOR_CORNER_DEG:
+            found.append(point.astype(float))
+    return found
+
+
+def _supported(points, gradients, minimum: float) -> float:
+    """Share of a candidate line that has an image edge running along it."""
+    gx, gy = gradients
+    height, width = gx.shape
+    a, b = np.asarray(points[0], float), np.asarray(points[-1], float)
+    direction = b - a
+    length = float(np.linalg.norm(direction))
+    if length < 1:
+        return 0.0
+    normal = np.array([-direction[1], direction[0]]) / length
+    steps = np.arange(0.0, length, 2.0)[:, None]
+    samples = a + (direction / length) * steps
+    xs = np.clip(np.rint(samples[:, 0]).astype(int), 0, width - 1)
+    ys = np.clip(np.rint(samples[:, 1]).astype(int), 0, height - 1)
+    across = np.abs(gx[ys, xs] * normal[0] + gy[ys, xs] * normal[1])
+    return float((across >= minimum).mean())
+
+
+def interior_hips(mask: np.ndarray, image_width: int, gradients=None, minimum: float = 0.0) -> list[tuple]:
+    """Hips inside one mask: apex to eave corner, kept only where the photo shows the edge."""
+    if gradients is None:
+        return []
+    tops = _corners(top_profile(mask), image_width, peak=True)
+    bottoms = _corners(bottom_profile(mask), image_width, peak=False)
+    height, width = mask.shape
+    found: list[tuple] = []
+    for apex in tops:
+        for corner in bottoms:
+            span = np.stack([apex, corner])
+            length = float(np.linalg.norm(corner - apex))
+            if length < SEAM_MIN_LEN * image_width:
+                continue
+            slope = float(np.degrees(np.arctan2(abs(corner[1] - apex[1]), max(abs(corner[0] - apex[0]), 1e-6))))
+            if not HIP_MIN_DEG <= slope <= HIP_MAX_DEG:
+                continue
+            samples = _along(span)
+            xs = np.clip(np.rint(samples[:, 0]).astype(int), 0, width - 1)
+            ys = np.clip(np.rint(samples[:, 1]).astype(int), 0, height - 1)
+            if mask[ys, xs].mean() < INTERIOR_INSIDE:
+                continue
+            if _supported(span, gradients, minimum) < INTERIOR_SUPPORT:
+                continue
+            found.append(([[int(apex[0]), int(apex[1])], [int(corner[0]), int(corner[1])]],
+                          plane_side(mask, image_width), "hip"))
+    return found
+
+
 def plane_spans(
     mask: np.ndarray, image_width: int, hybrid: bool = True, context=None
 ) -> list[tuple]:
@@ -465,6 +566,25 @@ def plane_spans(
     if longest >= PROFILE_MIN_FRAC * max(_plane_width(mask), 1):
         return _label_spans(profile, mask, context, image_width)
     return _label_spans(_polygon_spans(mask, image_width), mask, context, image_width)
+
+
+def blocker_pieces(mask: np.ndarray, image_width: int, blockers) -> list[tuple]:
+    """The short pieces a plane only yields because something in front cut its edges short.
+
+    Offered alongside the plane's own lines so occlusion.bridge can join the two sides of a palm.
+    Whatever does not join is dropped again by the caller: on its own, a stub is the noise the
+    minimum length exists to remove. Nothing here changes which lines the plane produces itself.
+    """
+    if blockers is None:
+        return []
+    minimum = _minimum(MIN_SPAN_FRACTION, mask, image_width)
+    short = [
+        (points, side, edge)
+        for edge in ("eave", "ridge")
+        for points, side in extract_spans(mask, edge, blockers)
+        if _length(np.asarray(points)) < minimum
+    ]
+    return _label_spans(short, mask, None, image_width)
 
 
 def same_plane(index: int, masks: list[np.ndarray]) -> set[int]:

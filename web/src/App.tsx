@@ -20,7 +20,7 @@ export default function App() {
   );
   const [photo, setPhoto] = useState<PhotoDetail | null>(null);
   const [activeId, setActiveId] = useState<string | null>(null);
-  const [tool, setTool] = useState<Tool>("brush");
+  const [tool, setTool] = useState<Tool>("select");
   const [brushSize, setBrushSize] = useState(40);
   const [zoom, setZoom] = useState(1);
   const [history, setHistory] = useState({ canUndo: false, canRedo: false });
@@ -252,6 +252,7 @@ export default function App() {
       }
       // chooseTool, not setTool: it also clears a half-drawn line, which setTool left stranded.
       if (event.key === "b") chooseTool("brush");
+      if (event.key === "s") chooseTool("select");
       if (event.key === "e") chooseTool("erase");
       if (event.key === "v") chooseTool("vertex");
       if (event.key === "m") chooseTool("move");
@@ -265,7 +266,8 @@ export default function App() {
   const active = photo?.regions.find((item) => item.id === activeId);
 
   useEffect(() => {
-    if (!active || drawingKind) return;
+    // Picking a region switches to a tool that can edit it, but never interrupts selecting.
+    if (!active || drawingKind || tool === "select") return;
     if (active.geometry === "line" && tool !== "vertex" && tool !== "move" && tool !== "box")
       setTool("vertex");
     if (active.geometry === "area" && (tool === "vertex" || tool === "move")) setTool("brush");
@@ -394,6 +396,7 @@ export default function App() {
               zoom={zoom}
               onMaskCommit={handleMaskCommit}
               onPolylineCommit={handlePolylineCommit}
+              onSelect={setActiveId}
               onBox={handleBox}
               onPoint={handlePoint}
               onRemoveAt={handleDelete}

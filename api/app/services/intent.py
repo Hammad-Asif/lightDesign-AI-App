@@ -10,6 +10,7 @@ KIND_TERMS: dict[str, list[str]] = {
 }
 
 TRUNK_TERMS = ["trunk", "wrap"]
+COLLAR_TERMS = ["collar"]
 FROND_TERMS = ["frond", "palm leaves", "palm leaf"]
 
 BOUNDARY_PHRASES = [
@@ -79,15 +80,10 @@ def parse(prompt: str) -> Intent:
     kinds: list[str] = []
 
     if "palm" in text:
-        wants_trunk = any(term in scoped for term in TRUNK_TERMS)
-        wants_frond = any(term in scoped for term in FROND_TERMS)
-        if not wants_trunk and not wants_frond:
-            kinds += ["palm_trunk", "palm_frond"]
-        else:
-            if wants_trunk:
-                kinds.append("palm_trunk")
-            if wants_frond:
-                kinds.append("palm_frond")
+        parts = (("palm_trunk", TRUNK_TERMS), ("palm_collar", COLLAR_TERMS), ("palm_frond", FROND_TERMS))
+        wanted = [kind for kind, terms in parts if any(term in scoped for term in terms)]
+        # A palm named without a part means the whole palm, all three zones.
+        kinds += wanted or ["palm_trunk", "palm_collar", "palm_frond"]
 
     without_palms = re.sub(r"palm (?:tree|trees)?", " ", scoped)
     for kind, terms in KIND_TERMS.items():
@@ -97,7 +93,7 @@ def parse(prompt: str) -> Intent:
 
     sides = [side for side in SIDES if re.search(rf"\b{side}\b", text)]
     ordered = [k for k in
-               ["roof", "hedge", "shrub", "topiary", "palm_trunk", "palm_frond", "tree_canopy"]
+               ["roof", "hedge", "shrub", "topiary", "palm_trunk", "palm_collar", "palm_frond", "tree_canopy"]
                if k in kinds]
     # Edges read from the scoped text, so a boundary like "the bottom of the fronds" is not
     # taken for "along the bottom".
