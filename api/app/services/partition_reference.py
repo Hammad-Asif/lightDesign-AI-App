@@ -11,18 +11,56 @@ runs on top afterwards except the instruction's side/edge filter in the router.
 
 from __future__ import annotations
 
+import importlib
+import importlib.util
 import math
+from typing import TYPE_CHECKING
 
 import cv2
 import numpy as np
 from PIL import Image
 
-from roofline import partition, pipeline
-from roofline.config import Params
-
 from app.services import roofline as product_roofline
 
+if TYPE_CHECKING:
+    from roofline.config import Params
+
 WORKING_LONG_EDGE = 2000
+
+# The reference package comes from the separate roof-detection project, not from this repo, so
+# it is loaded on first use rather than at import time: a checkout without it still starts, and
+# every other mode still runs. Only PARTITION_ENGINE=reference needs it.
+MISSING = (
+    "PARTITION_ENGINE=reference needs the roof-detection project installed as the `roofline` "
+    "package (pip install -e <path to roof-detection>). Without it here, set PARTITION_ENGINE=port "
+    "to use this repo's own implementation of the same method, or EDGE_EXTRACTOR=hybrid."
+)
+_engine_cache: tuple | None = None
+
+
+def available() -> bool:
+    """Whether the reference package can be imported on this machine."""
+    try:
+        return importlib.util.find_spec("roofline") is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def _engine():
+    """(partition, pipeline, Params) from the reference package, or a RuntimeError naming the fix."""
+    global _engine_cache
+    if _engine_cache is None:
+        try:
+            package = importlib.import_module("roofline")
+            _engine_cache = (
+                importlib.import_module("roofline.partition"),
+                importlib.import_module("roofline.pipeline"),
+                importlib.import_module("roofline.config").Params,
+            )
+            del package
+        except ImportError as exc:
+            raise RuntimeError(MISSING) from exc
+    return _engine_cache
 
 
 def working_copy(image: Image.Image) -> tuple[np.ndarray, Image.Image, float]:
@@ -60,6 +98,7 @@ def result(working_bgr: np.ndarray, working_masks: list[np.ndarray], scores: lis
            params: Params | None = None) -> tuple[list[list[tuple]], set, dict, dict]:
     """The lines per plane as (points, side, edge) in full-resolution pixels, the keys of the
     inferred connectors, the pitch per plane, and the reference's own result for inspection."""
+    partition, pipeline, Params = _engine()
     params = params or Params.load()
     instances = [{"mask": (m > 0).astype(np.uint8) * 255, "score": s, "source": "fal"} for m, s in zip(working_masks, scores)]
     prep = pipeline.prepare(working_bgr, instances, params, foliage_override=foliage)

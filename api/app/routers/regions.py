@@ -181,6 +181,9 @@ def run_detection(photo_id: str, body: DetectRequest, store: Store = Depends(get
     # instances per call, JPEG. With the reference engine the working copy is built by the
     # reference's own code (OpenCV INTER_AREA), so SAM 3 sees exactly what the reference sends.
     use_reference = partitioned and settings.partition_engine == "reference"
+    if use_reference and not partition_reference.available():
+        # Said here, before a billed detection call, rather than from inside the geometry after it.
+        raise HTTPException(503, partition_reference.MISSING)
     reference: dict | None = None
     if use_reference:
         working_bgr, small, scale = partition_reference.working_copy(image)

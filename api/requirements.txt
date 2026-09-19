@@ -18,3 +18,6 @@ email-validator==2.3.0
 # project installed as a package, so the product draws exactly what that project draws.
 # Local dev: pip install -e /Users/samibutt/Documents/freelance/roof-detection
 # Deploy: vendor that project's roofline/ package (pyproject.toml is in its root).
+# Not installed? The app still starts and every other mode runs — the package is imported on
+# first use, not at import time. Set PARTITION_ENGINE=port for this repo's own implementation
+# of the same method, or EDGE_EXTRACTOR=hybrid; only "reference" needs the package.
