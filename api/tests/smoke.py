@@ -241,9 +241,10 @@ check("intent reads the entire front roofline as the full outline", real.edges =
 
 check("intent ignores unrelated prompt", intent.parse("make it look nice").matched is False)
 check("hedge prompt selects hedge only", intent.parse("mini lights in the hedges").kinds == ["hedge"])
-check("gable maps to rake, not ridge", intent.parse("put C9 on the gable").edges == ["rake"])
+check("gable maps to the sloping edges (rake and hip), not ridge",
+      intent.parse("put C9 on the gable").edges == ["rake", "hip"])
 check("rake is a roof term",
-      intent.parse("C9 on the rakes").kinds == ["roof"] and intent.parse("C9 on the rakes").edges == ["rake"])
+      intent.parse("C9 on the rakes").kinds == ["roof"] and intent.parse("C9 on the rakes").edges == ["rake", "hip"])
 check("ridge still maps to ridge", intent.parse("light the ridge").edges == ["ridge"])
 
 OUTLINE = ["eave", "rake", "hip"]
@@ -273,11 +274,14 @@ scoped_kinds = {r["kind"] for r in scoped if r["role"] == "target"}
 check("detect honours the prompt", scoped_kinds == {"roof", "palm_trunk"})
 # A roofline request also looks for what stands in front of the house, so a line that disappears
 # behind a palm can be joined back up. Those are evidence, not lighting targets.
-check("things in front of the house come back as blockers",
-      {r["kind"] for r in scoped if r["role"] == "blocker"} <= set(detect.ROOF_BLOCKERS) | {"palm_collar", "palm_frond"})
-check("a roof request asks for palms, trees and cars as well",
-      set(detect.queried_kinds(["roof"])) == {"roof", *detect.ROOF_BLOCKERS})
-check("a request with no roof asks for nothing extra", detect.queried_kinds(["hedge"]) == ["hedge"])
+check("an instruction returns only what it asked for",
+      not [r for r in scoped if r["role"] == "blocker"])
+check("a roof request asks the model for the roof and nothing else",
+      detect.queried_kinds(["roof"]) == ["roof"])
+check("blockers are fetched only when they are switched on",
+      set(detect.queried_kinds(["roof"], True)) == {"roof", *detect.ROOF_BLOCKERS})
+check("a request with no roof asks for nothing extra", detect.queried_kinds(["hedge"], True) == ["hedge"])
+check("detecting everything still includes what stands in front", "obstruction" in detect.DEFAULT_KINDS)
 check("manual regions are lighting targets", all(
     r["role"] == "target" for r in client.get(f"/photos/{photo_id}").json()["regions"] if r["source"] == "manual"))
 check("detect keeps front spans only", all(
@@ -294,14 +298,16 @@ def detected_lines(prompt: str) -> list[dict]:
     photo = client.post(
         "/photos", files={"file": ("h.png", sample_photo(), "image/png")}, data={"prompt": prompt}
     ).json()["id"]
+    # Lit lines only: partition mode also returns the edges the instruction did not ask for,
+    # hidden (visible=False), so the editor holds the whole roof structure.
     return [r for r in client.post(f"/photos/{photo}/detect", json={"kinds": None}).json()
-            if r["geometry"] == "line"]
+            if r["geometry"] == "line" and r["visible"]]
 
 
 gable_lines = detected_lines("put C9 on the gable")
-check("a gable instruction keeps the rake spans", any(r["edge"] == "rake" for r in gable_lines))
-check("a gable instruction keeps only rakes or edges it could not identify",
-      bool(gable_lines) and all(r["edge"] in {"rake", "unknown"} for r in gable_lines))
+check("a gable instruction keeps the sloping spans", any(r["edge"] in ("rake", "hip") for r in gable_lines))
+check("a gable instruction keeps only sloping edges or edges it could not identify",
+      bool(gable_lines) and all(r["edge"] in {"rake", "hip", "unknown"} for r in gable_lines))
 check("a ridge instruction no longer sweeps up rakes",
       not any(r["edge"] == "rake" for r in detected_lines("C9 along the ridge")))
 
@@ -463,12 +469,12 @@ check("a stub that never joins is dropped", all(
     for span, *_ in roof_lines([nibbled], elsewhere, intent.Intent(), True)))
 
 front_lines = detected_lines("C9 on the front roofline")
-check("front roofline keeps the front plane's rakes as well as its eave",
-      {"eave", "rake"} <= {r["edge"] for r in front_lines})
+check("front roofline keeps the front plane's sloping edges as well as its eave",
+      "eave" in {r["edge"] for r in front_lines} and {"rake", "hip"} & {r["edge"] for r in front_lines})
 check("front roofline keeps only front spans",
       bool(front_lines) and all(r["side"] == "front" for r in front_lines))
-check("front gable keeps the front plane's rakes",
-      any(r["edge"] == "rake" and r["side"] == "front" for r in detected_lines("put C9 on the front gable")))
+check("front gable keeps the front plane's sloping edges",
+      any(r["edge"] in ("rake", "hip") and r["side"] == "front" for r in detected_lines("put C9 on the front gable")))
 
 from app.providers.prompts import collapse_facade_boxes  # noqa: E402
 
@@ -734,6 +740,98 @@ try:
     check("a wrap cannot stop below its start", False)
 except ValueError:
     check("a wrap cannot stop below its start", True)
+
+# ---- instruction -> specification -> confirmed design -------------------------------------
+spec = intent.specification(
+    "C9 warm white on the front roofline at 12 inch spacing, mini lights in the hedges, "
+    "24 inch wreath on the front door"
+)
+check("an instruction splits into one request per clause", len(spec.requests) == 3)
+first, second, third = spec.requests
+check("a request keeps its place and its lighting together",
+      first.kinds == ["roof"] and first.sides == ["front"] and first.edges == OUTLINE
+      and first.lighting.category == "c9" and first.lighting.colours == ["warm_white"] and first.lighting.spacing_in == 12)
+check("the second clause is its own request", second.kinds == ["hedge"] and second.lighting.category == "mini"
+      and second.lighting.colours == [])
+check("a wreath is a hand-drawn wreath region with a size, not a spacing",
+      third.kinds == ["wreath"] and third.manual == ["wreath"] and third.lighting.size_in == 24 and third.lighting.spacing_in is None)
+check("the union still drives detection", spec.intent.kinds == ["roof", "hedge"] and spec.intent.sides == ["front"])
+check("colour counts are read",
+      intent.specification("two red one white C9 along the eaves").requests[0].lighting.counts == [2, 1])
+check("a colour sequence keeps its order",
+      intent.specification("red and green C9 on the roof").requests[0].lighting.colours == ["red", "green"])
+check("a lighting-only clause refines the request before it",
+      intent.specification("C9 on the roof, twinkling, 15 inch spacing").requests[0].lighting.twinkle is True
+      and intent.specification("C9 on the roof, twinkling, 15 inch spacing").requests[0].lighting.spacing_in == 15)
+check("'all' refines every request", all(
+    r.lighting.colours == ["warm_white"] for r in
+    intent.specification("C9 on the roofline and mini lights in the hedges, all warm white").requests))
+check("a place with no lighting takes the lighting before it",
+      intent.specification("red C9 on the roof and on the hedges").requests[0].kinds == ["roof", "hedge"])
+check("no product named splits by what each place takes by default",
+      [r.kinds for r in intent.specification("warm white on the roof and the hedges").requests] == [["roof"], ["hedge"]])
+check("multicolour is the catalogue sequence",
+      intent.specification("multicolour minis on the palms").requests[0].lighting.colours == ["red", "green", "blue", "amber"])
+check("candy cane is red and white per turn",
+      intent.specification("candy cane wrap on the palm trunks").requests[0].lighting.per_turn is True)
+check("a colour we do not carry is reported, not guessed",
+      intent.specification("teal C9 on the roof").requests[0].lighting.unread == ["teal"])
+check("steady means no twinkle", intent.specification("steady white C9 on the gutters").requests[0].lighting.twinkle is False)
+check("an instruction with no lighting gives no requests", intent.specification("make it look nice").requests == [])
+
+spec_photo = client.post(
+    "/photos", files={"file": ("h.png", sample_photo(), "image/png")},
+    data={"prompt": "C9 warm white on the front roofline at 12 inch spacing, mini lights in the hedges, "
+                    "24 inch wreath on the front door"},
+).json()
+requests = spec_photo["interpreted"]["requests"]
+check("upload reads the instruction before any detection", len(requests) == 3)
+check("a socket line resolves with its pattern and spacing",
+      requests[0]["product_name"] == "C9 LED" and requests[0]["settings"]["spacing_in"] == 12
+      and requests[0]["settings"]["pattern"]["steps"] == [{"colour": "warm_white", "count": 1}] and requests[0]["problems"] == [])
+check("a strand with no colour named is warm white, and says so",
+      requests[1]["product_name"] == "Mini lights, warm white" and "warm white" in requests[1]["assumed"])
+check("a wreath resolves to the size asked for", requests[2]["product_name"] == "Wreath, 24 in, warm white")
+reread = client.post(f"/photos/{spec_photo['id']}/interpret", json={"prompt": "blue mini lights in the hedges"}).json()
+unmatched = reread["interpreted"]["requests"][0]
+check("re-reading needs no detection and replaces the instruction", reread["prompt"] == "blue mini lights in the hedges")
+check("a strand the catalogue lacks is a problem with choices, not a guess",
+      unmatched["product_id"] is None and unmatched["problems"] and unmatched["choices"])
+odd = client.post(f"/photos/{spec_photo['id']}/interpret", json={"prompt": "C9 at 10 inch spacing on the roof"}).json()
+check("a spacing the product is not sold at is reported and left unset",
+      odd["interpreted"]["requests"][0]["settings"]["spacing_in"] is None
+      and any("spacing" in p for p in odd["interpreted"]["requests"][0]["problems"]))
+back = client.post(f"/photos/{spec_photo['id']}/interpret", json={"prompt": spec_photo["prompt"]}).json()
+check("nothing is confirmed until the user confirms", client.get(f"/photos/{spec_photo['id']}/design").json() is None)
+
+client.put(f"/photos/{spec_photo['id']}/mode", json={"mode": "automatic"})
+client.post(f"/photos/{spec_photo['id']}/detect", json={"kinds": None})
+spec_regions = client.get(f"/photos/{spec_photo['id']}").json()["regions"]
+lit_roof = {r["id"] for r in spec_regions if r["kind"] == "roof" and r["visible"] and r["edge"] in OUTLINE and r["side"] == "front"}
+confirmable = [r for r in back["interpreted"]["requests"] if r["settings"]]
+design = client.put(f"/photos/{spec_photo['id']}/design", json={"requests": confirmable})
+check("confirming puts each request's settings on the regions it lights", design.status_code == 200
+      and set(design.json()["requests"][0]["region_ids"]) == lit_roof and lit_roof)
+check("every lit region carries the confirmed product", all(
+    row["settings"]["product_id"] == requests[0]["product_id"]
+    for row in design.json()["regions"] if row["region_id"] in lit_roof))
+check("a request with nothing drawn yet is kept with no regions",
+      design.json()["requests"][-1]["kinds"] == ["wreath"] and design.json()["requests"][-1]["region_ids"] == [])
+check("the confirmed design is read back", client.get(f"/photos/{spec_photo['id']}/design").json()["id"] == design.json()["id"])
+bad_spacing = {**confirmable[0], "settings": {**confirmable[0]["settings"], "spacing_in": 10}}
+check("confirming a spacing the product is not sold at is refused",
+      client.put(f"/photos/{spec_photo['id']}/design", json={"requests": [bad_spacing]}).status_code == 422)
+wreath_on_roof = {**confirmable[0], "settings": confirmable[-1]["settings"]}
+check("a wreath cannot be confirmed onto a roofline",
+      client.put(f"/photos/{spec_photo['id']}/design", json={"requests": [wreath_on_roof]}).status_code == 422)
+check("re-confirming replaces the design rather than adding to it",
+      client.put(f"/photos/{spec_photo['id']}/design", json={"requests": confirmable[:1]}).json()["regions"].__len__() == len(lit_roof)
+      and client.get(f"/photos/{spec_photo['id']}/design").json()["id"] == design.json()["id"])
+own = client.post("/products", json={"category": "c9", "name": "My C9", "bulb_diameter_in": 1.125, "spacing_in": 12}).json()
+mine = {**confirmable[0], "settings": {**confirmable[0]["settings"], "product_id": own["id"]}}
+client.put(f"/photos/{spec_photo['id']}/design", json={"requests": [mine]})
+check("a product in a confirmed design cannot be deleted", client.delete(f"/products/{own['id']}").status_code == 409)
+check("another user cannot read my design", intruder.get(f"/photos/{spec_photo['id']}/design").status_code == 404)
 
 check("logout succeeds", client.post("/auth/logout").status_code == 204)
 check("session is gone after logout",

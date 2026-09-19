@@ -153,6 +153,9 @@ class Design(Timestamped, Base):
         ForeignKey("designs.id", ondelete="SET NULL")
     )
     name: Mapped[str] = mapped_column(String(200), default="Design", server_default="Design")
+    # The confirmed specification: the instruction's requests as the user accepted or corrected
+    # them, each with the region ids it lit. design_regions holds the per-region settings.
+    requests: Mapped[list | None] = mapped_column(JSONB)
 
 
 class DesignRegion(Timestamped, Base):

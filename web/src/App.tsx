@@ -8,8 +8,20 @@ import { ThemeToggle, type Theme } from "./components/ThemeToggle";
 import { RegionPanel } from "./components/RegionPanel";
 import { Toolbar } from "./components/Toolbar";
 import { Upload } from "./components/Upload";
-import { BLOCKER_KINDS, geometryOf, KIND_COLORS, KIND_LABELS } from "./types";
-import type { MaskingMode, PhotoDetail, Region, RegionKind, Tool, User } from "./types";
+import { Specification } from "./components/Specification";
+import { BLOCKER_KINDS, geometryOf, KIND_COLORS } from "./types";
+import type {
+  Design,
+  DesignRequest,
+  MaskingMode,
+  PaletteColour,
+  PhotoDetail,
+  Product,
+  Region,
+  RegionKind,
+  Tool,
+  User,
+} from "./types";
 
 export default function App() {
   const [user, setUser] = useState<User | null>(null);
@@ -27,6 +39,11 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [drawingKind, setDrawingKind] = useState<RegionKind | null>(null);
+  const [products, setProducts] = useState<Product[]>([]);
+  const [palette, setPalette] = useState<PaletteColour[]>([]);
+  // The photo's confirmed lighting, if any; null until the user confirms it.
+  const [design, setDesign] = useState<Design | null>(null);
+  const [showLighting, setShowLighting] = useState(false);
 
   const canvasRef = useRef<MaskCanvasHandle>(null);
 
@@ -47,10 +64,23 @@ export default function App() {
       .finally(() => setCheckingSession(false));
   }, []);
 
+  // The catalogue and palette are read once per sign-in; the specification is shown against them.
+  useEffect(() => {
+    if (!user) return;
+    Promise.all([api.listProducts(), api.palette()])
+      .then(([items, colours]) => {
+        setProducts(items);
+        setPalette(colours);
+      })
+      .catch(fail);
+  }, [user?.id]);
+
   const resetWorkspace = () => {
     setPhoto(null);
     setActiveId(null);
     setDrawingKind(null);
+    setDesign(null);
+    setShowLighting(false);
   };
 
   // A 401 anywhere means the session ended: return to sign-in instead of showing an error.
@@ -95,7 +125,15 @@ export default function App() {
   const handleUpload = (file: File, prompt: string) =>
     guard(async () => {
       const uploaded = await api.uploadPhoto(file, prompt);
+      setDesign(null);
       setPhoto(await api.getPhoto(uploaded.id));
+    });
+
+  const handleInterpret = (prompt: string) =>
+    guard(async () => {
+      if (!photo) return;
+      await api.interpret(photo.id, prompt);
+      setPhoto(await api.getPhoto(photo.id));
     });
 
   const handleMode = (mode: MaskingMode) =>
@@ -107,6 +145,12 @@ export default function App() {
       setPhoto(detail);
       setActiveId(detail.regions[0]?.id ?? null);
       setTool(detail.regions[0]?.geometry === "line" ? "vertex" : "brush");
+    });
+
+  const handleConfirmLighting = (requests: DesignRequest[]) =>
+    guard(async () => {
+      if (!photo) return;
+      setDesign(await api.putDesign(photo.id, requests));
     });
 
   const handleRedetect = (allKinds = false) =>
@@ -264,6 +308,14 @@ export default function App() {
   }, []);
 
   const active = photo?.regions.find((item) => item.id === activeId);
+  const requests = photo?.interpreted?.requests ?? [];
+  const attention = requests.filter((r) => r.problems.length > 0 || !r.settings).length;
+
+  // Whatever was confirmed for this photo before, e.g. when it is opened again.
+  useEffect(() => {
+    if (!photo?.id || !photo.mode) return;
+    api.getDesign(photo.id).then(setDesign).catch(fail);
+  }, [photo?.id, photo?.mode]);
 
   useEffect(() => {
     // Picking a region switches to a tool that can edit it, but never interrupts selecting.
@@ -309,7 +361,14 @@ export default function App() {
           </div>
           <main className="entry">
             {photo ? (
-              <ModeChooser busy={busy} onChoose={handleMode} />
+              <ModeChooser
+                photo={photo}
+                products={products}
+                palette={palette}
+                busy={busy}
+                onInterpret={handleInterpret}
+                onChoose={handleMode}
+              />
             ) : (
               <Upload busy={busy} onSubmit={handleUpload} />
             )}
@@ -365,23 +424,43 @@ export default function App() {
             />
           )}
 
-          {photo.interpreted && !photo.approved && (
+          {photo.interpreted && (
             <div className="interpreted">
-              {photo.interpreted.matched ? (
-                <span>
-                  From your instruction, masking only:{" "}
-                  <strong>
-                    {photo.interpreted.kinds.map((k) => KIND_LABELS[k]).join(", ")}
-                  </strong>
-                  {photo.interpreted.sides.length > 0 && <> · {photo.interpreted.sides.join("/")} only</>}
-                  {photo.interpreted.edges.length > 0 && <> · {photo.interpreted.edges.join("/")}</>}
-                </span>
-              ) : (
-                <span>No lighting areas recognised in your instruction — masking everything.</span>
-              )}
-              <button onClick={() => handleRedetect(true)} disabled={busy}>
-                Detect all region types
-              </button>
+              <span>
+                {requests.length
+                  ? `Instruction read as ${requests.length} ${requests.length === 1 ? "request" : "requests"}` +
+                    (attention ? `, ${attention} to check` : "") +
+                    (design ? ` · lighting confirmed for ${design.regions.length} ${design.regions.length === 1 ? "region" : "regions"}` : " · lighting not confirmed")
+                  : photo.interpreted.matched
+                    ? "Masking only what the instruction named."
+                    : "No lighting areas recognised in the instruction — masking everything."}
+              </span>
+              <span className="interpreted-actions">
+                {requests.length > 0 && (
+                  <button onClick={() => setShowLighting((open) => !open)}>
+                    {showLighting ? "Hide lighting" : design ? "Lighting" : "Review lighting"}
+                  </button>
+                )}
+                {!photo.approved && (
+                  <button onClick={() => handleRedetect(true)} disabled={busy}>
+                    Detect all region types
+                  </button>
+                )}
+              </span>
+            </div>
+          )}
+
+          {showLighting && requests.length > 0 && (
+            <div className="spec-bar">
+              <Specification
+                requests={requests}
+                products={products}
+                palette={palette}
+                regions={photo.regions}
+                design={design}
+                busy={busy}
+                onConfirm={handleConfirmLighting}
+              />
             </div>
           )}
 

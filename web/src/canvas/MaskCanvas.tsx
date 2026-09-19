@@ -99,8 +99,10 @@ export const MaskCanvas = forwardRef<MaskCanvasHandle, Props>(function MaskCanva
   const past = useRef<Snapshot[]>([]);
   const future = useRef<Snapshot[]>([]);
 
+  const photoRef = useRef(photo);
   regionsRef.current = regions;
   activeRef.current = activeId;
+  photoRef.current = photo;
 
   const scale = () => {
     const canvas = canvasRef.current;
@@ -119,8 +121,25 @@ export const MaskCanvas = forwardRef<MaskCanvasHandle, Props>(function MaskCanva
     context.clearRect(0, 0, canvas.width, canvas.height);
     context.drawImage(image, 0, 0, canvas.width, canvas.height);
 
+    // Roof planes from the partition, filled under the lines the way the reference app draws
+    // them, so a glance shows which plane each edge belongs to.
+    for (const plane of photoRef.current.interpreted?.planes ?? []) {
+      if (!plane.polygon || plane.polygon.length < 3) continue;
+      context.beginPath();
+      plane.polygon.forEach((p, i) => (i ? context.lineTo(p[0], p[1]) : context.moveTo(p[0], p[1])));
+      context.closePath();
+      context.fillStyle = plane.color;
+      context.globalAlpha = 0.2;
+      context.fill();
+      context.globalAlpha = 1;
+    }
+
+    const junctions: number[][] = [];
     for (const region of regionsRef.current) {
-      if (!region.visible) continue;
+      // A roof line the instruction did not ask for is still drawn, dashed and dim: detected,
+      // not lit. Every other hidden region stays off the canvas.
+      const unlit = !region.visible && region.kind === "roof" && region.geometry === "line";
+      if (!region.visible && !unlit) continue;
       const isActive = region.id === activeRef.current;
 
       if (region.geometry === "area") {
@@ -156,11 +175,28 @@ export const MaskCanvas = forwardRef<MaskCanvasHandle, Props>(function MaskCanva
         context.setLineDash([0.5 / factor, 7 / factor]);
       }
 
-      context.strokeStyle = region.color;
-      context.lineWidth = (isActive ? 4.5 : 2.5) / factor;
-      trace(points);
-      context.stroke();
-      context.setLineDash([]);
+      if (region.kind === "roof") {
+        // a dark halo keeps a line crisp against bright sky and light shingles
+        context.globalAlpha = unlit ? 0.55 : 1;
+        context.setLineDash(unlit ? [8 / factor, 6 / factor] : unidentified ? [0.5 / factor, 7 / factor] : []);
+        context.strokeStyle = "rgba(0, 0, 0, 0.6)";
+        context.lineWidth = (isActive ? 8 : 6) / factor;
+        trace(points);
+        context.stroke();
+        context.strokeStyle = region.color;
+        context.lineWidth = (isActive ? 4.5 : 3) / factor;
+        trace(points);
+        context.stroke();
+        context.setLineDash([]);
+        context.globalAlpha = 1;
+        if (!unlit) junctions.push(points[0], points[points.length - 1]);
+      } else {
+        context.strokeStyle = region.color;
+        context.lineWidth = (isActive ? 4.5 : 2.5) / factor;
+        trace(points);
+        context.stroke();
+        context.setLineDash([]);
+      }
 
       // Stretches that pass behind an object are dashed. They are measured along the saved
       // line, so they are skipped while that line is being dragged.
@@ -190,6 +226,20 @@ export const MaskCanvas = forwardRef<MaskCanvasHandle, Props>(function MaskCanva
           context.strokeStyle = region.color;
           context.stroke();
         }
+      }
+    }
+
+    // junctions: where roof lines meet, drawn once on top of every line
+    if (junctions.length) {
+      const radius = 4.5 / factor;
+      context.lineWidth = 1.5 / factor;
+      for (const [x, y] of junctions) {
+        context.beginPath();
+        context.arc(x, y, radius, 0, Math.PI * 2);
+        context.fillStyle = "#ff3b30";
+        context.fill();
+        context.strokeStyle = "rgba(0, 0, 0, 0.6)";
+        context.stroke();
       }
     }
 

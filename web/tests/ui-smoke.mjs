@@ -2,6 +2,9 @@ import { chromium } from "playwright";
 import { mkdirSync, writeFileSync } from "node:fs";
 
 const OUT = process.env.SHOT_DIR ?? "./test-output";
+// Defaults are the usual dev servers; set both to point at a mock-provider pair on other ports.
+const API = process.env.API_URL ?? "http://127.0.0.1:8000";
+const UI = process.env.UI_URL ?? "http://127.0.0.1:5173/";
 mkdirSync(OUT, { recursive: true });
 const errors = [];
 let failed = false;
@@ -12,7 +15,7 @@ function check(label, ok) {
 }
 
 
-const health = await fetch("http://127.0.0.1:8000/health").then((r) => r.json());
+const health = await fetch(`${API}/health`).then((r) => r.json());
 if (health.segmentation_provider !== "mock") {
   console.error(
     `This suite asserts against the mock provider's fixed regions, but the API is running ` +
@@ -26,7 +29,7 @@ const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
 page.on("console", (m) => m.type() === "error" && errors.push(m.text()));
 page.on("pageerror", (e) => errors.push(String(e)));
 
-await page.goto("http://127.0.0.1:5173/", { waitUntil: "networkidle" });
+await page.goto(UI, { waitUntil: "networkidle" });
 check("sign-in screen shows first", (await page.locator("h1").innerText()) === "Sign in");
 await page.getByRole("button", { name: "New here? Create an account" }).click();
 await page.getByLabel("Name").fill("UI Smoke");
@@ -61,19 +64,31 @@ await page.setInputFiles('input[type="file"]', `${OUT}/house.png`);
 await page.fill("textarea", "C9 on the front roofline, mini lights in the hedges and palm trunks");
 await page.getByRole("button", { name: "Continue" }).click();
 
-await page.waitForSelector("text=Choose masking mode", { timeout: 15000 });
+await page.waitForSelector("text=Check the instruction", { timeout: 15000 });
 check("mode chooser appears", true);
+// The instruction is read before any detection: one row per clause, resolved to a product.
+const preview = await page.locator(".spec-row").allInnerTexts();
+check(`instruction read as requests before detection (${preview.length})`, preview.length === 2);
+check("roofline request resolved to a C9 line with the outline edges",
+  preview[0].includes("Roofline") && preview[0].includes("eaves, rakes, hips") && preview[0].includes("C9 LED"));
+check("hedges and trunks share one strand request, warm white assumed",
+  preview[1].includes("Hedge") && preview[1].includes("Palm trunk") && preview[1].includes("Mini lights, warm white")
+  && preview[1].includes("Assumed: warm white"));
 await page.screenshot({ path: `${OUT}/01-mode.png` });
+// Re-reading a corrected instruction costs nothing and needs no detection.
+await page.fill("textarea", "red and green C9 on the front roofline at 15 inch spacing, mini lights in the hedges and palm trunks");
+await page.getByRole("button", { name: "Read it again" }).click();
+await page.waitForFunction(() => document.querySelector(".spec-row")?.textContent?.includes("Green"), null, { timeout: 15000 });
+const reread = await page.locator(".spec-row").first().innerText();
+check("a corrected instruction is re-read in place", reread.includes("Red") && reread.includes("15 in spacing"));
 
 await page.getByRole("button", { name: /Automatic/ }).click();
 await page.waitForSelector(".sidebar", { timeout: 120000 });
 await page.waitForTimeout(1200);
 
 const banner = await page.locator(".interpreted").innerText();
-check("interpreted banner names only the requested areas",
-  banner.includes("Roofline") && banner.includes("Hedge") && banner.includes("Palm trunk"));
-check("interpreted banner excludes what was not asked for",
-  !banner.includes("Topiary") && !banner.includes("Tree canopy"));
+check("interpreted banner counts the requests and says nothing is confirmed",
+  banner.includes("2 requests") && banner.includes("not confirmed"));
 
 const kinds = await page.locator(".region[data-geometry='area'][data-role='target'] select").evaluateAll(
   (nodes) => [...new Set(nodes.map((n) => n.value))],
@@ -133,6 +148,25 @@ check("roofline has kind, side and edge selectors", (await roofRegion.locator("s
 await sideSelect.selectOption("front");
 await page.waitForTimeout(600);
 check("roofline side set to front", (await sideSelect.inputValue()) === "front");
+
+// Confirming the lighting: each request against the regions it will light, editable, then saved
+// as the photo's design. Nothing renders from the instruction directly.
+await page.getByRole("button", { name: "Review lighting" }).click();
+await page.waitForSelector(".spec-bar .spec-row", { timeout: 10000 });
+const rows = await page.locator(".spec-bar .spec-row").allInnerTexts();
+check("lighting rows count the regions each request lights", rows.every((row) => /\d+ regions?|no regions yet/.test(row)));
+check("roofline request lights at least one region", /[1-9]\d* regions?/.test(rows[0]));
+const spacing = page.locator(".spec-bar .spec-row").first().getByTitle("Spacing");
+await spacing.selectOption("18");
+check("spacing can be corrected before confirming", (await spacing.inputValue()) === "18");
+await page.getByRole("button", { name: "Confirm lighting" }).click();
+await page.waitForFunction(() => document.querySelector(".interpreted")?.textContent?.includes("lighting confirmed"), null, { timeout: 10000 });
+const confirmedBanner = await page.locator(".interpreted").innerText();
+check(`design confirmed with regions (${confirmedBanner.match(/confirmed for (\d+)/)?.[1]})`,
+  /confirmed for [1-9]\d* regions?/.test(confirmedBanner));
+check("confirm button rests once confirmed", !(await page.getByRole("button", { name: "Confirm changes" }).isEnabled()));
+await page.screenshot({ path: `${OUT}/04b-lighting.png` });
+await page.getByRole("button", { name: "Hide lighting" }).click();
 
 await page.getByRole("button", { name: "Approve mask set" }).click();
 await page.waitForSelector(".badge.ok", { timeout: 10000 });

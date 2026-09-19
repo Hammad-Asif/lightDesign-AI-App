@@ -13,3 +13,8 @@ alembic==1.20.0
 psycopg[binary]==3.3.5
 argon2-cffi==25.1.0
 email-validator==2.3.0
+
+# Reference roof-line engine (PARTITION_ENGINE=reference, the default): the roof-detection
+# project installed as a package, so the product draws exactly what that project draws.
+# Local dev: pip install -e /Users/samibutt/Documents/freelance/roof-detection
+# Deploy: vendor that project's roofline/ package (pyproject.toml is in its root).

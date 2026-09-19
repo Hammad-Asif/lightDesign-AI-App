@@ -104,10 +104,21 @@ def line(points, gradients, minimum: float, band: float = BAND, smooth: int = SM
     Each straight run of the polyline is treated on its own, so a line that legitimately turns —
     two rakes joined at a gable apex — keeps its corner instead of being fitted into one line.
     """
+    return fitted_line(points, gradients, minimum, band, smooth, simplify, fit)[0]
+
+
+def fitted_line(points, gradients, minimum: float, band: float = BAND, smooth: int = SMOOTH,
+                simplify: float = SIMPLIFY, fit: bool = True) -> tuple[list[list[int]], bool]:
+    """`line`, and whether every run that moved found a straight fit.
+
+    False means at least one run kept its median-smoothed points because no straight line had
+    the consensus — the wobble a caller with its own straight geometry may prefer to keep out.
+    """
     original = np.asarray(points, dtype=float)
     if len(original) < 2:
-        return [[int(x), int(y)] for x, y in original]
+        return [[int(x), int(y)] for x, y in original], True
 
+    straight = True
     runs: list[np.ndarray] = []
     for pair in zip(original[:-1], original[1:]):
         ends = np.stack(pair)
@@ -122,6 +133,8 @@ def line(points, gradients, minimum: float, band: float = BAND, smooth: int = SM
         moved = samples + normal * _median(offsets, smooth)[:, None]
         fitted = _fit(moved, ends, FIT_TOLERANCE, FIT_ROUNDS) if fit else None
         # Without a straight answer the run keeps the smoothed points it found.
+        if fit and fitted is None:
+            straight = False
         runs.append(fitted if fitted is not None else moved)
 
     # Where two runs meet, both moved their shared corner; sit it between the two answers.
@@ -133,7 +146,7 @@ def line(points, gradients, minimum: float, band: float = BAND, smooth: int = SM
     run = np.vstack([piece if i == 0 else piece[1:] for i, piece in enumerate(joined)])
     if simplify > 0 and len(run) > 2:
         run = cv2.approxPolyDP(run.astype(np.float32).reshape(-1, 1, 2), simplify, False).reshape(-1, 2)
-    return [[int(round(x)), int(round(y))] for x, y in run]
+    return [[int(round(x)), int(round(y))] for x, y in run], straight
 
 
 def lines(spans: list[tuple], gradients, minimum: float, **options) -> list[tuple]:

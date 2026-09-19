@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 from app.auth import current_user
 from app.config import get_settings
 from app.db import get_db
-from app.models import DesignRegion, Photo, Product, Region, User
+from app.models import Design, DesignRegion, Photo, Product, Region, User
 from app.services import occlusion
 
 REGION_FIELDS = (
@@ -156,7 +156,7 @@ class Store:
         self.db.execute(select(Photo.id).where(Photo.id == photo.id).with_for_update())
         stale = list(
             self.db.scalars(
-                select(Region.id).where(Region.photo_id == photo.id, Region.source == "auto")
+                select(Region.id).where(Region.photo_id == photo.id, Region.source.in_(("auto", "inferred")))
             )
         )
         self.db.execute(delete(Region).where(Region.id.in_(stale)))
@@ -244,6 +244,36 @@ class Store:
             raise HTTPException(409, "This product is used in a design")
         self.db.delete(product)
         self.db.commit()
+
+    # -- designs ---------------------------------------------------------------
+
+    def design(self, photo: Photo) -> Design | None:
+        """The photo's design: one per photo until Milestone 4 adds revisions."""
+        return self.db.scalar(
+            select(Design)
+            .where(Design.photo_id == photo.id, Design.owner_id == self.user.id)
+            .order_by(Design.created_at.desc())
+            .limit(1)
+        )
+
+    def design_regions(self, design: Design) -> list[DesignRegion]:
+        return list(self.db.scalars(select(DesignRegion).where(DesignRegion.design_id == design.id)))
+
+    def set_design(self, photo: Photo, requests: list[dict], rows: dict[uuid.UUID, dict]) -> Design:
+        """Replace the photo's design with the confirmed requests and their per-region settings."""
+        design = self.design(photo)
+        if design is None:
+            design = Design(id=uuid.uuid4(), owner_id=self.user.id, photo_id=photo.id)
+            self.db.add(design)
+        else:
+            self.db.execute(delete(DesignRegion).where(DesignRegion.design_id == design.id))
+        design.requests = requests
+        self.db.add_all(
+            DesignRegion(id=uuid.uuid4(), design_id=design.id, region_id=region_id, settings=settings)
+            for region_id, settings in rows.items()
+        )
+        self.db.commit()
+        return design
 
     # -- files -----------------------------------------------------------------
 

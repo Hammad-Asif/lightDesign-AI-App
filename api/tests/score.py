@@ -11,7 +11,7 @@ import cv2
 import numpy as np
 from PIL import Image, ImageOps
 
-PHOTOS = Path("/Users/samibutt/Documents/freelance/Hammad-project/bulb-project/lighting project")
+PHOTOS = Path("/imgs")
 CLEAN_DIR = PHOTOS / "truth_clean"     # cleaned annotations win when present
 MAX_EDGE, MIN_EDGE = 1280, 1000
 TOLERANCE = 8.0

@@ -1,4 +1,17 @@
-import type { Edge, Photo, PhotoDetail, Region, RegionKind, MaskingMode, Side, User } from "./types";
+import type {
+  Design,
+  DesignRequest,
+  Edge,
+  MaskingMode,
+  PaletteColour,
+  Photo,
+  PhotoDetail,
+  Product,
+  Region,
+  RegionKind,
+  Side,
+  User,
+} from "./types";
 
 export const API_URL = import.meta.env.VITE_API_URL ?? "";
 
@@ -8,6 +21,9 @@ export class UnauthorizedError extends Error {}
 function detailOf(body: { detail?: unknown }, fallback: string): string {
   if (typeof body.detail === "string") return body.detail;
   if (Array.isArray(body.detail) && body.detail[0]?.msg) return String(body.detail[0].msg);
+  // A list of plain sentences, as the design confirmation returns when settings do not fit.
+  if (Array.isArray(body.detail) && body.detail.every((item: unknown) => typeof item === "string"))
+    return (body.detail as string[]).join(" ");
   return fallback;
 }
 
@@ -83,6 +99,19 @@ export const refineRegion = (
   id: string,
   payload: { box?: number[]; point?: number[]; region_id?: string; kind?: RegionKind },
 ) => send<Region>(`/photos/${id}/regions/refine`, "POST", payload);
+
+// Re-reads the instruction (a new one when given) without detecting anything: reading is free.
+export const interpret = (id: string, prompt?: string) =>
+  send<Photo>(`/photos/${id}/interpret`, "POST", { prompt: prompt ?? null });
+
+export const listProducts = () => send<Product[]>("/products", "GET");
+export const palette = () => send<PaletteColour[]>("/products/palette", "GET");
+
+// null until the lighting has been confirmed for the photo.
+export const getDesign = (id: string) => send<Design | null>(`/photos/${id}/design`, "GET");
+
+export const putDesign = (id: string, requests: DesignRequest[]) =>
+  send<Design>(`/photos/${id}/design`, "PUT", { requests });
 
 export const approvePhoto = (id: string) => send<PhotoDetail>(`/photos/${id}/approve`, "POST");
 export const reopenPhoto = (id: string) => send<PhotoDetail>(`/photos/${id}/reopen`, "POST");

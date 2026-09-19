@@ -38,14 +38,44 @@ class Settings(BaseSettings):
     fal_timeout: float = 120.0
     fal_concurrency: int = 4
 
-    # hybrid | profile — how roof edges are pulled from a plane mask. "profile" restores
-    # the top/bottom-profile-only behaviour exactly, without a code rollback.
+    # hybrid | profile | partition — how roof edges are pulled from the plane masks. "profile"
+    # restores the top/bottom-profile-only behaviour exactly, without a code rollback.
+    # "partition" (services/partition.py) gives every pixel to one plane first and reads the
+    # lines off the borders, so hips and ridges between planes come out as lines; opt-in.
     edge_extractor: str = "hybrid"
+    # Partition mode's detection request, matching the reference method: working-copy long
+    # edge and instances per call (it also posts a JPEG). Both change the cache key of every
+    # roof response, so switching a photo between modes re-bills its detection.
+    partition_detect_max_edge: int = 2000
+    partition_fal_max_masks: int = 12
+    # After the energy relaxation each lit line (eave, rake, hip) may move along its own normal
+    # to the strongest parallel image edge within the band — soffit to fascia — with direction
+    # kept and every junction re-solved. Off: the geometry is left exactly as the graph made it.
+    # reference | port. "reference" runs the reference implementation itself (the `roofline`
+    # package installed from the roof-detection project) on the reference's own working copy,
+    # so the product draws exactly what that project draws. "port" is services/partition.py.
+    partition_engine: str = "reference"
+    # Reference-engine option: find foliage with a SAM "tree" pass (one more call) instead of
+    # by colour, as the reference app's "Find trees with SAM" box does.
+    partition_tree_pass: bool = False
+    partition_constrained_snap: bool = True
+    # The product's free snap (services/snap.py, with the straight-fit fallback) on top of
+    # partition's lines as well. Off by default: it refits per line and can turn a corner.
+    partition_snap: bool = False
+    # Product rule kept from the hybrid path: a lower roof's top edge running into the wall of
+    # the storey above is relabelled "junction" (dark). Off: roles are the reference table only.
+    partition_junctions: bool = True
 
     # Move each extracted roof line onto the image edge it follows (services/snap.py). Measured
     # on the annotated houses: mean F1 49.6 -> 54.8, and a drawn line sits 3.1px from the true
     # gutter instead of 4.8px. Set false to keep lines exactly where the mask put them.
     snap_to_edges: bool = True
+
+    # Off: an instruction returns only what it asked for. On: a roof request also detects palms,
+    # trees and cars, kept as blockers rather than lighting targets, so a line passing behind one
+    # is joined up and its hidden stretch reported. That costs extra detection requests per photo
+    # and puts objects on screen the instruction never mentioned.
+    detect_blockers: bool = False
 
     # Off: draw hips that fall inside a single mask, where two roof planes came back merged and
     # no mask boundary runs along the line between them. The candidates are real geometry (apex

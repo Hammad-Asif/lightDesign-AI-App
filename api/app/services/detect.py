@@ -15,7 +15,18 @@ DEFAULT_KINDS = [
     "palm_collar",
     "palm_frond",
     "tree_canopy",
+    # Only in the "detect everything" pass: an instruction that says roofline gets a roofline.
+    "obstruction",
 ]
+
+# One colour per roof edge role, the reference app's palette, so a glance tells a ridge from an
+# eave. Edges the role step could not name keep the plain roof colour.
+EDGE_COLORS = {"ridge": "#ff3b30", "hip": "#ff9f0a", "valley": "#0a84ff", "eave": "#39ff14", "rake": "#bf5af2"}
+
+
+def edge_color(edge: str | None) -> str:
+    return EDGE_COLORS.get(edge or "", COLORS["roof"])
+
 
 COLORS = {
     "roof": "#38bdf8",
@@ -113,16 +124,16 @@ def upscale_mask(mask: np.ndarray, size: tuple[int, int]) -> np.ndarray:
     return cv2.resize(mask.astype(np.uint8), size, interpolation=cv2.INTER_NEAREST).astype(bool)
 
 
-# What can stand between the camera and a roofline. Asked for alongside any roof request, so a
-# line that disappears behind a palm can be joined up and the hidden stretch reported. They are
-# detected as evidence, not as lighting targets: routers/regions.py stores them as blockers.
+# What can stand between the camera and a roofline. Detecting them lets a line that disappears
+# behind a palm be joined up and its hidden stretch reported — but they are not what the customer
+# asked for, so they are only fetched when blockers are switched on (Settings.detect_blockers).
 ROOF_BLOCKERS = ["obstruction", "palm_trunk", "tree_canopy"]
 
 
-def queried_kinds(selected: list[str]) -> list[str]:
-    """What a request asks the model for: rooflines also look for things standing in front."""
+def queried_kinds(selected: list[str], blockers: bool = False) -> list[str]:
+    """What a request asks the model for. An instruction names what it wants and gets that."""
     kinds = list(selected)
-    if "roof" in kinds:
+    if blockers and "roof" in kinds:
         kinds += [kind for kind in ROOF_BLOCKERS if kind not in kinds]
     return kinds
 
@@ -131,8 +142,9 @@ def run(
     image: Image.Image,
     provider: SegmentationProvider,
     kinds: list[str] | None = None,
+    blockers: bool = False,
 ) -> list[Detection]:
-    wanted = queried_kinds(kinds or DEFAULT_KINDS)
+    wanted = queried_kinds(kinds or DEFAULT_KINDS, blockers)
 
     # Every kind, roof included, is one text prompt to the same model.
     detections = provider.detect(image, query_kinds(wanted))

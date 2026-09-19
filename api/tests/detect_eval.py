@@ -52,24 +52,28 @@ DEFAULT_PHOTOS = [
 ]
 
 
-def cache_key(photo: str, size: tuple[int, int], prompt: str, extra: dict) -> str:
+def cache_key(photo: str, size: tuple[int, int], prompt: str, extra: dict,
+              max_masks: int | None = None, image_format: str = "png") -> str:
     settings = get_settings()
-    material = [photo, list(size), prompt, extra, settings.fal_model, settings.fal_max_masks]
+    material = [photo, list(size), prompt, extra, settings.fal_model, max_masks or settings.fal_max_masks]
+    # A JPEG post is a different request; PNG keys stay as they were.
+    if image_format != "png":
+        material.append(image_format)
     return hashlib.sha1(json.dumps(material, sort_keys=True).encode()).hexdigest()[:16]
 
 
 class CachedFal(F.FalProvider):
     """The real provider, with every response kept on disk and spending made explicit."""
 
-    def __init__(self, photo: str, spend: bool):
-        super().__init__()
+    def __init__(self, photo: str, spend: bool, max_masks: int | None = None, image_format: str = "png"):
+        super().__init__(max_masks=max_masks, image_format=image_format)
         self.photo = photo
         self.spend = spend
         self.billed = 0
         self._lock = threading.Lock()
 
     def _call(self, image, prompt, **extra):
-        key = cache_key(self.photo, image.size, prompt, extra)
+        key = cache_key(self.photo, image.size, prompt, extra, self.max_masks, self.image_format)
         entry = CACHE / f"{key}.json"
         if entry.exists():
             return json.loads(entry.read_text())

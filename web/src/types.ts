@@ -20,7 +20,7 @@ export type RegionKind =
 
 export type Geometry = "line" | "area";
 export type Side = "front" | "left" | "right";
-export type Edge = "eave" | "rake" | "hip" | "ridge" | "junction" | "unknown";
+export type Edge = "eave" | "rake" | "hip" | "ridge" | "valley" | "junction" | "unknown";
 export type MaskingMode = "manual" | "automatic";
 export type Tool = "select" | "brush" | "erase" | "vertex" | "move" | "box" | "line" | "click";
 
@@ -34,7 +34,7 @@ export interface Region {
   role: RegionRole;
   label: string;
   geometry: Geometry;
-  source: "auto" | "manual";
+  source: "auto" | "manual" | "inferred";
   color: string;
   score: number;
   visible: boolean;
@@ -46,11 +46,95 @@ export interface Region {
   hidden?: number[][] | null;
 }
 
+export type ProductCategory = "c9" | "c7" | "mini" | "icicle" | "wreath" | "garland";
+
+export interface Product {
+  id: string;
+  builtin: boolean;
+  category: ProductCategory;
+  name: string;
+  spacing_in: number | null;
+  spacing_options_in: number[];
+  diameter_in: number | null;
+  colours: string[];
+  twinkle: boolean;
+}
+
+export interface PaletteColour {
+  key: string;
+  name: string;
+  hex: string;
+}
+
+export interface PatternStep {
+  colour: string;
+  count: number;
+}
+
+export interface Pattern {
+  steps: PatternStep[];
+  direction?: "forward" | "reverse";
+  offset?: number;
+  unit?: "bulb" | "turn";
+}
+
+// What lights one region: render parameters, never pixels. Mirrors schemas.LightingSettings.
+export interface LightingSettings {
+  product_id: string;
+  pattern?: Pattern | null;
+  spacing_in?: number | null;
+  twinkle?: boolean | null;
+  wrap?: { start: number; stop: number; turn_spacing_in: number } | null;
+}
+
+// One clause of the instruction, resolved against the catalogue on the server.
+export interface InterpretedRequest {
+  text: string;
+  kinds: RegionKind[];
+  sides: Side[];
+  edges: Edge[];
+  // Kinds detection never finds; the salesperson draws them.
+  manual: RegionKind[];
+  lighting: {
+    category: ProductCategory | null;
+    colours: string[];
+    counts: number[];
+    spacing_in: number | null;
+    size_in: number | null;
+    twinkle: boolean | null;
+    per_turn: boolean;
+  };
+  product_id: string | null;
+  product_name: string | null;
+  settings: LightingSettings | null;
+  assumed: string[];
+  problems: string[];
+  choices: { id: string; name: string }[];
+}
+
+export interface DesignRequest {
+  text: string;
+  kinds: RegionKind[];
+  sides: Side[];
+  edges: Edge[];
+  settings: LightingSettings;
+}
+
+export interface Design {
+  id: string;
+  name: string;
+  requests: (DesignRequest & { product_name: string; region_ids: string[] })[];
+  regions: { region_id: string; settings: LightingSettings }[];
+}
+
 export interface Interpreted {
   kinds: RegionKind[];
   sides: Side[];
   edges: Edge[];
   matched: boolean;
+  requests?: InterpretedRequest[] | null;
+  // Partition mode: the detected roof planes, closed polygons in photo pixels with their partition colour.
+  planes?: { plane: number; polygon: number[][]; color: string }[] | null;
 }
 
 export interface Photo {
@@ -160,4 +244,24 @@ export interface User {
   email: string;
   name: string;
   created_at: string;
+}
+
+export const CATEGORY_LABELS: Record<ProductCategory, string> = {
+  c9: "C9",
+  c7: "C7",
+  mini: "Mini lights",
+  icicle: "Icicle lights",
+  wreath: "Wreath",
+  garland: "Garland",
+};
+
+// Whether a confirmed request lights this region. Mirrors lighting.matches on the server.
+export function requestLights(
+  request: { kinds: RegionKind[]; sides: Side[]; edges: Edge[] },
+  region: Region,
+): boolean {
+  if (region.role !== "target" || !region.visible || !request.kinds.includes(region.kind)) return false;
+  if (request.sides.length && region.side && !request.sides.includes(region.side)) return false;
+  if (region.kind === "roof" && request.edges.length) return region.edge !== null && request.edges.includes(region.edge);
+  return region.kind !== "roof" || (region.edge !== "junction" && region.edge !== "unknown");
 }

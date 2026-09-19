@@ -18,7 +18,12 @@ interface Props {
 }
 
 const SIDES: Side[] = ["front", "left", "right"];
-const EDGES: Edge[] = ["eave", "rake", "hip", "ridge", "junction", "unknown"];
+const EDGES: Edge[] = ["eave", "rake", "hip", "ridge", "valley", "junction", "unknown"];
+// The reference app's palette, one colour per roof edge role (kept in step with the API's
+// detect.EDGE_COLORS). Edges without a named role keep the plain roof colour.
+export const EDGE_COLORS: Partial<Record<Edge, string>> = {
+  ridge: "#ff3b30", hip: "#ff9f0a", valley: "#0a84ff", eave: "#39ff14", rake: "#bf5af2",
+};
 
 // Share of a line that passes behind objects, as a whole percentage.
 function hiddenShare(region: Region): number {
@@ -116,7 +121,11 @@ export function RegionPanel({
               <select
                 value={region.edge ?? "eave"}
                 onClick={(event) => event.stopPropagation()}
-                onChange={(event) => onPatch(region.id, { edge: event.target.value as Edge })}
+                onChange={(event) => {
+                  const edge = event.target.value as Edge;
+                  // a new role brings its colour with it, so the drawing stays readable
+                  onPatch(region.id, { edge, ...(EDGE_COLORS[edge] ? { color: EDGE_COLORS[edge] } : {}) });
+                }}
               >
                 {EDGES.map((edge) => (
                   <option key={edge} value={edge}>
@@ -140,7 +149,11 @@ export function RegionPanel({
         )}
 
         <span className="source">
-          {region.source === "auto" ? `auto ${Math.round(region.score * 100)}%` : "manual"}
+          {region.source === "auto"
+            ? `auto ${Math.round(region.score * 100)}%`
+            : region.source === "inferred"
+              ? "inferred"
+              : "manual"}
         </span>
       </div>
 

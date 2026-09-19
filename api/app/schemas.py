@@ -35,7 +35,7 @@ Side = Literal["front", "left", "right"]
 # fabricating a label the UI would present as fact.
 # "hip" is a sloping line where two roof planes meet; it is lit as part of the outline.
 # "junction" is where a lower roof runs into the wall above it: identified, and never lit.
-Edge = Literal["eave", "rake", "hip", "ridge", "junction", "unknown"]
+Edge = Literal["eave", "rake", "hip", "ridge", "valley", "junction", "unknown"]
 MaskingMode = Literal["manual", "automatic"]
 
 
@@ -45,7 +45,8 @@ class Region(BaseModel):
     role: RegionRole = "target"
     label: str
     geometry: GeometryType
-    source: Literal["auto", "manual"]
+    # inferred: a partition-mode connector drawn across an occluded stretch from no pixels.
+    source: Literal["auto", "manual", "inferred"]
     color: str
     score: float = 1.0
     visible: bool = True
@@ -62,6 +63,15 @@ class Interpreted(BaseModel):
     sides: list[Side] = []
     edges: list[Edge] = []
     matched: bool = False
+    # The instruction clause by clause, each resolved against the catalogue (services/lighting.py):
+    # where the lights go, which product, pattern and spacing, what was assumed, what did not match.
+    requests: list[dict] | None = None
+    # Partition mode: per detected plane, pitch as seen, calibrated when a focal length is
+    # known, and the nearest standard pitch with which of the two it came from.
+    pitch: dict | None = None
+    # Partition mode: the detected roof planes as closed polygons in photo pixels, each with the
+    # colour it has in the partition, so the editor can fill them under the lines.
+    planes: list[dict] | None = None
 
 
 class Photo(BaseModel):
@@ -118,6 +128,11 @@ class RegionPatch(BaseModel):
 
 class ModeRequest(BaseModel):
     mode: MaskingMode
+
+
+class InterpretRequest(BaseModel):
+    # None keeps the photo's instruction and re-reads it, e.g. after the catalogue changed.
+    prompt: str | None = Field(default=None, max_length=2000)
 
 
 class RegisterRequest(BaseModel):
@@ -245,3 +260,30 @@ class LightingSettings(BaseModel):
     twinkle: bool | None = None
     # Palm trunks and collars only; None there means wrapped over the full height.
     wrap: Wrap | None = None
+
+
+class DesignRequest(BaseModel):
+    """One confirmed request: the places it lights and the lighting they get."""
+
+    text: str = Field(default="", max_length=400)
+    kinds: list[RegionKind] = Field(min_length=1)
+    sides: list[Side] = []
+    edges: list[Edge] = []
+    settings: LightingSettings
+
+
+class DesignPut(BaseModel):
+    requests: list[DesignRequest] = Field(default=[], max_length=24)
+
+
+class DesignRegionOut(BaseModel):
+    region_id: str
+    settings: LightingSettings
+
+
+class DesignOut(BaseModel):
+    id: str
+    name: str
+    # The confirmed requests, each with the regions it lit at the time of confirmation.
+    requests: list[dict]
+    regions: list[DesignRegionOut]

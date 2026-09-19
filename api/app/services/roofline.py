@@ -75,7 +75,7 @@ SAME_PLANE_CONTAINMENT = 0.50    # overlap as a share of the smaller mask
 
 # Which label survives when two near-duplicate spans disagree: a useful, known edge beats
 # an unknown one, so dedupe never drops a labelled span in favour of an unlabelled twin.
-EDGE_ORDER = {"eave": 0, "rake": 1, "hip": 2, "ridge": 3, "junction": 4, "unknown": 5}
+EDGE_ORDER = {"eave": 0, "rake": 1, "hip": 2, "ridge": 3, "valley": 4, "junction": 5, "unknown": 6}
 
 
 def top_profile(mask: np.ndarray) -> np.ndarray:

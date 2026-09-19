@@ -42,8 +42,17 @@ MASK_THRESHOLD = 127
 ASPECT_TOLERANCE = 0.02
 
 
-def _data_uri(image: Image.Image) -> str:
+def _data_uri(image: Image.Image, image_format: str = "png") -> str:
     buffer = io.BytesIO()
+    if image_format == "jpeg":
+        # The reference method posts JPEG at quality 92, encoded by OpenCV. Same encoder here, so
+        # identical pixels give identical bytes and SAM 3 sees exactly what the reference sends.
+        bgr = np.ascontiguousarray(np.asarray(image.convert("RGB"))[:, :, ::-1])
+        ok, encoded = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 92])
+        if not ok:
+            raise RuntimeError("could not encode the working copy as JPEG")
+        return "data:image/jpeg;base64," + base64.b64encode(encoded.tobytes()).decode()
+        return "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode()
     image.save(buffer, format="PNG")
     return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
 
@@ -79,14 +88,25 @@ def _conform(mask: np.ndarray, size: tuple[int, int]) -> np.ndarray:
     return cv2.resize(mask.astype(np.uint8), size, interpolation=cv2.INTER_NEAREST).astype(bool)
 
 
+MASK_FETCH_TIMEOUT = 15.0     # s per attempt: a stalled CDN connection must not cost the whole fal_timeout
+MASK_FETCH_ATTEMPTS = 3
+
+
 def _mask_from_url(url: str, size: tuple[int, int], timeout: float) -> np.ndarray | None:
-    try:
-        data = httpx.get(url, timeout=timeout).content
-        mask = np.array(Image.open(io.BytesIO(data)).convert("L")) > MASK_THRESHOLD
-    except Exception as exc:  # noqa: BLE001 — one bad mask must not kill the batch
-        log.warning("could not fetch a fal mask: %s", str(exc)[:140])
-        return None
-    return _conform(mask, size)
+    """Download and decode one mask. Short attempts with retries: a stalled connection used to wait
+    the full API timeout (120 s) and then drop the plane, which showed up as minutes of detection
+    time and missing roof lines."""
+    last = None
+    for attempt in range(MASK_FETCH_ATTEMPTS):
+        try:
+            data = httpx.get(url, timeout=min(timeout, MASK_FETCH_TIMEOUT)).content
+            mask = np.array(Image.open(io.BytesIO(data)).convert("L")) > MASK_THRESHOLD
+            return _conform(mask, size)
+        except Exception as exc:  # noqa: BLE001 — one bad mask must not kill the batch
+            last = exc
+            log.warning("fetching a fal mask failed (attempt %d/%d): %s", attempt + 1, MASK_FETCH_ATTEMPTS, str(exc)[:140])
+    log.warning("giving up on a fal mask after %d attempts: %s", MASK_FETCH_ATTEMPTS, str(last)[:140])
+    return None
 
 
 def _mask_from_rle(entry, size: tuple[int, int]) -> np.ndarray | None:
@@ -148,23 +168,27 @@ def _drop_nested(
 
 
 class FalProvider:
-    def __init__(self):
+    def __init__(self, max_masks: int | None = None, image_format: str = "png"):
         self.settings = get_settings()
         if not self.settings.fal_key:
             raise RuntimeError("FAL_KEY is not set")
         # fal_client reads the key from the environment.
         os.environ.setdefault("FAL_KEY", self.settings.fal_key)
+        # The request shape. Defaults are the settings, so the default path posts what it always
+        # has; partition mode asks for the reference method's 12 instances and a JPEG.
+        self.max_masks = max_masks if max_masks is not None else self.settings.fal_max_masks
+        self.image_format = image_format
 
     # -- plumbing ---------------------------------------------------------------
 
     def _call(self, image: Image.Image, prompt: str, **extra) -> dict:
         arguments = {
-            "image_url": _data_uri(image),
+            "image_url": _data_uri(image, self.image_format),
             "prompt": prompt,
             "apply_mask": False,
             "include_scores": True,
             "return_multiple_masks": True,
-            "max_masks": self.settings.fal_max_masks,
+            "max_masks": self.max_masks,
             "output_format": "png",
             **extra,
         }
@@ -191,12 +215,11 @@ class FalProvider:
             decoded = [_mask_from_rle(entry, size) for entry in entries]
         else:
             timeout = self.settings.fal_timeout
-            decoded = [
-                _mask_from_url(item["url"], size, timeout)
-                if isinstance(item, dict) and item.get("url")
-                else None
-                for item in result.get("masks") or []
-            ]
+            items = result.get("masks") or []
+            urls = [item["url"] if isinstance(item, dict) and item.get("url") else None for item in items]
+            # Every mask is its own download (about 1.3 s each from fal's CDN): fetch them together.
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                decoded = list(pool.map(lambda u: _mask_from_url(u, size, timeout) if u else None, urls))
         scores = result.get("scores") or []
         return [
             (float(scores[index]) if index < len(scores) else 0.5, mask)
