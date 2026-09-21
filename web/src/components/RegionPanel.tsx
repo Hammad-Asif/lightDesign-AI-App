@@ -24,6 +24,11 @@ const EDGES: Edge[] = ["eave", "rake", "hip", "ridge", "valley", "junction", "un
 export const EDGE_COLORS: Partial<Record<Edge, string>> = {
   ridge: "#ff3b30", hip: "#ff9f0a", valley: "#0a84ff", eave: "#39ff14", rake: "#bf5af2",
 };
+// The key covers the edges a "roofline" instruction lights (intent.OUTLINE_EDGES); the others
+// are drawn for reference and their rows say what they are.
+const LIT_EDGES: { edge: Edge; name: string }[] = [
+  { edge: "eave", name: "Eave" }, { edge: "rake", name: "Rake" }, { edge: "hip", name: "Hip" },
+];
 
 // Share of a line that passes behind objects, as a whole percentage.
 function hiddenShare(region: Region): number {
@@ -174,6 +179,16 @@ export function RegionPanel({
       <h2>
         Lines <span className="count">{lines.length}</span>
       </h2>
+      {lines.length > 0 && (
+        <ul className="legend" aria-label="What the line colours mean">
+          {LIT_EDGES.filter(({ edge }) => lines.some((line) => line.edge === edge)).map(({ edge, name }) => (
+            <li key={edge}>
+              <span className="swatch" style={{ background: EDGE_COLORS[edge] }} />
+              {name}
+            </li>
+          ))}
+        </ul>
+      )}
       {lines.length ? (
         <ul>{lines.map(row)}</ul>
       ) : (

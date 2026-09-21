@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 import cv2
 import numpy as np
 
-from app.services import roofline
+from app.services import occlusion, roofline
 
 WORK_LONG_EDGE = 2000
 
@@ -55,6 +55,9 @@ FRAME_PX = 2
 EXG_THRESHOLD = 0.06
 FOLIAGE_MIN_SHARE = 0.0005
 FOLIAGE_DILATE_L = 0.006
+# A *detected* blocker (SAM's palm trunk, tree, car) is grown a little wider than the colour
+# guess, so the boundary pixels the mask traced along its edge fall inside it.
+BLOCKER_DILATE_L = 0.010
 STRAIGHT_RMS = 3.0            # px: a suspect piece straighter than this is a real edge
 TRUSTED_MIN_PX = 30
 TRUSTED_MIN_PERIMETER = 0.04
@@ -91,6 +94,14 @@ CLUSTER_LAMBDA = 2.0
 LINE_MERGE_DEG = 5.0
 LINE_MERGE_OFFSET_L = 0.006
 LINE_MERGE_GAP_L = 0.25
+# One physical edge drawn twice. The line merge in step 6 runs on the raw fits; the energy
+# relaxation afterwards pulls two groups onto the same edge, so lines that were too far apart to
+# merge can finish a pixel apart. Same test as that merge, applied to where the lines end up —
+# and only between segments carrying the same role, because a thin band's eave and the junction
+# above it are also near-parallel and close, and both of those are real.
+DUPLICATE_DEG = 8.0
+DUPLICATE_OFFSET_L = 0.006
+DUPLICATE_OVERLAP = 0.70
 JUNCTION_L = 0.008
 # 0 = off, as in the reference. 10 kept thin tile bands' eave and ridge corners apart on the
 # 1280px masks (house02 35.6 -> 49.5) but measured negative on the reference harness; to be
@@ -117,6 +128,14 @@ PITCH_SIGMA_CALIBRATED_DEG = 2.0
 PITCH_SIGMA_APPARENT_DEG = 6.0
 PITCH_DISAGREE_DEG = 10.0
 PITCH_MAX_DEG = 80.0          # steeper edges are wall steps or cuts, not slopes
+# Same angle, same reasoning, applied to the role table instead of the pitch: measured
+# on the annotated houses, tightening it below 80 trades F1 for nothing the scorer sees.
+WALL_STEP_DEG = 80.0
+# A palm trunk leans, and the notch wall the mask takes around it leans with it: 55-78 degrees
+# on the client's photo, under the gate above. What still gives it away is that it is short —
+# a rake that steep runs to an apex and is long; a notch wall is a stub. Both tests, either fires.
+STEEP_STUB_DEG = 55.0
+STEEP_STUB_L = 0.10
 PLAN_HORIZONTAL_DEG = 6.0
 # Dormer rule: a shared sloped border whose smaller plane's free edge lies inside the outline of
 # host + child is a dormer's roof edge overhanging the host — a rake with a fascia — not a crease.
@@ -344,8 +363,16 @@ class Boundary:
     trusted: np.ndarray          # (N,) bool
 
 
-def boundaries(labels: np.ndarray, count: int, L: float, suspect: np.ndarray | None) -> list[Boundary]:
-    """Every plane's boundary pixels, tagged with the plane across them and marked trusted."""
+def boundaries(labels: np.ndarray, count: int, L: float, suspect: np.ndarray | None,
+               blocked: np.ndarray | None = None) -> list[Boundary]:
+    """Every plane's boundary pixels, tagged with the plane across them and marked trusted.
+
+    `suspect` is the colour guess at foliage: a boundary there is doubted, then kept where it is
+    straight and long enough to be a roof edge. `blocked` is a detected object standing in front
+    of the roof: a boundary there is never trusted, straight or not. That distinction is the
+    whole point — the edge of a palm trunk is perfectly straight, which is exactly why the
+    straightness test used to keep it and draw it as a hip.
+    """
     height, width = labels.shape
     out: list[Boundary] = []
     tag_kernel = np.ones((2 * TAG_REACH + 1, 2 * TAG_REACH + 1), np.uint8)
@@ -367,6 +394,8 @@ def boundaries(labels: np.ndarray, count: int, L: float, suspect: np.ndarray | N
             if suspect is not None:
                 flagged = suspect[trace[:, 1], trace[:, 0]] & ~frame
                 trusted &= _trust_suspects(trace, flagged, len(trace))
+            if blocked is not None:
+                trusted &= ~blocked[trace[:, 1], trace[:, 0]]
             out.append(Boundary(plane=k, contour=trace, tags=tags, trusted=trusted))
     return out
 
@@ -1129,6 +1158,26 @@ def _is_plan_horizontal(direction: np.ndarray, point: np.ndarray, scene: Scene) 
     return _angle_between(direction, np.array([1.0, 0.0])) <= PLAN_HORIZONTAL_FALLBACK_DEG
 
 
+def _is_wall_step(direction: np.ndarray, point: np.ndarray, scene: Scene, length: float, L: float) -> bool:
+    """Is this edge too steep to be a roof edge at all?
+
+    Same test plane_pitches uses to refuse a pitch: past PITCH_MAX_DEG from the plan horizontal
+    an edge is a wall step or a cut, not a slope. On the roof outline that means the side of a
+    step between two storeys, or the wall of a notch the mask took around whatever stands in
+    front of the roof. Left lit, those notch walls are what reads as "the boundary line is the
+    roofline", and they break the eave at every trunk. A leaning trunk leans its notch walls
+    under that gate, so a steep *stub* is refused as well: see STEEP_STUB_DEG.
+    """
+    horizontals = _vp_directions(scene, point, horizontal_only=True)
+    reference = (min(horizontals, key=lambda h: _angle_between(direction, h))
+                 if horizontals else np.array([1.0, 0.0]))
+    return _steep_stub(_angle_between(direction, reference), length, L)
+
+
+def _steep_stub(angle: float, length: float, L: float) -> bool:
+    return angle > WALL_STEP_DEG or (angle > STEEP_STUB_DEG and length < STEEP_STUB_L * L)
+
+
 def _plane_above(segment: Segment, labels: np.ndarray, plane: int, L: float) -> bool:
     """Does the plane lie above this free edge? Tested a little inside along the normal."""
     height, width = labels.shape
@@ -1194,7 +1243,8 @@ class Dormers:
 
 def assign_roles(segments: list[Segment], labels: np.ndarray, scene: Scene, L: float,
                  dormers: "Dormers | None" = None) -> None:
-    """The role table: shared horizontal -> ridge; shared sloped -> rake when the smaller plane
+    """The role table: anything steeper than a roof can be -> junction (a wall step or a notch
+    wall, never lit); then shared horizontal -> ridge; shared sloped -> rake when the smaller plane
     is a dormer on the other, else valley at a re-entrant foot, else hip; free horizontal -> eave
     with the plane above, ridge below; free sloped -> hip on a plane whose top is under
     TOP_TO_EAVE of its eave (an apex counts as 0), else rake."""
@@ -1203,7 +1253,13 @@ def assign_roles(segments: list[Segment], labels: np.ndarray, scene: Scene, L: f
     pending: list[Segment] = []
     for s in segments:
         length = float(np.linalg.norm(s.end - s.start))
-        horizontal = _is_plan_horizontal(_unit(s.end - s.start), (s.start + s.end) / 2, scene)
+        direction, middle = _unit(s.end - s.start), (s.start + s.end) / 2
+        if _is_wall_step(direction, middle, scene, length, L):
+            # Too steep to be any roof edge. "junction" is the label for roof meeting wall:
+            # identified, drawn dark, never lit — which is what a notch wall deserves too.
+            s.role = "junction"
+            continue
+        horizontal = _is_plan_horizontal(direction, middle, scene)
         if len(s.planes) == 2:
             if horizontal:
                 s.role = "ridge"
@@ -1393,6 +1449,145 @@ def _resize_mask(mask: np.ndarray, size: tuple[int, int]) -> np.ndarray:
     return cv2.resize(mask.astype(np.uint8), size, interpolation=cv2.INTER_NEAREST).astype(bool)
 
 
+def _drop_duplicates(segments: list[Segment], L: float) -> list[Segment]:
+    """Drop a segment that retraces one already kept with the same role; the longer survives.
+
+    Step 6 merges lines that are already close when the graph is built. The relaxation that
+    follows moves them, so two groups can end up drawn along the same roof edge a pixel or two
+    apart — one line to look at, two lines drawn, which is what reads as a double roofline.
+    Comparing only within a role is what keeps a parapet intact: its eave and the junction above
+    it are near-parallel and a few pixels apart, and neither is a copy of the other.
+    """
+    kept: list[Segment] = []
+    for s in sorted(segments, key=lambda x: -float(np.linalg.norm(x.end - x.start))):
+        if not any(k.role == s.role and _retraces(k, s, L) for k in kept):
+            kept.append(s)
+    return kept
+
+
+def _retraces(long: Segment, short: Segment, L: float) -> bool:
+    """Does `short` lie along `long` — parallel, close, and covered by it?"""
+    direction, other = _unit(short.end - short.start), _unit(long.end - long.start)
+    if _angle_between(direction, other) > DUPLICATE_DEG:
+        return False
+    normal = np.array([-other[1], other[0]])
+    offset = max(abs(float((short.start - long.start) @ normal)), abs(float((short.end - long.start) @ normal)))
+    if offset > DUPLICATE_OFFSET_L * L:
+        return False
+    span = float(np.linalg.norm(short.end - short.start))
+    if span < 1e-6:
+        return True
+    extent = sorted([0.0, float((long.end - long.start) @ other)])
+    at = sorted([float((short.start - long.start) @ other), float((short.end - long.start) @ other)])
+    return max(0.0, min(extent[1], at[1]) - max(extent[0], at[0])) / span >= DUPLICATE_OVERLAP
+
+
+def clean_spans(spans: list[tuple], extent: float) -> list[tuple]:
+    """Both corrections applied to finished (points, side, edge) spans, whichever engine made them.
+
+    partition_result does this inside itself, where the real vanishing points and line groups are
+    to hand. The reference engine returns finished spans and nothing else, so the same two rules
+    are repeated here on geometry alone:
+
+    1. An edge far steeper than the roof's own horizontal is a wall step or the wall of a notch
+       the mask took around whatever stands in front of the roof. It is relabelled "junction" —
+       identified, drawn dark, never lit. Left lit, those notch walls are what reads as the
+       boundary being taken for the roofline, and they break the line at every palm trunk.
+    2. Two spans of the same role drawn along the same edge are one edge drawn twice. The longer
+       survives. Same role only: a thin band's eave and the junction above it are also close and
+       near-parallel, and both of those are real.
+
+    The eaves give the horizontal: they are the roof's plan horizontal by definition, which is
+    steadier than the image's own horizontal on a photo taken from off to one side.
+    """
+    if not spans:
+        return spans
+    reference = _span_horizontal(spans)
+    relabelled = [
+        (points, side, "junction" if edge in ("eave", "rake", "hip")
+         and _steep_stub(_angle_between(_span_direction(points), reference), _span_length(points), extent) else edge)
+        for points, side, edge in spans
+    ]
+    kept: list[int] = []
+    for index in sorted(range(len(relabelled)), key=lambda i: -_span_length(relabelled[i][0])):
+        span = relabelled[index]
+        if not any(relabelled[k][2] == span[2] and _span_retraces(relabelled[k][0], span[0], extent) for k in kept):
+            kept.append(index)
+    keep = set(kept)
+    return [span for index, span in enumerate(relabelled) if index in keep]
+
+
+# A bridged line is one straight edge again; the pieces were straight fits of that same edge,
+# so anything this far off the chord between the outer ends is a real bend, not a join.
+BRIDGE_STRAIGHT_L = 0.006
+
+
+def bridge_through(spans: list[tuple], blockers: np.ndarray | None, width: int, extent: float) -> list[tuple]:
+    """Join the pieces of a roof edge that a detected object cut in two, into one straight line.
+
+    The roof does not stop at a palm trunk; only the view of it does. occlusion.bridge joins
+    same-role pieces that are collinear and whose gap a detected object covers — so a trunk,
+    a tree or a car joins the edge back up, and the arched entry between two garage roofs,
+    which no object covers, is left as the real gap it is. The line then passes behind the
+    object; the stretch behind it is reported by occlusion.hidden_stretches and never lit.
+
+    bridge concatenates the pieces' points. On partition output every piece is already a
+    straight fit, so the join is straightened to its two outer ends: one edge, one line.
+    """
+    joined = occlusion.bridge(spans, blockers, width)
+    out = []
+    for points, side, edge in joined:
+        if len(points) > 2:
+            array = np.asarray(points, float)
+            chord = array[-1] - array[0]
+            norm = np.linalg.norm(chord)
+            if norm > 1e-6:
+                normal = np.array([-chord[1], chord[0]]) / norm
+                if float(np.abs((array - array[0]) @ normal).max()) <= BRIDGE_STRAIGHT_L * extent:
+                    points = [points[0], points[-1]]
+        out.append((points, side, edge))
+    return out
+
+
+def _span_direction(points) -> np.ndarray:
+    return _unit(np.array(points[-1], float) - np.array(points[0], float))
+
+
+def _span_length(points) -> float:
+    array = np.asarray(points, float)
+    return float(np.linalg.norm(np.diff(array, axis=0), axis=1).sum())
+
+
+def _span_horizontal(spans: list[tuple]) -> np.ndarray:
+    """The roof's own horizontal, from its eaves, weighted by length; the image's if it has none."""
+    total = np.zeros(2)
+    for points, _, edge in spans:
+        if edge != "eave":
+            continue
+        direction = _span_direction(points)
+        if direction[0] < 0:
+            direction = -direction
+        total += direction * _span_length(points)
+    return _unit(total) if np.linalg.norm(total) > 1e-6 else np.array([1.0, 0.0])
+
+
+def _span_retraces(long_points, short_points, extent: float) -> bool:
+    other = _span_direction(long_points)
+    if _angle_between(_span_direction(short_points), other) > DUPLICATE_DEG:
+        return False
+    origin = np.array(long_points[0], float)
+    normal = np.array([-other[1], other[0]])
+    short = np.asarray(short_points, float)
+    if float(np.abs((short - origin) @ normal).max()) > DUPLICATE_OFFSET_L * extent:
+        return False
+    span = _span_length(short_points)
+    if span < 1e-6:
+        return True
+    extent_along = sorted([0.0, float((np.array(long_points[-1], float) - origin) @ other)])
+    at = sorted([float((short[0] - origin) @ other), float((short[-1] - origin) @ other)])
+    return max(0.0, min(extent_along[1], at[1]) - max(extent_along[0], at[0])) / span >= DUPLICATE_OVERLAP
+
+
 def partition_result(
     roof_masks: list[np.ndarray],
     width: int,
@@ -1417,21 +1612,22 @@ def partition_result(
         array = np.asarray(image.convert("RGB")) if hasattr(image, "convert") else np.asarray(image)
         rgb = cv2.resize(array, size, interpolation=cv2.INTER_AREA) if factor < 1 else array
     suspect = foliage_mask(rgb, L)
+    blocked = None
     if blockers is not None:
         small = _resize_mask(blockers, size) if factor < 1 else blockers.astype(bool)
-        grown = cv2.dilate(small.astype(np.uint8), _ellipse(FOLIAGE_DILATE_L * L)).astype(bool)
-        suspect = grown if suspect is None else (suspect | grown)
+        blocked = cv2.dilate(small.astype(np.uint8), _ellipse(BLOCKER_DILATE_L * L)).astype(bool)
 
     raw_labels = partition(masks, scores or [], L)
     labels = cleanup(raw_labels.copy(), len(masks), L)
-    bounds = boundaries(labels, len(masks), L, suspect)
+    bounds = boundaries(labels, len(masks), L, suspect, blocked)
     # The dormer test reads the map before cleanup filled the dormer's face: there the dormer's
     # eave still borders background inside the outline of host + dormer.
     dormers = Dormers(raw_labels, boundaries(raw_labels, len(masks), L, None))
     polygons = plane_polygons(bounds, L)
 
     if rgb is not None:
-        segments = lsd_segments(cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY), suspect)
+        excluded = suspect if blocked is None else (blocked if suspect is None else (suspect | blocked))
+        segments = lsd_segments(cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY), excluded)
     else:
         segments = np.zeros((0, 4))
     scene = vanishing_points(segments, (size[1], size[0]))
@@ -1464,7 +1660,9 @@ def partition_result(
         for s in from_graph:
             g, ja, jb = s.key
             s.start, s.end = _project(shared[g], nodes[ja].point), _project(shared[g], nodes[jb].point)
-    found = from_graph + others
+    # Last, so it judges where the lines finally sit: constrained snap can move two copies of
+    # one edge onto each other, and roles are already decided, so the longer survivor keeps its own.
+    found = _drop_duplicates(from_graph + others, L)
     pitches = plane_pitches(found, scene, _focal_px(image, L) if image is not None else None, L)
 
     sides = [roofline.plane_side(mask, width) for mask in roof_masks]
@@ -1489,9 +1687,23 @@ def partition_result(
             inferred.add(tuple(map(tuple, points)))
     if junctions:
         # Product rule kept from the hybrid path (Settings.partition_junctions): a lower roof's
-        # top edge that runs into the wall of the storey above is relabelled "junction".
-        planes = roofline.mark_junctions(planes, roof_masks, width)
+        # top edge that runs into the wall of the storey above is relabelled "junction". Only a
+        # ridge is offered to the test — the role table has already found the horizontal top
+        # edges, and on partition output that is what a wall junction looks like. Offering hips
+        # and rakes as well is what used to strip whole hips off the lower roof (3 lines, 957 px
+        # on the test house) whenever the upper storey happened to rise above them.
+        planes = _ridges_to_junctions(planes, roof_masks, width)
     return planes, inferred, pitches
+
+
+def _ridges_to_junctions(planes: list[list[tuple]], roof_masks: list[np.ndarray], width: int) -> list[list[tuple]]:
+    ridges_only = [[span for span in spans if span[2] == "ridge"] for spans in planes]
+    marked = roofline.mark_junctions(ridges_only, roof_masks, width)
+    out = []
+    for spans, relabelled in zip(planes, marked):
+        replaced = iter(relabelled)
+        out.append([next(replaced) if span[2] == "ridge" else span for span in spans])
+    return out
 
 
 def partition_lines(roof_masks, width, blockers=None, image=None, scores=None) -> list[list[tuple]]:

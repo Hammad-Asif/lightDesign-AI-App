@@ -104,6 +104,16 @@ def roof_lines(
         # drop real lines (measured: 45 -> 34 spans, 838 px lost, the main roof's hip among
         # them) and give a joined polyline one role for several edges. So they are skipped.
         spans = [span for spans in planes for span in spans] + inside
+        # Two things neither engine gets right on its own, corrected on the finished spans so
+        # the reference engine is covered too: the walls of a notch the mask took around a palm
+        # trunk drawn as lit "hips" (relabelled junction, so the eave runs through the trunk),
+        # and one edge drawn twice after the relaxation pulled two lines together.
+        extent = partition.roof_extent(roof_masks)
+        spans = partition.clean_spans(spans, extent)
+        # A roof edge is one line; an object in front of it is something the line passes
+        # behind. Pieces a detected trunk, tree or car cut apart are joined back into one
+        # straight line here (the hybrid path's bridge, kept; its dedupe and join stay off).
+        spans = partition.bridge_through(spans, blockers, width, extent)
     else:
         spans = roofline.dedupe([span for spans in planes for span in spans] + inside + seams, width)
         # Extraction splits an edge wherever it turns; a plane's pieces that meet end to end are rejoined.

@@ -38,4 +38,8 @@ def health(response: Response):
         "milestone": "M2",
         "database": database,
         "segmentation_provider": settings.segmentation_provider,
+        # Which roof-line path is live. Settings are read once at startup, so this is the only
+        # way to tell whether an .env edit has taken effect without reading the server log.
+        "edge_extractor": settings.edge_extractor,
+        "partition_engine": settings.partition_engine if settings.edge_extractor == "partition" else None,
     }
