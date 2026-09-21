@@ -3,7 +3,9 @@ import {
   useCallback,
   useEffect,
   useImperativeHandle,
+  useLayoutEffect,
   useRef,
+  useState,
   type PointerEvent as ReactPointerEvent,
 } from "react";
 
@@ -34,7 +36,11 @@ interface Props {
   activeId: string | null;
   tool: Tool;
   brushSize: number;
+  // 1 fits the whole photo in view; higher values enlarge it within the scrolling bed.
   zoom: number;
+  // Objects in front of the house are detected so lines can continue behind them, not because
+  // anyone asked for them: off the photo unless shown on purpose or one is selected.
+  showObstacles: boolean;
   onMaskCommit: (regionId: string, blob: Blob) => Promise<Region>;
   onPolylineCommit: (regionId: string, polyline: number[][]) => void;
   onSelect: (regionId: string) => void;
@@ -69,6 +75,7 @@ export const MaskCanvas = forwardRef<MaskCanvasHandle, Props>(function MaskCanva
     tool,
     brushSize,
     zoom,
+    showObstacles,
     onMaskCommit,
     onPolylineCommit,
     onSelect,
@@ -100,9 +107,33 @@ export const MaskCanvas = forwardRef<MaskCanvasHandle, Props>(function MaskCanva
   const future = useRef<Snapshot[]>([]);
 
   const photoRef = useRef(photo);
+  const obstaclesRef = useRef(showObstacles);
   regionsRef.current = regions;
   activeRef.current = activeId;
   photoRef.current = photo;
+  obstaclesRef.current = showObstacles;
+
+  // Zoom 1 fits the photo to the bed in both directions, so the whole house is on screen; the
+  // bed is measured rather than the window, since the panels around it change size.
+  const bedRef = useRef<HTMLDivElement>(null);
+  const [fitWidth, setFitWidth] = useState<number | null>(null);
+  useLayoutEffect(() => {
+    const bed = bedRef.current;
+    if (!bed) return;
+    const measure = () => {
+      const style = getComputedStyle(bed);
+      const width = bed.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
+      const height = bed.clientHeight - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom);
+      setFitWidth(Math.max(80, Math.min(width, (height * photo.width) / photo.height)));
+    };
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(bed);
+    return () => observer.disconnect();
+  }, [photo.width, photo.height]);
+
+  const quietObstacle = (region: Region) =>
+    region.role === "blocker" && !obstaclesRef.current && region.id !== activeRef.current;
 
   const scale = () => {
     const canvas = canvasRef.current;
@@ -140,6 +171,7 @@ export const MaskCanvas = forwardRef<MaskCanvasHandle, Props>(function MaskCanva
       // not lit. Every other hidden region stays off the canvas.
       const unlit = !region.visible && region.kind === "roof" && region.geometry === "line";
       if (!region.visible && !unlit) continue;
+      if (quietObstacle(region)) continue;
       const isActive = region.id === activeRef.current;
 
       if (region.geometry === "area") {
@@ -176,8 +208,9 @@ export const MaskCanvas = forwardRef<MaskCanvasHandle, Props>(function MaskCanva
       }
 
       if (region.kind === "roof") {
-        // a dark halo keeps a line crisp against bright sky and light shingles
-        context.globalAlpha = unlit ? 0.55 : 1;
+        // a dark halo keeps a line crisp against bright sky and light shingles; an unlit edge
+        // is dashed and a little quieter, but still legible on terracotta tile
+        context.globalAlpha = unlit ? 0.8 : 1;
         context.setLineDash(unlit ? [8 / factor, 6 / factor] : unidentified ? [0.5 / factor, 7 / factor] : []);
         context.strokeStyle = "rgba(0, 0, 0, 0.6)";
         context.lineWidth = (isActive ? 8 : 6) / factor;
@@ -333,7 +366,7 @@ export const MaskCanvas = forwardRef<MaskCanvasHandle, Props>(function MaskCanva
     };
   }, [regions, photo.width, photo.height, requestDraw]);
 
-  useEffect(requestDraw, [activeId, zoom, requestDraw]);
+  useEffect(requestDraw, [activeId, zoom, fitWidth, showObstacles, requestDraw]);
 
   useEffect(() => {
     if (!drawingColor) {
@@ -447,7 +480,7 @@ export const MaskCanvas = forwardRef<MaskCanvasHandle, Props>(function MaskCanva
 
   const areaAt = (point: number[]) =>
     [...regionsRef.current].reverse().find((region) => {
-      if (!region.visible || region.geometry !== "area") return false;
+      if (!region.visible || region.geometry !== "area" || quietObstacle(region)) return false;
       const layer = layers.current.get(region.id);
       if (!layer) return false;
       const x = Math.round(point[0]);
@@ -657,12 +690,12 @@ export const MaskCanvas = forwardRef<MaskCanvasHandle, Props>(function MaskCanva
   };
 
   return (
-    <div className="canvas-scroll">
+    <div className="canvas-scroll" ref={bedRef}>
       <canvas
         ref={canvasRef}
         width={photo.width}
         height={photo.height}
-        style={{ width: `${zoom * 100}%` }}
+        style={{ width: fitWidth ? `${Math.round(fitWidth * zoom)}px` : `${zoom * 100}%` }}
         className={`canvas tool-${tool}`}
         onPointerDown={onPointerDown}
         onPointerMove={onPointerMove}

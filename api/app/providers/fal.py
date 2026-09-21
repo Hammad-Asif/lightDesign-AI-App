@@ -269,7 +269,11 @@ class FalProvider:
                 boxes.append((score, box))
                 masks[(kind, box)] = mask
             if boxes:
-                found[kind] = nms(boxes)
+                # Palms are not deduplicated by box: two palms standing together share one crown
+                # box (IoU 0.61 on the client's photo) while their trunks are a hand apart, and
+                # box NMS threw away the one whose trunk crossed the roofline. They are
+                # deduplicated by trunk instead, once split — detect.expand_palms.
+                found[kind] = boxes if kind == "palm_tree" else nms(boxes)
 
         suppress_across_classes(found)
         _drop_nested(found, masks, (image.height, image.width))

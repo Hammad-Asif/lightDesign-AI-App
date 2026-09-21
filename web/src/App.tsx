@@ -43,7 +43,9 @@ export default function App() {
   const [palette, setPalette] = useState<PaletteColour[]>([]);
   // The photo's confirmed lighting, if any; null until the user confirms it.
   const [design, setDesign] = useState<Design | null>(null);
-  const [showLighting, setShowLighting] = useState(false);
+  // The sidebar shows either the lines and areas, or the lighting for them.
+  const [sidebarTab, setSidebarTab] = useState<"regions" | "lighting">("regions");
+  const [showObstacles, setShowObstacles] = useState(false);
 
   const canvasRef = useRef<MaskCanvasHandle>(null);
 
@@ -80,7 +82,8 @@ export default function App() {
     setActiveId(null);
     setDrawingKind(null);
     setDesign(null);
-    setShowLighting(false);
+    setSidebarTab("regions");
+    setShowObstacles(false);
   };
 
   // A 401 anywhere means the session ended: return to sign-in instead of showing an error.
@@ -143,8 +146,10 @@ export default function App() {
       if (mode === "automatic") await api.detectRegions(photo.id);
       const detail = await api.getPhoto(photo.id);
       setPhoto(detail);
-      setActiveId(detail.regions[0]?.id ?? null);
-      setTool(detail.regions[0]?.geometry === "line" ? "vertex" : "brush");
+      // Start on the first thing the instruction asked for, never on an obstacle.
+      const first = detail.regions.find((region) => region.role !== "blocker");
+      setActiveId(first?.id ?? null);
+      setTool(first?.geometry === "line" ? "vertex" : "brush");
     });
 
   const handleConfirmLighting = (requests: DesignRequest[]) =>
@@ -163,9 +168,14 @@ export default function App() {
   const handleMaskCommit = useCallback(
     async (regionId: string, blob: Blob) => {
       const region = await api.putMask(photo!.id, regionId, blob);
-      // Repainting something in front of the house changes what the lines behind it hide.
-      if (BLOCKER_KINDS.includes(region.kind)) setPhoto(await api.getPhoto(photo!.id));
-      else mergeRegion(region);
+      // Repainting something in front of the house changes what the lines behind it hide, and
+      // can join two pieces of a roofline into one — so the whole photo is re-read, and a
+      // selection that pointed at the absorbed piece falls back to nothing rather than dangling.
+      if (BLOCKER_KINDS.includes(region.kind)) {
+        const detail = await api.getPhoto(photo!.id);
+        setPhoto(detail);
+        setActiveId((current) => (current && detail.regions.some((r) => r.id === current) ? current : region.id));
+      } else mergeRegion(region);
       return region;
     },
     [photo?.id],
@@ -386,9 +396,23 @@ export default function App() {
               ) : (
                 <span className="badge">Draft</span>
               )}
-              <span className="muted small">
-                {photo.regions.length} {photo.regions.length === 1 ? "region" : "regions"}
-              </span>
+              {photo.interpreted && (
+                <button
+                  className="link status"
+                  title="Open the lighting for this photo"
+                  onClick={() => setSidebarTab("lighting")}
+                >
+                  {requests.length
+                    ? design
+                      ? `Lighting confirmed for ${design.regions.length} ${design.regions.length === 1 ? "line or area" : "lines and areas"}`
+                      : attention
+                        ? `Lighting: ${attention} to check`
+                        : "Lighting not confirmed yet"
+                    : photo.interpreted.matched
+                      ? "Masking only what the instruction named"
+                      : "No lighting recognised in the instruction"}
+                </button>
+              )}
             </div>
             <div className="header-actions">
               <span className="muted small">{user.email}</span>
@@ -420,48 +444,9 @@ export default function App() {
               onUndo={() => canvasRef.current?.undo()}
               onRedo={() => canvasRef.current?.redo()}
               onRedetect={() => handleRedetect(false)}
+              onDetectAll={() => handleRedetect(true)}
               onApprove={handleApprove}
             />
-          )}
-
-          {photo.interpreted && (
-            <div className="interpreted">
-              <span>
-                {requests.length
-                  ? `Instruction read as ${requests.length} ${requests.length === 1 ? "request" : "requests"}` +
-                    (attention ? `, ${attention} to check` : "") +
-                    (design ? ` · lighting confirmed for ${design.regions.length} ${design.regions.length === 1 ? "region" : "regions"}` : " · lighting not confirmed")
-                  : photo.interpreted.matched
-                    ? "Masking only what the instruction named."
-                    : "No lighting areas recognised in the instruction — masking everything."}
-              </span>
-              <span className="interpreted-actions">
-                {requests.length > 0 && (
-                  <button onClick={() => setShowLighting((open) => !open)}>
-                    {showLighting ? "Hide lighting" : design ? "Lighting" : "Review lighting"}
-                  </button>
-                )}
-                {!photo.approved && (
-                  <button onClick={() => handleRedetect(true)} disabled={busy}>
-                    Detect all region types
-                  </button>
-                )}
-              </span>
-            </div>
-          )}
-
-          {showLighting && requests.length > 0 && (
-            <div className="spec-bar">
-              <Specification
-                requests={requests}
-                products={products}
-                palette={palette}
-                regions={photo.regions}
-                design={design}
-                busy={busy}
-                onConfirm={handleConfirmLighting}
-              />
-            </div>
           )}
 
           <div className="stage">
@@ -473,6 +458,7 @@ export default function App() {
               tool={tool}
               brushSize={brushSize}
               zoom={zoom}
+              showObstacles={showObstacles}
               onMaskCommit={handleMaskCommit}
               onPolylineCommit={handlePolylineCommit}
               onSelect={setActiveId}
@@ -484,15 +470,59 @@ export default function App() {
               onDrawFinish={handleDrawFinish}
               onDrawCancel={() => setDrawingKind(null)}
             />
-            <RegionPanel
-              regions={photo.regions}
-              activeId={activeId}
-              drawingKind={drawingKind}
-              onSelect={setActiveId}
-              onPatch={handlePatch}
-              onDelete={handleDelete}
-              onAdd={handleAdd}
-            />
+            <aside className="sidebar">
+              <div className="tabs" role="tablist">
+                <button
+                  role="tab"
+                  aria-selected={sidebarTab === "regions"}
+                  className={sidebarTab === "regions" ? "tab active" : "tab"}
+                  onClick={() => setSidebarTab("regions")}
+                >
+                  Lines & areas
+                </button>
+                <button
+                  role="tab"
+                  aria-selected={sidebarTab === "lighting"}
+                  className={sidebarTab === "lighting" ? "tab active" : "tab"}
+                  onClick={() => setSidebarTab("lighting")}
+                >
+                  Lighting
+                  {!design && requests.length > 0 && <span className="tab-dot" title="Not confirmed yet" />}
+                </button>
+              </div>
+              <div className="sidebar-body">
+                {sidebarTab === "regions" ? (
+                  <RegionPanel
+                    regions={photo.regions}
+                    activeId={activeId}
+                    drawingKind={drawingKind}
+                    showObstacles={showObstacles}
+                    onShowObstacles={setShowObstacles}
+                    onSelect={setActiveId}
+                    onPatch={handlePatch}
+                    onDelete={handleDelete}
+                    onAdd={(kind) => {
+                      handleAdd(kind);
+                    }}
+                  />
+                ) : requests.length > 0 ? (
+                  <Specification
+                    requests={requests}
+                    products={products}
+                    palette={palette}
+                    regions={photo.regions}
+                    design={design}
+                    busy={busy}
+                    onConfirm={handleConfirmLighting}
+                  />
+                ) : (
+                  <p className="muted small">
+                    The instruction names no lighting to set. Describe it on the start screen, for
+                    example "C9 warm white on the roofline".
+                  </p>
+                )}
+              </div>
+            </aside>
           </div>
         </div>
       )}

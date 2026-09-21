@@ -83,11 +83,19 @@ class CachedFal(F.FalProvider):
         with self._lock:
             self.billed += 1
         result = super()._call(image, prompt, **extra)
-        # fal's CDN links are not permanent, so keep the mask files themselves.
+        # fal's CDN links are not permanent, so keep the mask files themselves. A dropped
+        # download here would lose a call that has already been billed, so it is retried.
         for index, item in enumerate(result.get("masks") or []):
             if isinstance(item, dict) and item.get("url"):
                 path = CACHE / f"{key}_{index}.png"
-                path.write_bytes(httpx.get(item["url"], timeout=120).content)
+                for attempt in range(3):
+                    try:
+                        path.write_bytes(httpx.get(item["url"], timeout=120).content)
+                        break
+                    except httpx.HTTPError:
+                        if attempt == 2:
+                            raise
+                        time.sleep(2 * (attempt + 1))
                 item["url"] = str(path)
         entry.write_text(json.dumps(result))
         return result

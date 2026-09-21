@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 
 import { polylineLength } from "../canvas/layers";
 import { AREA_KINDS, KIND_COLORS, KIND_GROUPS, KIND_LABELS, LINE_KINDS } from "../types";
@@ -8,6 +8,8 @@ interface Props {
   regions: Region[];
   activeId: string | null;
   drawingKind: RegionKind | null;
+  showObstacles: boolean;
+  onShowObstacles: (show: boolean) => void;
   onSelect: (id: string) => void;
   onPatch: (
     id: string,
@@ -38,18 +40,65 @@ function hiddenShare(region: Region): number {
   return Math.round((100 * hidden) / total);
 }
 
+// Detected rows carry a trailing " (not lit)" that is already said by the section they sit in.
+const shortLabel = (label: string) => label.replace(/\s*\(not lit\)$/, "");
+
+function Section({
+  title,
+  count,
+  open,
+  onToggle,
+  note,
+  children,
+}: {
+  title: string;
+  count?: number;
+  open: boolean;
+  onToggle: (open: boolean) => void;
+  note?: ReactNode;
+  children: ReactNode;
+}) {
+  return (
+    <details className="panel-section" open={open} onToggle={(event) => onToggle(event.currentTarget.open)}>
+      <summary>
+        <span>{title}</span>
+        {count !== undefined && <span className="count">{count}</span>}
+      </summary>
+      {note}
+      {children}
+    </details>
+  );
+}
+
 export function RegionPanel({
   regions,
   activeId,
   drawingKind,
+  showObstacles,
+  onShowObstacles,
   onSelect,
   onPatch,
   onDelete,
   onAdd,
 }: Props) {
-  const lines = regions.filter((region) => region.geometry === "line" && region.role !== "blocker");
-  const areas = regions.filter((region) => region.geometry === "area" && region.role !== "blocker");
+  const targets = regions.filter((region) => region.role !== "blocker");
+  // A line is lit when it is visible: detected-but-unrequested edges (ridges, roof meeting wall)
+  // arrive hidden, and so does any line the user switches off.
+  const lit = targets.filter((region) => region.geometry === "line" && region.visible);
+  const unlit = targets.filter((region) => region.geometry === "line" && !region.visible);
+  const areas = targets.filter((region) => region.geometry === "area");
   const blockers = regions.filter((region) => region.role === "blocker");
+
+  const holds = (group: Region[]) => group.some((region) => region.id === activeId);
+  const [open, setOpen] = useState({ unlit: false, blockers: false, add: false });
+  // A selection made on the photo opens the section it sits in, so it is never selected unseen.
+  useEffect(() => {
+    setOpen((current) => ({
+      unlit: current.unlit || holds(unlit),
+      blockers: current.blockers || holds(blockers),
+      add: current.add || Boolean(drawingKind),
+    }));
+  }, [activeId, drawingKind]);
 
   // Selecting on the photo has to show up here, even when the row is scrolled out of sight.
   const activeRow = useRef<HTMLLIElement | null>(null);
@@ -57,131 +106,159 @@ export function RegionPanel({
     activeRow.current?.scrollIntoView({ block: "nearest" });
   }, [activeId]);
 
-  const row = (region: Region) => (
-    <li
-      key={region.id}
-      ref={region.id === activeId ? activeRow : undefined}
-      className={region.id === activeId ? "region active" : "region"}
-      data-geometry={region.geometry}
-      data-role={region.role}
-      data-edge={region.edge ?? ""}
-      onClick={() => onSelect(region.id)}
-    >
-      <div className="region-head">
-        <span className="swatch" style={{ background: region.color }} />
-        <input
-          value={region.label}
-          onClick={(event) => event.stopPropagation()}
-          onChange={(event) => onPatch(region.id, { label: event.target.value })}
-        />
-        <button
-          className="icon"
-          title={region.visible ? "Hide" : "Show"}
-          onClick={(event) => {
-            event.stopPropagation();
-            onPatch(region.id, { visible: !region.visible });
-          }}
-        >
-          {region.visible ? "◉" : "○"}
-        </button>
-        <button
-          className="icon"
-          title="Delete region"
-          onClick={(event) => {
-            event.stopPropagation();
-            onDelete(region.id);
-          }}
-        >
-          ✕
-        </button>
-      </div>
-
-      <div className="region-meta">
-        <select
-          value={region.kind}
-          onClick={(event) => event.stopPropagation()}
-          onChange={(event) => onPatch(region.id, { kind: event.target.value as RegionKind })}
-        >
-          {(region.geometry === "line" ? LINE_KINDS : AREA_KINDS).map((kind) => (
-            <option key={kind} value={kind}>
-              {KIND_LABELS[kind]}
-            </option>
-          ))}
-        </select>
-
-        {region.geometry === "line" && (
-          <>
-            <select
-              value={region.side ?? "front"}
+  const row = (region: Region) => {
+    const isActive = region.id === activeId;
+    const hidden = region.geometry === "line" ? hiddenShare(region) : 0;
+    return (
+      <li
+        key={region.id}
+        ref={isActive ? activeRow : undefined}
+        className={isActive ? "region active" : "region"}
+        data-geometry={region.geometry}
+        data-role={region.role}
+        data-kind={region.kind}
+        data-edge={region.edge ?? ""}
+        onClick={() => onSelect(region.id)}
+      >
+        <div className="region-head">
+          <span className="swatch" style={{ background: region.color }} />
+          {isActive ? (
+            <input
+              aria-label="Name"
+              value={region.label}
               onClick={(event) => event.stopPropagation()}
-              onChange={(event) => onPatch(region.id, { side: event.target.value as Side })}
-            >
-              {SIDES.map((side) => (
-                <option key={side} value={side}>
-                  {side}
-                </option>
-              ))}
-            </select>
-            {region.kind === "roof" && (
+              onChange={(event) => onPatch(region.id, { label: event.target.value })}
+            />
+          ) : (
+            <span className="region-name">{shortLabel(region.label)}</span>
+          )}
+          {hidden > 0 && !isActive && (
+            <span className="region-flag" title={`${hidden}% passes behind objects — no lights there`}>
+              {hidden}% hidden
+            </span>
+          )}
+          {region.kind === "roof" && region.edge === "unknown" && !isActive && (
+            <span className="region-flag warn" title="Edge type not identified">
+              check
+            </span>
+          )}
+          <button
+            className="icon"
+            title={region.visible ? (region.geometry === "line" ? "Don't light this line" : "Hide") : region.geometry === "line" ? "Light this line" : "Show"}
+            aria-label={region.visible ? "Hide" : "Show"}
+            onClick={(event) => {
+              event.stopPropagation();
+              onPatch(region.id, { visible: !region.visible });
+            }}
+          >
+            {region.visible ? "◉" : "○"}
+          </button>
+          <button
+            className="icon"
+            title="Delete"
+            aria-label="Delete"
+            onClick={(event) => {
+              event.stopPropagation();
+              onDelete(region.id);
+            }}
+          >
+            ✕
+          </button>
+        </div>
+
+        {isActive && (
+          <>
+            <div className="region-meta">
               <select
-                value={region.edge ?? "eave"}
+                aria-label="Kind"
+                value={region.kind}
                 onClick={(event) => event.stopPropagation()}
-                onChange={(event) => {
-                  const edge = event.target.value as Edge;
-                  // a new role brings its colour with it, so the drawing stays readable
-                  onPatch(region.id, { edge, ...(EDGE_COLORS[edge] ? { color: EDGE_COLORS[edge] } : {}) });
-                }}
+                onChange={(event) => onPatch(region.id, { kind: event.target.value as RegionKind })}
               >
-                {EDGES.map((edge) => (
-                  <option key={edge} value={edge}>
-                    {edge}
+                {(region.geometry === "line" ? LINE_KINDS : AREA_KINDS).map((kind) => (
+                  <option key={kind} value={kind}>
+                    {KIND_LABELS[kind]}
                   </option>
                 ))}
               </select>
+
+              {region.geometry === "line" && (
+                <>
+                  <select
+                    aria-label="Side"
+                    value={region.side ?? "front"}
+                    onClick={(event) => event.stopPropagation()}
+                    onChange={(event) => onPatch(region.id, { side: event.target.value as Side })}
+                  >
+                    {SIDES.map((side) => (
+                      <option key={side} value={side}>
+                        {side}
+                      </option>
+                    ))}
+                  </select>
+                  {region.kind === "roof" && (
+                    <select
+                      aria-label="Edge"
+                      value={region.edge ?? "eave"}
+                      onClick={(event) => event.stopPropagation()}
+                      onChange={(event) => {
+                        const edge = event.target.value as Edge;
+                        // a new role brings its colour with it, so the drawing stays readable
+                        onPatch(region.id, { edge, ...(EDGE_COLORS[edge] ? { color: EDGE_COLORS[edge] } : {}) });
+                      }}
+                    >
+                      {EDGES.map((edge) => (
+                        <option key={edge} value={edge}>
+                          {edge}
+                        </option>
+                      ))}
+                    </select>
+                  )}
+                </>
+              )}
+
+              {region.kind === "custom" && (
+                <input
+                  type="color"
+                  className="colour"
+                  title="Pick a colour for this region"
+                  value={region.color}
+                  onClick={(event) => event.stopPropagation()}
+                  onChange={(event) => onPatch(region.id, { color: event.target.value })}
+                />
+              )}
+
+              <span className="source">
+                {region.source === "auto"
+                  ? `found · ${Math.round(region.score * 100)}%`
+                  : region.source === "inferred"
+                    ? "continued"
+                    : "drawn by you"}
+              </span>
+            </div>
+
+            {hidden > 0 && (
+              <p className="muted small hidden-note">{hidden}% passes behind objects — no lights there</p>
+            )}
+            {region.kind === "roof" && region.edge === "unknown" && (
+              <p className="small unknown-note">Edge type not identified. Choose eave, rake, hip or ridge.</p>
             )}
           </>
         )}
+      </li>
+    );
+  };
 
-        {region.kind === "custom" && (
-          <input
-            type="color"
-            className="colour"
-            title="Pick a colour for this region"
-            value={region.color}
-            onClick={(event) => event.stopPropagation()}
-            onChange={(event) => onPatch(region.id, { color: event.target.value })}
-          />
-        )}
-
-        <span className="source">
-          {region.source === "auto"
-            ? `auto ${Math.round(region.score * 100)}%`
-            : region.source === "inferred"
-              ? "inferred"
-              : "manual"}
-        </span>
-      </div>
-
-      {region.geometry === "line" && hiddenShare(region) > 0 && (
-        <p className="muted small hidden-note">
-          {hiddenShare(region)}% passes behind objects — no lights there
-        </p>
-      )}
-
-      {region.kind === "roof" && region.edge === "unknown" && (
-        <p className="small unknown-note">Edge type not identified. Choose eave, rake, hip or ridge.</p>
-      )}
-    </li>
-  );
+  const shownEdges = LIT_EDGES.filter(({ edge }) => lit.some((line) => line.edge === edge));
 
   return (
-    <aside className="sidebar">
+    <div className="region-panel">
       <h2>
-        Lines <span className="count">{lines.length}</span>
+        Lines to light <span className="count">{lit.length}</span>
       </h2>
-      {lines.length > 0 && (
+      {shownEdges.length > 0 && (
         <ul className="legend" aria-label="What the line colours mean">
-          {LIT_EDGES.filter(({ edge }) => lines.some((line) => line.edge === edge)).map(({ edge, name }) => (
+          {shownEdges.map(({ edge, name }) => (
             <li key={edge}>
               <span className="swatch" style={{ background: EDGE_COLORS[edge] }} />
               {name}
@@ -189,10 +266,22 @@ export function RegionPanel({
           ))}
         </ul>
       )}
-      {lines.length ? (
-        <ul>{lines.map(row)}</ul>
+      {lit.length ? (
+        <ul>{lit.map(row)}</ul>
       ) : (
-        <p className="muted small">Add one below, then click along the roofline to draw it.</p>
+        <p className="muted small">None yet. Add a line below and click along the roofline to draw it.</p>
+      )}
+
+      {unlit.length > 0 && (
+        <Section
+          title="Other roof edges, not lit"
+          count={unlit.length}
+          open={open.unlit}
+          onToggle={(value) => setOpen((current) => ({ ...current, unlit: value }))}
+          note={<p className="muted small">Found on the roof but not part of the instruction. Use ○ to light one.</p>}
+        >
+          <ul>{unlit.map(row)}</ul>
+        </Section>
       )}
 
       <h2>
@@ -201,46 +290,65 @@ export function RegionPanel({
       {areas.length ? (
         <ul>{areas.map(row)}</ul>
       ) : (
-        <p className="muted small">Add one below, then paint it with the brush.</p>
+        <p className="muted small">None yet. Add one below, then paint it with the brush.</p>
       )}
 
       {blockers.length > 0 && (
-        <>
-          <h2>
-            In front of the house <span className="count">{blockers.length}</span>
-          </h2>
-          <p className="muted small">
-            Not lit. Lines passing behind these are joined up and reported as hidden — correct one
-            with the brush and every line behind it follows.
-          </p>
+        <Section
+          title="Obstacles in front of the house"
+          count={blockers.length}
+          open={open.blockers}
+          onToggle={(value) => setOpen((current) => ({ ...current, blockers: value }))}
+          note={
+            <>
+              <p className="muted small">
+                Found so the roofline can continue behind trees, palms and cars. Never lit. If a
+                line joins wrongly, correct the obstacle here.
+              </p>
+              <label className="check">
+                <input
+                  type="checkbox"
+                  checked={showObstacles}
+                  onChange={(event) => onShowObstacles(event.target.checked)}
+                />
+                Show on the photo
+              </label>
+            </>
+          }
+        >
           <ul>{blockers.map(row)}</ul>
-        </>
+        </Section>
       )}
 
-      <h2>Add region</h2>
-      {drawingKind && (
-        <p className="drawing-hint">
-          Click along the {KIND_LABELS[drawingKind].toLowerCase()} on the photo. Enter to finish,
-          Esc to cancel.
-        </p>
-      )}
-      {KIND_GROUPS.map((group) => (
-        <div key={group.title} className="add-group">
-          <h3>{group.title}</h3>
-          <div className="add-grid">
-            {group.kinds.map((kind) => (
-              <button
-                key={kind}
-                className={drawingKind === kind ? "add-kind drawing" : "add-kind"}
-                onClick={() => onAdd(kind)}
-              >
-                <span className="swatch" style={{ background: KIND_COLORS[kind] }} />
-                {KIND_LABELS[kind]}
-              </button>
-            ))}
+      <Section
+        title="Add a line or area"
+        open={open.add}
+        onToggle={(value) => setOpen((current) => ({ ...current, add: value }))}
+      >
+        {drawingKind && (
+          <p className="drawing-hint">
+            Click along the {KIND_LABELS[drawingKind].toLowerCase()} on the photo. Enter to finish,
+            Esc to cancel.
+          </p>
+        )}
+        {KIND_GROUPS.map((group) => (
+          <div key={group.title} className="add-group">
+            <h3>{group.title}</h3>
+            <div className="add-grid">
+              {group.kinds.map((kind) => (
+                <button
+                  key={kind}
+                  className={drawingKind === kind ? "add-kind drawing" : "add-kind"}
+                  onClick={() => onAdd(kind)}
+                >
+                  <span className="swatch" style={{ background: KIND_COLORS[kind] }} />
+                  {KIND_LABELS[kind]}
+                </button>
+              ))}
+            </div>
           </div>
-        </div>
-      ))}
-    </aside>
+        ))}
+      </Section>
+    </div>
   );
 }

@@ -71,11 +71,13 @@ class Settings(BaseSettings):
     # gutter instead of 4.8px. Set false to keep lines exactly where the mask put them.
     snap_to_edges: bool = True
 
-    # Off: an instruction returns only what it asked for. On: a roof request also detects palms,
-    # trees and cars, kept as blockers rather than lighting targets, so a line passing behind one
-    # is joined up and its hidden stretch reported. That costs extra detection requests per photo
-    # and puts objects on screen the instruction never mentioned.
-    detect_blockers: bool = False
+    # On: a roof request also detects palm trunks, trees and cars, kept as blockers rather than
+    # lighting targets. A roof edge one of them cuts in two is joined back into one straight line
+    # that passes behind it, an edge it cuts off is carried through to its far side, and the
+    # hidden stretch is reported and never lit. Without them the app cannot tell "roof behind a
+    # palm" from "no roof here" — in line geometry they are the same. Costs four detection
+    # requests per roof photo instead of one. Off: an instruction returns only what it asked for.
+    detect_blockers: bool = True
 
     # Off: draw hips that fall inside a single mask, where two roof planes came back merged and
     # no mask boundary runs along the line between them. The candidates are real geometry (apex

@@ -26,6 +26,47 @@ uploaded it. API docs are at http://localhost:8000/docs. Settings come from `api
 Schema changes go through Alembic: edit `app/models.py`, run
 `.venv/bin/alembic revision --autogenerate -m "..."`, and review the generated file.
 
+## Run on Windows (development)
+
+Same pieces, PowerShell paths. Needs Python 3.11, Node 20 and PostgreSQL for Windows. From the
+repository root, after `git pull`:
+
+```powershell
+cd api
+python -m venv .venv                                   # first time only
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+createdb -U postgres lightdesign                       # first time only; full path if not on PATH:
+                                                       # & "C:\Program Files\PostgreSQL\16\bin\createdb.exe" -U postgres lightdesign
+.\.venv\Scripts\alembic.exe upgrade head               # after every pull
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
+```
+
+Second terminal:
+
+```powershell
+cd web
+npm install
+npm run dev
+```
+
+`api\.env` on a Windows machine needs the database spelled out — a Windows PostgreSQL install
+has a password on `postgres` — plus the detector and the roof-line mode:
+
+```ini
+DATABASE_URL=postgresql+psycopg://postgres:PASSWORD@localhost:5432/lightdesign
+SEGMENTATION_PROVIDER=fal
+FAL_KEY=...
+EDGE_EXTRACTOR=partition
+PARTITION_ENGINE=port
+```
+
+`PARTITION_ENGINE=port` is required on any machine without the `roofline` package (see
+`requirements.txt`); leave `PARTITION_JUNCTIONS` and `DETECT_BLOCKERS` unset so the defaults
+apply. Settings are read once at start, so restart the API after editing `.env`, then confirm at
+http://localhost:8000/health — it reports `edge_extractor` and `partition_engine` as the running
+server sees them. Offline checks: `createdb -U postgres lightdesign_test` once, then
+`.\.venv\Scripts\python.exe tests\smoke.py` and, in `web`, `npx tsc -b`.
+
 ## Run (production)
 
 ```bash

@@ -86,36 +86,47 @@ await page.getByRole("button", { name: /Automatic/ }).click();
 await page.waitForSelector(".sidebar", { timeout: 120000 });
 await page.waitForTimeout(1200);
 
-const banner = await page.locator(".interpreted").innerText();
-check("interpreted banner counts the requests and says nothing is confirmed",
-  banner.includes("2 requests") && banner.includes("not confirmed"));
+const status = await page.locator(".header .status").innerText();
+check(`header says the lighting is not confirmed yet (${status})`, status.includes("not confirmed"));
 
-const kinds = await page.locator(".region[data-geometry='area'][data-role='target'] select").evaluateAll(
-  (nodes) => [...new Set(nodes.map((n) => n.value))],
+// The instruction asked for a roofline, hedges and palm trunks. Anything found only so a line can
+// continue behind it is an obstacle: kept out of the lists and off the photo unless asked for.
+const kinds = await page.locator(".region[data-geometry='area'][data-role='target']").evaluateAll(
+  (nodes) => [...new Set(nodes.map((n) => n.dataset.kind))],
 );
-check(`only requested area kinds masked (${kinds.join(",")})`,
+check(`only requested area kinds listed as areas (${kinds.join(",")})`,
   kinds.every((k) => ["hedge", "palm_trunk"].includes(k)));
+const obstacles = page.locator(".panel-section", { hasText: "Obstacles" });
+if (await obstacles.count()) {
+  check("obstacles are folded away by default", !(await obstacles.evaluate((node) => node.open)));
+}
 
 const regionCount = await page.locator(".region").count();
 check(`regions listed in sidebar (${regionCount})`, regionCount >= 3);
 const lineRegions = await page.locator('.region[data-geometry="line"]').count();
 check(`roofline spans listed (${lineRegions})`, lineRegions >= 1);
 check("eave spans present", (await page.locator('.region[data-edge="eave"]').count()) >= 1);
-const options = await page.locator(".region select option").allInnerTexts();
-check("side selector offers front/left/right", options.includes("front"));
-check("edge selector offers eave/ridge", options.includes("eave") && options.includes("ridge"));
-check("kind selector offers the house catalogue", options.includes("Driveway edge") && options.includes("Garage door"));
+check("only the selected row shows its edit controls",
+  (await page.locator(".region:not(.active) select").count()) === 0);
 await page.screenshot({ path: `${OUT}/02-editor.png` });
 
 const canvas = page.locator("canvas.canvas");
 check("canvas present", (await canvas.count()) === 1);
+const bed = await page.locator(".canvas-scroll").boundingBox();
+const fitted = await canvas.boundingBox();
+check("at Fit the whole photo is in view",
+  fitted.width <= bed.width + 1 && fitted.height <= bed.height + 1);
 
 const before = await canvas.screenshot();
 
-const hedge = page.locator('.region[data-geometry="area"]').first();
+const hedge = page.locator('.region[data-geometry="area"][data-role="target"]').first();
 await hedge.click();
 await page.waitForTimeout(300);
 check("brush tool enabled for area region", await page.getByRole("button", { name: "Brush" }).isEnabled());
+const areaOptions = await hedge.locator("select option").allInnerTexts();
+check("an area's kind selector offers the house catalogue", areaOptions.includes("Garage door"));
+await page.getByRole("button", { name: "Brush" }).click();
+check("brush size appears while brushing", await page.getByTitle("Brush size ([ and ])").isVisible());
 
 const box = await canvas.boundingBox();
 await page.mouse.move(box.x + box.width * 0.3, box.y + box.height * 0.75);
@@ -139,36 +150,45 @@ check("redo became available after undo", await page.getByRole("button", { name:
 const roofRegion = page.locator('.region[data-geometry="line"]').first();
 await roofRegion.click();
 await page.waitForTimeout(400);
-check("vertex tool enabled for line region", await page.getByRole("button", { name: "Vertices" }).isEnabled());
+check("point tool enabled for line region", await page.getByRole("button", { name: "Points" }).isEnabled());
 check("brush disabled for line region", !(await page.getByRole("button", { name: "Brush" }).isEnabled()));
 await page.screenshot({ path: `${OUT}/04-roofline.png` });
 
-const sideSelect = roofRegion.locator("select").nth(1);
+const lineOptions = await roofRegion.locator("select option").allInnerTexts();
+check("side selector offers front/left/right", lineOptions.includes("front"));
+check("edge selector offers eave/ridge", lineOptions.includes("eave") && lineOptions.includes("ridge"));
+check("a line's kind selector offers the line catalogue", lineOptions.includes("Driveway edge"));
+const sideSelect = roofRegion.getByLabel("Side");
 check("roofline has kind, side and edge selectors", (await roofRegion.locator("select").count()) === 3);
 await sideSelect.selectOption("front");
 await page.waitForTimeout(600);
 check("roofline side set to front", (await sideSelect.inputValue()) === "front");
 
+await page.getByRole("button", { name: "Zoom in" }).click();
+await page.waitForTimeout(200);
+check("zoom in enlarges the photo", (await canvas.boundingBox()).width > fitted.width);
+await page.getByTitle("Fit the whole photo").click();
+await page.waitForTimeout(200);
+
 // Confirming the lighting: each request against the regions it will light, editable, then saved
 // as the photo's design. Nothing renders from the instruction directly.
-await page.getByRole("button", { name: "Review lighting" }).click();
-await page.waitForSelector(".spec-bar .spec-row", { timeout: 10000 });
-const rows = await page.locator(".spec-bar .spec-row").allInnerTexts();
+await page.getByRole("tab", { name: "Lighting" }).click();
+await page.waitForSelector(".sidebar .spec-row", { timeout: 10000 });
+const rows = await page.locator(".sidebar .spec-row").allInnerTexts();
 check("lighting rows count the regions each request lights", rows.every((row) => /\d+ regions?|no regions yet/.test(row)));
 check("roofline request lights at least one region", /[1-9]\d* regions?/.test(rows[0]));
-const spacing = page.locator(".spec-bar .spec-row").first().getByTitle("Spacing");
+const spacing = page.locator(".sidebar .spec-row").first().getByTitle("Spacing");
 await spacing.selectOption("18");
 check("spacing can be corrected before confirming", (await spacing.inputValue()) === "18");
 await page.getByRole("button", { name: "Confirm lighting" }).click();
-await page.waitForFunction(() => document.querySelector(".interpreted")?.textContent?.includes("lighting confirmed"), null, { timeout: 10000 });
-const confirmedBanner = await page.locator(".interpreted").innerText();
-check(`design confirmed with regions (${confirmedBanner.match(/confirmed for (\d+)/)?.[1]})`,
-  /confirmed for [1-9]\d* regions?/.test(confirmedBanner));
+await page.waitForFunction(() => document.querySelector(".header .status")?.textContent?.includes("Lighting confirmed"), null, { timeout: 10000 });
+const confirmedStatus = await page.locator(".header .status").innerText();
+check(`design confirmed with regions (${confirmedStatus})`, /confirmed for [1-9]\d* /.test(confirmedStatus));
 check("confirm button rests once confirmed", !(await page.getByRole("button", { name: "Confirm changes" }).isEnabled()));
 await page.screenshot({ path: `${OUT}/04b-lighting.png` });
-await page.getByRole("button", { name: "Hide lighting" }).click();
+await page.getByRole("tab", { name: "Lines & areas" }).click();
 
-await page.getByRole("button", { name: "Approve mask set" }).click();
+await page.getByRole("button", { name: "Approve", exact: true }).click();
 await page.waitForSelector(".badge.ok", { timeout: 10000 });
 // Case-insensitive: the badge reads "Locked"; what matters is that it locks.
 check("mask set locks on approve",

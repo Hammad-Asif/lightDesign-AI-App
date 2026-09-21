@@ -273,12 +273,14 @@ scoped = client.post(f"/photos/{intent_photo}/detect", json={"kinds": None}).jso
 scoped_kinds = {r["kind"] for r in scoped if r["role"] == "target"}
 check("detect honours the prompt", scoped_kinds == {"roof", "palm_trunk"})
 # A roofline request also looks for what stands in front of the house, so a line that disappears
-# behind a palm can be joined back up. Those are evidence, not lighting targets.
-check("an instruction returns only what it asked for",
-      not [r for r in scoped if r["role"] == "blocker"])
-check("a roof request asks the model for the roof and nothing else",
-      detect.queried_kinds(["roof"]) == ["roof"])
-check("blockers are fetched only when they are switched on",
+# behind a palm can be joined back up. Those are evidence, not lighting targets: they come back
+# as blockers, never as something to light, and the instruction's own targets are unchanged.
+check("what stands in front of the house is a blocker, never a lighting target",
+      all(r["kind"] in detect.ROOF_BLOCKERS for r in scoped if r["role"] == "blocker")
+      and not any(r["role"] == "target" and r["kind"] in ("tree_canopy", "obstruction") for r in scoped))
+check("with blockers off a roof request asks the model for the roof and nothing else",
+      detect.queried_kinds(["roof"], False) == ["roof"])
+check("with blockers on a roof request also asks for what stands in front",
       set(detect.queried_kinds(["roof"], True)) == {"roof", *detect.ROOF_BLOCKERS})
 check("a request with no roof asks for nothing extra", detect.queried_kinds(["hedge"], True) == ["hedge"])
 check("detecting everything still includes what stands in front", "obstruction" in detect.DEFAULT_KINDS)
@@ -467,6 +469,34 @@ elsewhere = occlusion.blocker_union([np.pad(np.ones((250, 20), dtype=bool), ((10
 check("a stub that never joins is dropped", all(
     min(p[0] for p in span) >= 100
     for span, *_ in roof_lines([nibbled], elsewhere, intent.Intent(), True)))
+
+# ---- partition: one roof edge, one line, straight through whatever stands in front ----------
+# A roof band severed by two palm trunks with a sliver of roof between them, a second band
+# across an open gap nothing covers, and a third whose far end a trunk hides.
+tall = np.zeros((1000, 2400), dtype=bool); tall[600:700, 200:1000] = True
+t1 = np.zeros((1000, 2400), dtype=bool); t1[:, 500:560] = True
+t2 = np.zeros((1000, 2400), dtype=bool); t2[:, 590:650] = True
+tall &= ~(t1 | t2)
+right = np.zeros((1000, 2400), dtype=bool); right[600:700, 1300:2100] = True
+t3 = np.zeros((1000, 2400), dtype=bool); t3[:, 1900:1960] = True
+right &= ~t3
+palms = occlusion.blocker_union([t1, t2, t3], (1000, 2400))
+bare = roof_lines([tall, right], None, intent.Intent(), False, partitioned=True, scores=[0.9, 0.9], junctions=True)
+through = roof_lines([tall, right], palms, intent.Intent(), False, solid=palms, partitioned=True,
+                     scores=[0.9, 0.9], junctions=True)
+bare_eaves = sorted([s for s in bare if s[2] == "eave"], key=lambda s: s[0][0][0])
+eaves = sorted([s for s in through if s[2] == "eave"], key=lambda s: s[0][0][0])
+check("without the palms the severed band comes back in pieces", len(bare_eaves) > len(eaves))
+check("a roof edge two trunks cut apart is one straight line again",
+      len(eaves) == 2 and eaves[0][0][0][0] <= 205 and eaves[0][0][-1][0] >= 995 and len(eaves[0][0]) == 2)
+check("the line reports the stretches it passes behind",
+      len(occlusion.hidden_stretches(eaves[0][0], palms, 2400)) == 2)
+check("a gap nothing stands in front of is left open", eaves[1][0][0][0] >= 1295)
+check("a band whose far end a trunk hides is carried to where the roof is known to reach",
+      1955 <= eaves[1][0][-1][0] <= 2105)
+check("no line steeper than a roof can be is lit",
+      not [s for s in through if s[2] in ("eave", "rake", "hip")
+           and abs(s[0][-1][0] - s[0][0][0]) < abs(s[0][-1][1] - s[0][0][1])])
 
 front_lines = detected_lines("C9 on the front roofline")
 check("front roofline keeps the front plane's sloping edges as well as its eave",
@@ -832,6 +862,43 @@ mine = {**confirmable[0], "settings": {**confirmable[0]["settings"], "product_id
 client.put(f"/photos/{spec_photo['id']}/design", json={"requests": [mine]})
 check("a product in a confirmed design cannot be deleted", client.delete(f"/products/{own['id']}").status_code == 409)
 check("another user cannot read my design", intruder.get(f"/photos/{spec_photo['id']}/design").status_code == 404)
+
+# ---- a painted obstacle mends the roofline behind it ------------------------------------------
+# The model missed a palm: the eave came back in two pieces either side of it, plus a third
+# piece across a real gap. Painting the trunk joins the two; the real gap is left alone; a
+# line someone drew by hand is never touched.
+from app.db import _sessions  # noqa: E402
+from app.models import Photo as PhotoRow, Region as RegionRow, User as UserRow  # noqa: E402
+
+mend_photo = client.post(
+    "/photos", files={"file": ("h.png", sample_photo(), "image/png")}, data={"prompt": "C9 on the roofline"}
+).json()["id"]
+with _sessions()() as db:
+    owner = db.get(UserRow, db.get(PhotoRow, uuid.UUID(mend_photo)).owner_id)
+    for start, end in ((100, 400), (460, 800), (840, 890)):          # trunk will cover 400-460; 800-840 stays a real gap
+        db.add(RegionRow(id=uuid.uuid4(), photo_id=uuid.UUID(mend_photo), kind="roof", role="target",
+                         label="Eave", geometry="line", source="auto", color="#39ff14", score=0.5,
+                         visible=True, side="front", edge="eave", polyline=[[start, 300], [end, 300]]))
+    db.add(RegionRow(id=uuid.uuid4(), photo_id=uuid.UUID(mend_photo), kind="roof", role="target",
+                     label="Drawn", geometry="line", source="manual", color="#39ff14", score=1.0,
+                     visible=True, side="front", edge="eave", polyline=[[100, 340], [400, 340]]))
+    db.commit()
+trunk_region = client.post(f"/photos/{mend_photo}/regions", json={"kind": "palm_trunk", "geometry": "area"}).json()
+trunk_png = io.BytesIO()
+trunk_image = Image.new("L", (900, 600), 0)
+trunk_image.paste(255, (400, 0, 460, 600))
+trunk_image.save(trunk_png, format="PNG")
+client.put(f"/photos/{mend_photo}/regions/{trunk_region['id']}/mask",
+           files={"file": ("trunk.png", trunk_png.getvalue(), "image/png")})
+mended = [r for r in client.get(f"/photos/{mend_photo}").json()["regions"] if r["geometry"] == "line"]
+auto_eaves = sorted([r for r in mended if r["source"] == "auto"], key=lambda r: r["polyline"][0][0])
+check("painting the trunk joins the two pieces either side of it into one straight line",
+      len(auto_eaves) == 2 and auto_eaves[0]["polyline"] == [[100, 300], [800, 300]])
+check("the joined line reports the stretch behind the trunk",
+      auto_eaves[0]["hidden"] and 295 <= auto_eaves[0]["hidden"][0][0] <= 305 and 355 <= auto_eaves[0]["hidden"][0][1] <= 365)
+check("a gap nothing stands in front of is left open", auto_eaves[1]["polyline"] == [[840, 300], [890, 300]])
+check("a line drawn by hand is never joined or moved",
+      [r["polyline"] for r in mended if r["source"] == "manual"] == [[[100, 340], [400, 340]]])
 
 check("logout succeeds", client.post("/auth/logout").status_code == 204)
 check("session is gone after logout",

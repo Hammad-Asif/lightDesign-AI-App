@@ -37,6 +37,9 @@ def roof_lines(
     parsed: intent.Intent,
     hybrid: bool,
     edges=None,
+    # Blockers whose own outline is straight (occlusion.SOLID_KINDS): these are kept out of the
+    # boundary fit. `blockers` — everything in front of the house — still hides and still joins.
+    solid: np.ndarray | None = None,
     interior: bool = False,
     partitioned: bool = False,
     image=None,
@@ -73,7 +76,10 @@ def roof_lines(
             details["planes"] = solved["plane_polygons"]
     elif partitioned:
         planes, inferred, pitches = partition.partition_result(
-            roof_masks, width, blockers, image=image, scores=scores, junctions=junctions, constrained=constrained
+            # Only the straight-edged objects are kept out of the fit; everything in front of
+            # the house still hides a line and still joins one back up, below.
+            roof_masks, width, solid if solid is not None else blockers,
+            image=image, scores=scores, junctions=junctions, constrained=constrained
         )
         if details is not None:
             details["inferred"], details["pitch"] = inferred, pitches
@@ -106,14 +112,16 @@ def roof_lines(
         spans = [span for spans in planes for span in spans] + inside
         # Two things neither engine gets right on its own, corrected on the finished spans so
         # the reference engine is covered too: the walls of a notch the mask took around a palm
-        # trunk drawn as lit "hips" (relabelled junction, so the eave runs through the trunk),
-        # and one edge drawn twice after the relaxation pulled two lines together.
+        # trunk drawn as lit "hips" (dropped, so the eave runs through the trunk), and one
+        # edge drawn twice after the relaxation pulled two lines together.
         extent = partition.roof_extent(roof_masks)
         spans = partition.clean_spans(spans, extent)
         # A roof edge is one line; an object in front of it is something the line passes
         # behind. Pieces a detected trunk, tree or car cut apart are joined back into one
-        # straight line here (the hybrid path's bridge, kept; its dedupe and join stay off).
-        spans = partition.bridge_through(spans, blockers, width, extent)
+        # straight line, and an end such an object cut off is carried through to its far side
+        # (the hybrid path's bridge, kept; its dedupe and join stay off).
+        roof_union = np.logical_or.reduce(roof_masks) if len(roof_masks) > 1 else roof_masks[0]
+        spans = partition.bridge_through(spans, blockers, width, extent, roof=roof_union)
     else:
         spans = roofline.dedupe([span for spans in planes for span in spans] + inside + seams, width)
         # Extraction splits an edge wherever it turns; a plane's pieces that meet end to end are rejoined.
@@ -227,6 +235,7 @@ def run_detection(photo_id: str, body: DetectRequest, store: Store = Depends(get
 
     frame = (image.height, image.width)
     blockers = occlusion.blocker_union([d.mask for d in detections if _blocks(d.kind)], frame)
+    solid = occlusion.blocker_union([d.mask for d in detections if d.kind in occlusion.SOLID_KINDS], frame)
     fresh: list[RegionRow] = []
 
     roofs = [d for d in detections if d.kind == "roof"]
@@ -242,8 +251,9 @@ def run_detection(photo_id: str, body: DetectRequest, store: Store = Depends(get
             parsed,
             settings.edge_extractor == "hybrid",
             snap.field(image) if snapping or settings.interior_hips else None,
-            settings.interior_hips,
-            partitioned,
+            solid=solid,
+            interior=settings.interior_hips,
+            partitioned=partitioned,
             image=image,
             scores=[d.score for d in roofs],
             details=details,
@@ -384,7 +394,12 @@ def patch_region(
         setattr(region, name, value)
 
     store.save()
-    if "polyline" in updates or "kind" in updates:
+    if "kind" in updates and _blocks(updates["kind"]) and region.geometry == "area":
+        # Something just became an object in front of the house: mend the lines behind it.
+        store.rejoin_behind_blockers(photo)
+    elif "polyline" in updates or "kind" in updates:
+        # A dragged line must never be pulled back to where it was, so only the hidden
+        # stretches are recomputed here.
         store.refresh_hidden(photo)
     return region_dict(region)
 
@@ -405,7 +420,8 @@ def put_mask(
     region.source = "manual"
     store.save()
     if _blocks(region.kind):
-        store.refresh_hidden(photo)
+        # Painting the palm the model missed is enough: the roofline behind it joins back up.
+        store.rejoin_behind_blockers(photo)
     return region_dict(region)
 
 
@@ -461,7 +477,7 @@ def refine(photo_id: str, body: RefineRequest, store: Store = Depends(get_store)
         region = store.add_region(photo, region)
 
     if _blocks(region.kind):
-        store.refresh_hidden(photo)
+        store.rejoin_behind_blockers(photo)
     return region_dict(region)
 
 

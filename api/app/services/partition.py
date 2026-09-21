@@ -1490,9 +1490,11 @@ def clean_spans(spans: list[tuple], extent: float) -> list[tuple]:
     are repeated here on geometry alone:
 
     1. An edge far steeper than the roof's own horizontal is a wall step or the wall of a notch
-       the mask took around whatever stands in front of the roof. It is relabelled "junction" —
-       identified, drawn dark, never lit. Left lit, those notch walls are what reads as the
-       boundary being taken for the roofline, and they break the line at every palm trunk.
+       the mask took around whatever stands in front of the roof. It is dropped. It is not a
+       roof edge, nothing downstream needs it, and kept as a dark "junction" it came straight
+       back the moment every detected edge was shown — the short blue stubs at each palm trunk
+       the client marked as wrong. The horizontal roof-meets-wall junctions from
+       _ridges_to_junctions are never this steep and stay.
     2. Two spans of the same role drawn along the same edge are one edge drawn twice. The longer
        survives. Same role only: a thin band's eave and the junction above it are also close and
        near-parallel, and both of those are real.
@@ -1504,9 +1506,8 @@ def clean_spans(spans: list[tuple], extent: float) -> list[tuple]:
         return spans
     reference = _span_horizontal(spans)
     relabelled = [
-        (points, side, "junction" if edge in ("eave", "rake", "hip")
-         and _steep_stub(_angle_between(_span_direction(points), reference), _span_length(points), extent) else edge)
-        for points, side, edge in spans
+        (points, side, edge) for points, side, edge in spans
+        if not _steep_stub(_angle_between(_span_direction(points), reference), _span_length(points), extent)
     ]
     kept: list[int] = []
     for index in sorted(range(len(relabelled)), key=lambda i: -_span_length(relabelled[i][0])):
@@ -1520,22 +1521,45 @@ def clean_spans(spans: list[tuple], extent: float) -> list[tuple]:
 # A bridged line is one straight edge again; the pieces were straight fits of that same edge,
 # so anything this far off the chord between the outer ends is a real bend, not a join.
 BRIDGE_STRAIGHT_L = 0.006
+# Roof pixels grown this much count as covering a gap between two pieces, so a sliver of roof
+# left between two trunks does not break the join; the edge itself sits on the mask's boundary.
+BRIDGE_ROOF_GROW_PX = 3
+# How far off one piece's line the next may sit and still be the same edge. Pieces here are
+# straight fits of one edge and agree to a few pixels; hybrid's 1.5% of the image width let two
+# eaves a storey apart join across the entry tower when fronds hung over the gap (measured:
+# 31 px apart on a 2646 px photo, joined). Same order as the duplicate test.
+BRIDGE_OFFSET_L = 0.008
 
 
-def bridge_through(spans: list[tuple], blockers: np.ndarray | None, width: int, extent: float) -> list[tuple]:
-    """Join the pieces of a roof edge that a detected object cut in two, into one straight line.
+def bridge_through(spans: list[tuple], blockers: np.ndarray | None, width: int, extent: float,
+                   roof: np.ndarray | None = None) -> list[tuple]:
+    """A roof edge cut by something in front of it becomes one straight line again.
 
-    The roof does not stop at a palm trunk; only the view of it does. occlusion.bridge joins
-    same-role pieces that are collinear and whose gap a detected object covers — so a trunk,
-    a tree or a car joins the edge back up, and the arched entry between two garage roofs,
-    which no object covers, is left as the real gap it is. The line then passes behind the
-    object; the stretch behind it is reported by occlusion.hidden_stretches and never lit.
+    The roof does not stop at a palm trunk; only the view of it does. Two steps, both driven
+    by the detected objects and nothing else, so the arched entry between two garage roofs —
+    which no object covers — stays the real gap it is:
 
-    bridge concatenates the pieces' points. On partition output every piece is already a
-    straight fit, so the join is straightened to its two outer ends: one edge, one line.
+    1. occlusion.bridge joins same-role pieces that are collinear and whose gap is covered.
+       Cover is the detected objects plus the roof itself: between two trunks a sliver of roof
+       often survives, and it is roof, not a gap. Every piece is already a straight fit, so a
+       join is straightened to its two outer ends — one edge, one line.
+    2. occlusion.extend_behind carries a single remaining end through the object that cut it
+       off, to the object's far side, for a band whose end is hidden and has no piece beyond.
+
+    The stretch behind the object is then reported by occlusion.hidden_stretches, never lit.
     """
-    joined = occlusion.bridge(spans, blockers, width)
-    out = []
+    if blockers is None:
+        return list(spans)
+    # Cover is judged the way trust is: within BLOCKER_DILATE_L of the object, not pixel-exact.
+    # A palm's crown is ragged — sky shows between the fronds along a one-pixel sample line —
+    # yet the eave behind it is hidden all the same (measured on the client's photo: 0.45 exact,
+    # 0.71 grown; the real gap at the entry 0.21 -> 0.45, still well under the join threshold).
+    cover = cv2.dilate(blockers.astype(np.uint8), _ellipse(BLOCKER_DILATE_L * extent)).astype(bool)
+    if roof is not None:
+        grown = cv2.dilate(roof.astype(np.uint8), np.ones((2 * BRIDGE_ROOF_GROW_PX + 1,) * 2, np.uint8)).astype(bool)
+        cover = cover | grown
+    joined = occlusion.bridge(spans, cover, width, max_offset=BRIDGE_OFFSET_L * extent)
+    straight = []
     for points, side, edge in joined:
         if len(points) > 2:
             array = np.asarray(points, float)
@@ -1545,8 +1569,8 @@ def bridge_through(spans: list[tuple], blockers: np.ndarray | None, width: int, 
                 normal = np.array([-chord[1], chord[0]]) / norm
                 if float(np.abs((array - array[0]) @ normal).max()) <= BRIDGE_STRAIGHT_L * extent:
                     points = [points[0], points[-1]]
-        out.append((points, side, edge))
-    return out
+        straight.append((points, side, edge))
+    return occlusion.extend_behind(straight, blockers, extent, roof)
 
 
 def _span_direction(points) -> np.ndarray:
@@ -1626,8 +1650,11 @@ def partition_result(
     polygons = plane_polygons(bounds, L)
 
     if rgb is not None:
-        excluded = suspect if blocked is None else (blocked if suspect is None else (suspect | blocked))
-        segments = lsd_segments(cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY), excluded)
+        # Vanishing-point evidence is masked by the colour guess only. Detected objects are
+        # kept out of the boundary trust, not out of here: a palm's fronds cover a large share
+        # of a photo, and dropping every line segment under them shifted the horizontal
+        # vanishing point enough to turn a 6 degree eave into a "rake" (house03, measured).
+        segments = lsd_segments(cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY), suspect)
     else:
         segments = np.zeros((0, 4))
     scene = vanishing_points(segments, (size[1], size[0]))

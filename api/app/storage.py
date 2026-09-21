@@ -13,7 +13,7 @@ from app.auth import current_user
 from app.config import get_settings
 from app.db import get_db
 from app.models import Design, DesignRegion, Photo, Product, Region, User
-from app.services import occlusion
+from app.services import occlusion, partition
 
 REGION_FIELDS = (
     "kind", "role", "label", "geometry", "source", "color", "score",
@@ -186,6 +186,13 @@ class Store:
         lines = [r for r in regions if r.geometry == "line" and r.polyline]
         if not lines:
             return regions
+        blockers = self._blocker_union(photo, regions)
+        for line in lines:
+            line.hidden = occlusion.hidden_stretches(line.polyline, blockers, photo.width) or None
+        self.db.commit()
+        return regions
+
+    def _blocker_union(self, photo: Photo, regions: list[Region]) -> np.ndarray | None:
         masks = [
             mask
             for r in regions
@@ -193,11 +200,68 @@ class Store:
             for mask in [self.read_mask(photo.id, r.id)]
             if mask is not None
         ]
-        blockers = occlusion.blocker_union(masks, (photo.height, photo.width))
+        return occlusion.blocker_union(masks, (photo.height, photo.width))
+
+    def rejoin_behind_blockers(self, photo: Photo) -> list[Region]:
+        """After an object in front of the house is painted in or corrected: mend the roof lines
+        behind it the way detection would have.
+
+        A detected roof line that the object now cuts apart is joined back into one straight
+        line, and an end the object cuts off is carried through to its far side — the same two
+        steps roof_lines applies at detection, on the stored lines. So when the model misses a
+        palm, painting the trunk is enough: the roofline behind it mends itself. Only detected
+        lines take part (auto and inferred); a line someone drew is never touched, and a line
+        never un-joins when an object is erased — that is a deliberate correction, kept.
+        """
+        regions = self.regions(photo)
+        lines = [
+            r for r in regions
+            if r.geometry == "line" and r.kind == "roof" and r.source in ("auto", "inferred")
+            and r.polyline and len(r.polyline) >= 2
+        ]
+        blockers = self._blocker_union(photo, regions)
+        if blockers is None or not lines:
+            return self.refresh_hidden(photo)
+
+        points = np.array([p for r in lines for p in r.polyline], dtype=float)
+        extent = float(max(np.ptp(points[:, 0]), np.ptp(points[:, 1]), 1.0))
+        absorbed: set = set()
+        while True:
+            best = None
+            for left in lines:
+                if left.id in absorbed:
+                    continue
+                a = np.asarray(left.polyline)
+                if not occlusion._rightward(a):
+                    continue
+                for right in lines:
+                    if right is left or right.id in absorbed or right.edge != left.edge:
+                        continue
+                    b = np.asarray(right.polyline)
+                    if not occlusion._rightward(b):
+                        continue
+                    gap = occlusion._gap_if_continues(a, b, blockers, photo.width, partition.BRIDGE_OFFSET_L * extent)
+                    if gap is not None and (best is None or gap < best[0]):
+                        best = (gap, left, right)
+            if best is None:
+                break
+            _, left, right = best
+            # Detected lines are straight fits, so the join is the two outer ends; a wobblier
+            # polyline keeps its points, as occlusion.bridge would.
+            if len(left.polyline) == 2 and len(right.polyline) == 2:
+                left.polyline = [list(map(int, left.polyline[0])), list(map(int, right.polyline[-1]))]
+            else:
+                left.polyline = [list(map(int, p)) for p in left.polyline] + [list(map(int, p)) for p in right.polyline]
+            absorbed.add(right.id)
+
+        # Nothing is carried past an object here: no roof mask is stored, and a line is only
+        # carried to where the masks say there is roof. Joining the pieces either side of the
+        # object is what a painted object can do from geometry alone.
         for line in lines:
-            line.hidden = occlusion.hidden_stretches(line.polyline, blockers, photo.width) or None
+            if line.id in absorbed:
+                self.db.delete(line)
         self.db.commit()
-        return regions
+        return self.refresh_hidden(photo)
 
     # -- products --------------------------------------------------------------
 

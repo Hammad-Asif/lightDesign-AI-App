@@ -92,22 +92,47 @@ def clean(mask: np.ndarray, image_area: int) -> np.ndarray:
     return keep if keep.any() else binary.astype(bool)
 
 
+# Two palm instances are the same palm when their trunks overlap this much. Crowns are not
+# compared: neighbouring palms interleave their fronds, and it is the trunk that stands in front
+# of a roofline.
+SAME_TRUNK_IOU = 0.5
+
+
 def expand_palms(detections: list[Detection]) -> list[Detection]:
+    # Split every palm first, then decide duplicates by trunk in score order: the same palm
+    # twice is dropped, two palms standing together — one crown box, two trunks — both stay.
+    split = {id(item): palm.split(item.mask, item.box) for item in detections if item.kind == "palm_tree"}
+    kept: set[int] = set()
+    trunks: list[np.ndarray] = []
+    for item in sorted((d for d in detections if d.kind == "palm_tree"), key=lambda d: -d.score):
+        parts = split[id(item)]
+        if parts is None:
+            continue
+        trunk = parts[0]
+        if trunk.any() and any(_iou(trunk, seen) >= SAME_TRUNK_IOU for seen in trunks):
+            continue
+        trunks.append(trunk)
+        kept.add(id(item))
+
     result: list[Detection] = []
     for item in detections:
         if item.kind != "palm_tree":
             result.append(item)
             continue
-        parts = palm.split(item.mask, item.box)
-        if parts is None:
+        if id(item) not in kept:
             continue
         # Three zones lit independently: a warm white trunk, a red collar, green fronds.
         for kind, label, mask in zip(
-            ("palm_trunk", "palm_collar", "palm_frond"), ("palm trunk", "palm collar", "palm fronds"), parts
+            ("palm_trunk", "palm_collar", "palm_frond"), ("palm trunk", "palm collar", "palm fronds"), split[id(item)]
         ):
             if mask.any():
                 result.append(Detection(kind=kind, label=label, mask=mask, score=item.score, box=item.box))
     return result
+
+
+def _iou(a: np.ndarray, b: np.ndarray) -> float:
+    union = int(np.count_nonzero(a | b))
+    return int(np.count_nonzero(a & b)) / union if union else 0.0
 
 
 def working_copy(image: Image.Image, max_edge: int) -> tuple[Image.Image, float]:
@@ -127,7 +152,9 @@ def upscale_mask(mask: np.ndarray, size: tuple[int, int]) -> np.ndarray:
 # What can stand between the camera and a roofline. Detecting them lets a line that disappears
 # behind a palm be joined up and its hidden stretch reported — but they are not what the customer
 # asked for, so they are only fetched when blockers are switched on (Settings.detect_blockers).
-ROOF_BLOCKERS = ["obstruction", "palm_trunk", "tree_canopy"]
+# The whole palm counts, not just its trunk: on a two-storey house it is the fronds that hang
+# in front of the upper roof, and all three parts come out of the one "palm tree" call.
+ROOF_BLOCKERS = ["obstruction", "palm_trunk", "palm_collar", "palm_frond", "tree_canopy"]
 
 
 def queried_kinds(selected: list[str], blockers: bool = False) -> list[str]:
