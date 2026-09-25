@@ -1,0 +1,591 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Roofline</title>
+  <meta name="description" content="Roof structure lines from a street-level photo: SAM 3 planes, a hard partition, fitted lines, vanishing points and a planar graph.">
+  <!-- All assets come from public CDNs; nothing to install for the frontend. -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:ital,wght@0,400..700;1,400..700&display=swap" rel="stylesheet">
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = { theme: { extend: {
+      fontFamily: { sans: ['"Instrument Sans"', 'system-ui', 'sans-serif'] },
+      colors: { paper: '#EEF0EC', panel: '#F7F8F5', ink: '#1B2228', muted: '#5C6670', rule: '#CFD4CC', draft: '#2451C9', lightbox: '#191D21' },
+    } } };
+  </script>
+  <style>
+    html { font-variant-numeric: tabular-nums; }
+    input[type="range"] { -webkit-appearance: none; appearance: none; width: 100%; height: 24px; background: transparent; cursor: pointer; }
+    input[type="range"]::-webkit-slider-runnable-track { height: 3px; background: #CFD4CC; border-radius: 2px; }
+    input[type="range"]::-moz-range-track { height: 3px; background: #CFD4CC; border-radius: 2px; }
+    input[type="range"]::-webkit-slider-thumb { -webkit-appearance: none; width: 16px; height: 16px; margin-top: -6.5px; border-radius: 50%; background: #2451C9; border: 2px solid #F7F8F5; box-shadow: 0 0 0 1px #2451C9; }
+    input[type="range"]::-moz-range-thumb { width: 12px; height: 12px; border-radius: 50%; background: #2451C9; border: 2px solid #F7F8F5; box-shadow: 0 0 0 1px #2451C9; }
+    input[type="range"]:focus-visible { outline: none; }
+    input[type="range"]:focus-visible::-webkit-slider-thumb { box-shadow: 0 0 0 4px rgba(36, 81, 201, .35); }
+    input[type="range"]:disabled { cursor: not-allowed; opacity: .45; }
+    .frame { position: relative; background: #191D21; border-radius: 6px; overflow: hidden; display: flex; align-items: center; justify-content: center; }
+    .frame > canvas:not(.hidden), .frame > img:not(.hidden) { display: block; width: 100%; height: auto; }
+    .frame.empty { aspect-ratio: 3 / 2; }
+    .busy::after { content: ""; position: absolute; inset: 0; background: repeating-linear-gradient(-45deg, rgba(255,255,255,.05) 0 12px, transparent 12px 24px); pointer-events: none; }
+    .tooltip { position: absolute; pointer-events: none; background: rgba(27,34,40,.94); color: #F7F8F5; font-size: 12px; line-height: 1.35; padding: 6px 8px; border-radius: 4px; white-space: nowrap; transform: translate(12px, 12px); }
+    tr.hl td { background: rgba(36,81,201,.10); }
+    .seg-btn { padding: .5rem .5rem; font-weight: 500; }
+    .seg-btn[aria-pressed="true"] { background: #1B2228; color: #F7F8F5; }
+    .seg-btn:not([aria-pressed="true"]):not(:disabled):hover { background: #EEF0EC; }
+    .seg-btn:disabled { color: #9AA3AB; cursor: not-allowed; }
+    .seg-btn:focus-visible { outline: 2px solid #2451C9; outline-offset: -2px; }
+    .seg-btn + .seg-btn { border-left: 1px solid #CFD4CC; }
+    select, input[type="text"], input[type="number"] { border: 1px solid #CFD4CC; background: #EEF0EC; border-radius: 6px; padding: .35rem .6rem; }
+    select:focus, input[type="text"]:focus, input[type="number"]:focus { outline: none; border-color: #2451C9; box-shadow: 0 0 0 2px rgba(36,81,201,.25); }
+    .chip { display: inline-block; width: .7rem; height: .7rem; border-radius: 2px; margin-right: .4rem; vertical-align: -1px; }
+  </style>
+</head>
+<body class="bg-paper text-ink font-sans min-h-screen antialiased">
+
+  <header class="h-14 px-5 flex items-center justify-between border-b border-rule bg-panel">
+    <div class="flex items-baseline gap-3 min-w-0">
+      <h1 class="text-lg font-semibold tracking-tight">Roofline</h1>
+      <p class="text-sm text-muted hidden md:block truncate">Roof planes from SAM 3, lines from their borders and fitted edges, straightened by the scene's vanishing points.</p>
+    </div>
+    <p id="status" class="text-sm text-muted shrink-0 pl-4" aria-live="polite">Ready</p>
+  </header>
+
+  <div class="grid lg:grid-cols-[330px_minmax(0,1fr)] min-h-[calc(100vh-3.5rem)]">
+
+    <!-- ─────────────────────────── Controls ─────────────────────────── -->
+    <aside class="bg-panel border-b lg:border-b-0 lg:border-r border-rule p-5 space-y-7 lg:sticky lg:top-0 lg:h-[calc(100vh-3.5rem)] lg:overflow-y-auto">
+
+      <section class="space-y-3">
+        <h2 class="text-sm font-semibold">Image</h2>
+        <label id="dropzone" for="file" tabindex="0" class="block cursor-pointer rounded-md border border-dashed border-rule bg-paper px-4 py-5 text-center text-sm text-muted hover:border-draft focus-visible:outline focus-visible:outline-2 focus-visible:outline-draft">
+          <span class="block font-medium text-ink">Drop a house photo here</span>
+          <span class="block mt-1">or click to choose a JPG, PNG or WebP</span>
+        </label>
+        <input id="file" type="file" accept="image/*" class="sr-only">
+        <p id="fileInfo" class="text-sm text-muted truncate">No image loaded</p>
+        <p id="watermark" class="hidden text-sm rounded-md border border-red-300 bg-red-50 text-red-800 px-3 py-2 leading-snug"></p>
+        <p class="text-sm">No photo handy? <button id="sampleBtn" type="button" class="text-draft font-medium hover:underline focus-visible:outline focus-visible:outline-2 focus-visible:outline-draft rounded">Load the sample house</button></p>
+      </section>
+
+      <section class="space-y-4">
+        <div class="flex items-baseline justify-between"><h2 class="text-sm font-semibold">Roof planes</h2><span id="segTime" class="text-xs text-muted"></span></div>
+        <div role="group" aria-label="Segmentation method" class="grid grid-cols-3 rounded-md border border-rule overflow-hidden text-sm">
+          <button type="button" data-mode="sam3" class="mode-btn seg-btn" aria-pressed="false" disabled title="Put FAL_KEY in .env to enable">SAM 3</button>
+          <button type="button" data-mode="mock" class="mode-btn seg-btn" aria-pressed="true">GrabCut</button>
+          <button type="button" data-mode="threshold" class="mode-btn seg-btn" aria-pressed="false">Threshold</button>
+        </div>
+        <p id="samNote" class="text-xs text-muted leading-snug">SAM 3 (fal.ai) is off until FAL_KEY is set in .env and the server restarted.</p>
+        <p id="sampleNote" class="hidden text-xs text-muted leading-snug">The sample uses its own SAM-like masks (overlaps, holes, a parent instance), so nothing is sent to the API. Pick a method above to segment it yourself.</p>
+
+        <div id="sam3Controls" class="space-y-2 text-sm hidden">
+          <label for="prompt" class="block">What to segment</label>
+          <div class="flex gap-2">
+            <input id="prompt" type="text" value="roof" autocomplete="off" spellcheck="false" class="min-w-0 flex-1">
+            <button id="runSam" type="button" class="shrink-0 rounded-md bg-ink text-panel px-3 py-1.5 font-medium hover:bg-black focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-draft">Run</button>
+          </div>
+          <p id="samHost" class="text-muted leading-snug"></p>
+          <details class="text-sm">
+            <summary class="cursor-pointer text-draft font-medium">Extra SAM passes</summary>
+            <div class="mt-2 space-y-2">
+              <label class="flex items-start gap-2 cursor-pointer"><input id="treePass" type="checkbox" class="mt-1 h-4 w-4 accent-draft"><span>Find trees with SAM instead of by colour <span class="text-muted">(one more call)</span></span></label>
+              <label class="flex items-start gap-2 cursor-pointer"><input id="refineSmall" type="checkbox" class="mt-1 h-4 w-4 accent-draft"><span>Sharpen small planes on a zoomed crop <span class="text-muted">(one call each)</span></span></label>
+              <label class="block" for="subtract">Cut these out of the planes</label>
+              <input id="subtract" type="text" placeholder="chimney, skylight" autocomplete="off" spellcheck="false" class="w-full">
+            </div>
+          </details>
+        </div>
+
+        <div id="pointControls" class="space-y-2 text-sm">
+          <p id="pointHint" class="text-muted leading-snug"></p>
+          <div class="flex items-center justify-between">
+            <span>Point prompts <span id="pointReadout" class="text-muted">none</span></span>
+            <button id="clearPoint" type="button" class="text-draft font-medium hover:underline disabled:text-muted disabled:no-underline focus-visible:outline focus-visible:outline-2 focus-visible:outline-draft rounded" disabled>Clear</button>
+          </div>
+        </div>
+
+        <div id="thresholdControls" class="space-y-3 hidden">
+          <div>
+            <div class="flex items-baseline justify-between text-sm"><label for="threshold">Gray threshold</label><output id="thresholdOut" for="threshold" class="text-muted">80</output></div>
+            <input id="threshold" type="range" min="0" max="255" step="1" value="80">
+          </div>
+          <label class="flex items-center gap-2 text-sm cursor-pointer"><input id="invert" type="checkbox" checked class="h-4 w-4 accent-draft">Dark pixels are the roof</label>
+        </div>
+      </section>
+
+      <section class="space-y-4">
+        <div class="flex items-baseline justify-between"><h2 class="text-sm font-semibold">Geometry</h2><span id="geoTime" class="text-xs text-muted"></span></div>
+        <div>
+          <div class="flex items-baseline justify-between text-sm"><label for="epsilon">Corner tolerance (ε)</label><output id="epsilonOut" for="epsilon" class="text-muted"></output></div>
+          <input id="epsilon" type="range" min="0.001" max="0.05" step="0.001" disabled>
+          <p class="text-xs text-muted leading-snug">Douglas-Peucker only seeds corners. Higher means fewer seeds, so longer fitted lines.</p>
+        </div>
+        <div>
+          <div class="flex items-baseline justify-between text-sm"><label for="mergeAngle">Merge angle</label><output id="mergeAngleOut" for="mergeAngle" class="text-muted"></output></div>
+          <input id="mergeAngle" type="range" min="1" max="15" step="0.5" disabled>
+          <p class="text-xs text-muted leading-snug">Neighbouring edges closer than this in direction become one line.</p>
+        </div>
+        <div>
+          <div class="flex items-baseline justify-between text-sm"><label for="snap">Junction snap radius</label><output id="snapOut" for="snap" class="text-muted"></output></div>
+          <input id="snap" type="range" min="0.002" max="0.03" step="0.001" disabled>
+          <p class="text-xs text-muted leading-snug">Corners of different planes closer than this share one junction.</p>
+        </div>
+        <div>
+          <div class="flex items-baseline justify-between text-sm"><label for="wdir">Pull toward vanishing points</label><output id="wdirOut" for="wdir" class="text-muted"></output></div>
+          <input id="wdir" type="range" min="0" max="30" step="0.5" disabled>
+          <p class="text-xs text-muted leading-snug">How strongly eaves and ridges follow the scene's horizontal directions. 0 turns it off.</p>
+        </div>
+        <div class="text-sm">
+          <label for="stage" class="block mb-1">Show the result after</label>
+          <select id="stage" class="w-full">
+            <option value="3">3 · line fitting per plane</option>
+            <option value="4">4 · vanishing-point directions</option>
+            <option value="5">5 · planar graph and energy loop</option>
+            <option value="6">6 · hidden creases</option>
+            <option value="7" selected>7 · roles and pitch (final)</option>
+          </select>
+        </div>
+      </section>
+
+      <section class="space-y-3 text-sm">
+        <h2 class="text-sm font-semibold">Pitch calibration</h2>
+        <div class="flex items-center gap-2">
+          <label for="focal" class="shrink-0">Focal length</label>
+          <input id="focal" type="number" min="8" max="400" step="1" placeholder="26" class="w-20">
+          <span class="text-muted">mm, 35 mm equivalent</span>
+        </div>
+        <p id="focalNote" class="text-xs text-muted leading-snug">True pitch needs the focal length. It is read from EXIF when the photo has it. A phone's main camera is about 26 mm, its ultrawide about 13 mm.</p>
+        <p id="pitchReadout" class="leading-snug"></p>
+      </section>
+
+      <section id="legend" class="text-xs text-muted space-y-1.5"></section>
+    </aside>
+
+    <!-- ─────────────────────────── Viewports ─────────────────────────── -->
+    <main class="p-5 space-y-4 min-w-0">
+      <div class="flex flex-wrap items-center justify-between gap-3">
+        <div role="group" aria-label="Viewport layout" class="inline-flex rounded-md border border-rule overflow-hidden text-sm bg-panel">
+          <button type="button" data-view="both" class="view-btn seg-btn !py-1.5 !px-3 !font-normal" aria-pressed="true">Side by side</button>
+          <button type="button" data-view="mask" class="view-btn seg-btn !py-1.5 !px-3 !font-normal" aria-pressed="false">Inspect</button>
+          <button type="button" data-view="roof" class="view-btn seg-btn !py-1.5 !px-3 !font-normal" aria-pressed="false">Roofline</button>
+        </div>
+        <p id="hoverReadout" class="text-sm text-muted truncate"></p>
+      </div>
+
+      <div id="viewports" class="grid gap-4 xl:grid-cols-2">
+        <figure id="maskView" class="space-y-2 min-w-0">
+          <figcaption class="text-sm flex flex-wrap items-center gap-x-2 gap-y-1">
+            <span class="font-medium">A</span>
+            <select id="layer" class="text-sm !py-1" aria-label="Inspection layer">
+              <option value="partition">Hard partition (phase 1)</option>
+              <option value="instances">Raw SAM instances</option>
+              <option value="arcs">Trusted arcs (phase 2)</option>
+              <option value="lines">All lines, by vanishing point (phase 4)</option>
+            </select>
+            <span id="coverage" class="text-muted"></span>
+          </figcaption>
+          <div id="maskFrame" class="frame empty">
+            <img id="maskImg" alt="Inspection layer of the segmentation" class="hidden">
+            <p id="maskEmpty" class="text-sm text-neutral-400 px-6 text-center">The partition of the roof into planes appears here.</p>
+          </div>
+          <p id="layerNote" class="text-xs text-muted leading-snug"></p>
+        </figure>
+
+        <figure id="roofView" class="space-y-2 min-w-0">
+          <figcaption class="text-sm"><span class="font-medium">B</span> <span class="text-muted">planes and lines over the photo</span></figcaption>
+          <div id="roofFrame" class="frame empty">
+            <canvas id="canvas" class="hidden"></canvas>
+            <div id="roofEmpty" class="text-sm text-neutral-400 px-6 text-center space-y-3">
+              <p>No image yet. Upload a house photo on the left, or try the sample.</p>
+              <button id="sampleBtn2" type="button" class="rounded-md bg-panel text-ink px-3 py-1.5 font-medium hover:bg-white focus-visible:outline focus-visible:outline-2 focus-visible:outline-draft">Load sample house</button>
+            </div>
+            <div id="tooltip" class="tooltip hidden"></div>
+          </div>
+        </figure>
+      </div>
+
+      <div class="flex flex-wrap items-center gap-x-6 gap-y-2 pt-1">
+        <button id="exportBtn" type="button" disabled class="rounded-md bg-draft text-white px-4 py-2 text-sm font-medium hover:bg-blue-800 disabled:bg-rule disabled:text-muted disabled:cursor-not-allowed focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-draft">Export roof geometry</button>
+        <p id="stats" class="text-sm text-muted">Export writes a JSON file with every plane and segment: endpoints, role, slope, pitch and length.</p>
+      </div>
+
+      <div id="planeWrap" class="hidden rounded-md border border-rule bg-panel overflow-hidden">
+        <table class="w-full text-sm">
+          <thead class="text-left text-muted"><tr class="border-b border-rule">
+            <th class="font-medium px-3 py-2">Plane</th><th class="font-medium px-3 py-2">Corners</th>
+            <th class="font-medium px-3 py-2 text-right">Pitch as seen</th><th class="font-medium px-3 py-2 text-right">True pitch</th><th class="font-medium px-3 py-2 text-right">Nearest standard</th>
+          </tr></thead>
+          <tbody id="planeBody"></tbody>
+        </table>
+      </div>
+
+      <div id="tableWrap" class="hidden rounded-md border border-rule bg-panel overflow-hidden">
+        <div class="max-h-72 overflow-auto">
+          <table class="w-full text-sm">
+            <thead class="text-left text-muted sticky top-0 bg-panel"><tr class="border-b border-rule">
+              <th class="font-medium px-3 py-2">#</th><th class="font-medium px-3 py-2">Role</th><th class="font-medium px-3 py-2">Planes</th>
+              <th class="font-medium px-3 py-2">From (x, y)</th><th class="font-medium px-3 py-2">To (x, y)</th>
+              <th class="font-medium px-3 py-2 text-right">Slope</th><th class="font-medium px-3 py-2 text-right">Pitch as seen</th>
+              <th class="font-medium px-3 py-2 text-right">Angle</th><th class="font-medium px-3 py-2 text-right">Length</th>
+            </tr></thead>
+            <tbody id="tableBody"></tbody>
+          </table>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <script>
+    // ───────────────────────────── State ─────────────────────────────
+    const state = {
+      config: { sam_api: false, text_prompt: 'roof', role_colors: {}, defaults: {} },
+      session: null, image: null, isSample: false, useSampleMasks: false,
+      mode: 'mock', textPrompt: 'roof', threshold: 80, invert: true, points: [],
+      epsilon: 0.01, mergeAngle: 5, snap: 0.008, wdir: 3, stage: 7, focal: null,
+      segmentation: null, geometry: null, hover: -1, view: 'both', layer: 'partition',
+    };
+    const $ = (id) => document.getElementById(id);
+    const el = Object.fromEntries(['status','file','dropzone','fileInfo','watermark','samNote','sampleNote','sam3Controls','prompt','runSam','samHost','treePass','refineSmall','subtract',
+      'pointControls','pointHint','pointReadout','clearPoint','thresholdControls','threshold','thresholdOut','invert',
+      'epsilon','epsilonOut','mergeAngle','mergeAngleOut','snap','snapOut','wdir','wdirOut','stage','focal','focalNote','pitchReadout','legend',
+      'segTime','geoTime','coverage','layer','layerNote','maskFrame','maskImg','maskEmpty','roofFrame','canvas','roofEmpty','tooltip',
+      'hoverReadout','exportBtn','stats','planeWrap','planeBody','tableWrap','tableBody','viewports','maskView','roofView'].map((id) => [id, $(id)]));
+    const ctx = el.canvas.getContext('2d');
+    const LAYER_NOTES = {
+      partition: 'Every pixel belongs to exactly one plane. The smallest instance wins a contested pixel, so sub-planes beat their parents. Borders between two colours are where ridges, hips and valleys come from.',
+      instances: 'What SAM 3 returned, before anything is resolved. Overlaps show as blended colours.',
+      arcs: 'Green: free boundary. Yellow: border with another plane. Red: untrusted, because something irregular (a tree) stands in front, so it takes no part in any line fit. Purple tint: detected foliage.',
+      lines: 'Every line segment in the photo, coloured by the vanishing point it agrees with: pink vertical, yellow and blue the two horizontal directions. These fix the scene\'s directions; none of them is ever output.',
+    };
+
+    const setStatus = (text, isError = false) => { el.status.textContent = text; el.status.classList.toggle('text-red-700', isError); el.status.classList.toggle('text-muted', !isError); };
+    const fmt = (v, d = 1) => (Number.isInteger(v) ? String(v) : v.toFixed(d));
+    const roleColor = (s) => s.color || state.config.role_colors[s.role] || '#39ff14';
+
+    async function api(path, options = {}) {
+      const res = await fetch(path, options);
+      if (!res.ok) { let detail = res.statusText; try { detail = (await res.json()).detail || detail; } catch (_) {} throw new Error(detail); }
+      return res.json();
+    }
+    function liveCall(fn, delay) { let timer = null, ticket = 0; return () => { clearTimeout(timer); const mine = ++ticket; timer = setTimeout(() => fn(() => mine === ticket), delay); }; }
+
+    // ───────────────────────────── Loading images ─────────────────────────────
+    async function loadSession(info) {
+      Object.assign(state, { session: info, points: [], segmentation: null, geometry: null, isSample: !!info.is_sample, useSampleMasks: !!info.is_sample });
+      el.fileInfo.textContent = `${info.filename}, ${info.width} × ${info.height}`;
+      el.fileInfo.title = info.source_width !== info.width ? `Downscaled from ${info.source_width} × ${info.source_height}; coordinates refer to the working size.` : '';
+      el.watermark.classList.toggle('hidden', !info.watermark.flagged);
+      el.watermark.textContent = info.watermark.flagged ? `This photo is watermarked (${info.watermark.reason}). Watermarks add false lines; use the clean original for real measurements.` : '';
+      el.focal.value = info.exif_focal_35mm || '';
+      state.focal = info.exif_focal_35mm || null;
+      el.focalNote.textContent = info.exif_focal_35mm
+        ? `Read from ${info.is_sample ? 'the sample\'s known camera' : 'the photo\'s EXIF'}: ${info.exif_focal_35mm} mm. Change it only if you know better.`
+        : 'This photo carries no focal length. Enter it to get true pitch: a phone\'s main camera is about 26 mm, its ultrawide about 13 mm.';
+      syncModeUi();
+      updatePointReadout();
+      const img = new Image(); img.src = info.image_url; await img.decode(); state.image = img;
+      el.canvas.width = info.width; el.canvas.height = info.height;
+      el.canvas.classList.remove('hidden'); el.roofEmpty.classList.add('hidden'); el.roofFrame.classList.remove('empty');
+      el.maskEmpty.classList.add('hidden'); el.maskImg.classList.add('hidden'); el.maskImg.removeAttribute('src'); el.coverage.textContent = '';
+      el.maskFrame.classList.remove('empty'); el.maskFrame.style.aspectRatio = `${info.width} / ${info.height}`;
+      for (const s of [el.epsilon, el.mergeAngle, el.snap, el.wdir]) s.disabled = false;
+      draw();
+      await runSegmentation();
+    }
+    async function uploadFile(file) {
+      if (!file) return;
+      if (!file.type.startsWith('image/')) { setStatus('Choose an image file (JPG, PNG or WebP).', true); return; }
+      setStatus(`Uploading ${file.name}…`);
+      try { const form = new FormData(); form.append('file', file); await loadSession(await api('/api/upload', { method: 'POST', body: form })); }
+      catch (err) { setStatus(`Upload failed: ${err.message}`, true); }
+    }
+    async function loadSample() {
+      setStatus('Loading sample house…');
+      try { await loadSession(await api('/api/sample', { method: 'POST' })); } catch (err) { setStatus(`Sample failed: ${err.message}`, true); }
+    }
+
+    // ───────────────────────────── Phases 1-2: planes ─────────────────────────────
+    let segTicket = 0;
+    async function runSegmentation() {
+      if (!state.session) return;
+      const mine = ++segTicket;
+      const mode = state.useSampleMasks ? 'sample' : state.mode;       // the sample keeps its built-in masks until a method is picked
+      el.maskFrame.classList.add('busy');
+      setStatus(mode === 'sam3' ? `Calling SAM 3 for "${state.textPrompt}"${state.points.length ? ` and ${state.points.length} point${state.points.length > 1 ? 's' : ''}` : ''}…` : 'Finding roof planes…');
+      try {
+        const body = { session_id: state.session.session_id, mode, text_prompt: state.textPrompt, points: state.points, threshold: state.threshold, invert: state.invert,
+          foliage: el.treePass.checked && mode === 'sam3' ? 'sam' : 'color', refine_small: el.refineSmall.checked && mode === 'sam3',
+          subtract: mode === 'sam3' ? el.subtract.value.split(',').map((t) => t.trim()).filter(Boolean) : [] };
+        const result = await api('/api/segment', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        if (mine !== segTicket) return;
+        state.segmentation = { params: body, ...result };
+        await showLayer();
+        if (mine !== segTicket) return;
+        const dropped = result.instances.filter((i) => i.status !== 'plane').length;
+        el.coverage.textContent = `${result.planes} plane${result.planes === 1 ? '' : 's'} from ${result.instances.length} instance${result.instances.length === 1 ? '' : 's'}`
+          + (dropped ? `, ${dropped} dropped as duplicates` : '') + `. ${result.adjacency_percent}% of the boundary is shared, ${result.untrusted_percent}% untrusted.`;
+        el.segTime.textContent = result.elapsed_ms >= 1000 ? `${(result.elapsed_ms / 1000).toFixed(2)} s` : `${result.elapsed_ms} ms`;
+        setStatus('Planes ready');
+        await runGeometry(() => mine === segTicket);
+      } catch (err) { if (mine === segTicket) setStatus(`Segmentation failed: ${err.message}`, true); }
+      finally { if (mine === segTicket) el.maskFrame.classList.remove('busy'); }
+    }
+    const liveSegmentation = liveCall(() => runSegmentation(), 120);
+
+    async function showLayer() {
+      el.layerNote.textContent = LAYER_NOTES[state.layer];
+      if (!state.segmentation) return;
+      el.maskImg.src = state.segmentation.layers[state.layer];
+      try { await el.maskImg.decode(); } catch (_) {}
+      el.maskImg.classList.remove('hidden');
+    }
+
+    // ───────────────────────────── Phases 3-7: geometry (live) ─────────────────────────────
+    async function runGeometry(stillCurrent = () => true) {
+      if (!state.session || !state.segmentation) return;
+      try {
+        const result = await api('/api/geometry', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ session_id: state.session.session_id, epsilon: state.epsilon, merge_angle_deg: state.mergeAngle, snap_radius_frac: state.snap,
+                                 w_dir: state.wdir, stop_after: state.stage, focal_35mm: state.focal && state.focal !== state.session.exif_focal_35mm ? state.focal : null }) });
+        if (!stillCurrent()) return;
+        state.geometry = result; state.hover = -1;
+        el.geoTime.textContent = `${result.timings.interactive_ms} ms`;
+        el.exportBtn.disabled = result.segments.length === 0;
+        el.stats.textContent = describeResult(result);
+        el.pitchReadout.innerHTML = describePitch(result);
+        draw(); renderTables();
+      } catch (err) { setStatus(`Geometry failed: ${err.message}`, true); }
+    }
+    const liveGeometry = liveCall((stillCurrent) => runGeometry(stillCurrent), 30);
+
+    function describeResult(g) {
+      if (!g.segments.length) return 'No lines. Check the partition in view A, or lower the corner tolerance.';
+      const counts = {}; for (const s of g.segments) counts[s.role] = (counts[s.role] || 0) + 1;
+      const parts = Object.entries(counts).map(([r, n]) => `${n} ${r}${n > 1 ? 's' : ''}`);
+      let text = `${g.planes.length} plane${g.planes.length === 1 ? '' : 's'}, ${g.segments.length} segments (${parts.join(', ')}), ${g.vertices.length} junctions.`;
+      const gr = g.info.graph;
+      if (gr) text += ` Energy ${gr.energy_start} to ${gr.energy_end} in ${gr.rounds} round${gr.rounds === 1 ? '' : 's'}; polygons and partition disagree on ${(gr.coverage.after.total * 100).toFixed(1)}% of the roof.`;
+      if (g.info.creases && g.info.creases.length) text += ` ${g.info.creases.length} hidden crease${g.info.creases.length > 1 ? 's' : ''} confirmed by image lines.`;
+      if (g.stage < 7) text += ` Showing the result after phase ${g.stage}.`;
+      return text;
+    }
+    function describePitch(g) {
+      const p = g.info.pitch; if (!p) return '';
+      if (p.roof) {
+        const trusted = p.focal_source === 'EXIF' || p.focal_source === 'entered by hand';
+        return `<span class="font-medium">Roof pitch ${p.roof.pitch}</span> (${p.roof.pitch_deg}°), nearest standard ${p.roof.standard.pitch}. `
+          + `<span class="text-muted">${trusted ? 'Calibrated' : 'Low confidence'}: focal length ${Math.round(p.focal_px)} px, ${p.focal_source}.</span>`;
+      }
+      return `<span class="text-muted">${p.focal_px ? 'This view does not constrain the pitch (no plane shows both an eave on a vanishing point and a consistent slope).' : 'No focal length, so only the pitch as seen in the photo is available.'}</span>`;
+    }
+
+    // ───────────────────────────── Drawing ─────────────────────────────
+    function draw() {
+      if (!state.image) return;
+      const W = el.canvas.width, H = el.canvas.height, lw = Math.max(2.5, W / 320), r = Math.max(4, W / 190);
+      ctx.clearRect(0, 0, W, H); ctx.drawImage(state.image, 0, 0, W, H);
+      const g = state.geometry;
+      if (g) {
+        const colors = state.segmentation ? Object.fromEntries(state.segmentation.instances.filter((i) => i.plane).map((i) => [i.plane, i.color])) : {};
+        for (const p of g.planes) {                                   // plane fills
+          ctx.beginPath(); p.polygon.forEach(([x, y], i) => (i ? ctx.lineTo(x, y) : ctx.moveTo(x, y))); ctx.closePath();
+          ctx.fillStyle = (colors[p.plane] || '#ffffff') + '33'; ctx.fill();
+        }
+        ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+        for (const [i, s] of g.segments.entries()) {                 // lines, coloured by role; inferred ones dashed
+          const [[x1, y1], [x2, y2]] = s.points, hot = i === state.hover, w = hot ? lw * 1.8 : lw;
+          ctx.setLineDash([]); ctx.strokeStyle = 'rgba(0,0,0,.6)'; ctx.lineWidth = w + lw * 1.2;
+          ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+          ctx.setLineDash(s.inferred ? [lw * 3, lw * 3] : []); ctx.strokeStyle = hot ? '#FFFFFF' : roleColor(s); ctx.lineWidth = w;
+          ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+        }
+        ctx.setLineDash([]);
+        for (const [x, y] of g.vertices) { ctx.fillStyle = '#FF3B30'; ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill(); ctx.strokeStyle = 'rgba(0,0,0,.6)'; ctx.lineWidth = Math.max(1, lw * 0.4); ctx.stroke(); }
+      }
+      if (state.mode !== 'threshold') {                                // numbered point prompts
+        const marks = state.points.length ? state.points : (state.mode === 'mock' && !state.useSampleMasks ? [[Math.round(W / 2), Math.round(H * 0.45)]] : []);
+        ctx.save(); ctx.font = `bold ${Math.round(r * 2.6)}px "Instrument Sans", system-ui, sans-serif`; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+        marks.forEach(([px, py], i) => {
+          ctx.fillStyle = 'rgba(247,248,245,.92)'; ctx.beginPath(); ctx.arc(px, py, r * 2.2, 0, Math.PI * 2); ctx.fill();
+          ctx.strokeStyle = '#2451C9'; ctx.lineWidth = Math.max(2, lw * 0.9); ctx.stroke();
+          ctx.fillStyle = '#2451C9'; ctx.fillText(state.points.length ? String(i + 1) : '+', px, py + r * 0.15);
+        });
+        ctx.restore();
+      }
+    }
+
+    function renderTables() {
+      const g = state.geometry;
+      if (!g || !g.segments.length) { el.tableWrap.classList.add('hidden'); el.planeWrap.classList.add('hidden'); return; }
+      el.tableWrap.classList.remove('hidden');
+      el.tableBody.innerHTML = g.segments.map((s) => `
+        <tr data-i="${s.id}" class="border-b border-rule/60 last:border-0">
+          <td class="px-3 py-1.5 text-muted">${s.id + 1}</td>
+          <td class="px-3 py-1.5"><span class="chip" style="background:${roleColor(s)}"></span>${s.role}${s.crease ? ' (hidden crease)' : ''}${s.inferred ? ' <span class="text-muted">inferred</span>' : ''}</td>
+          <td class="px-3 py-1.5">${(s.planes || []).join(' + ')}</td>
+          <td class="px-3 py-1.5">${fmt(s.points[0][0])}, ${fmt(s.points[0][1])}</td>
+          <td class="px-3 py-1.5">${fmt(s.points[1][0])}, ${fmt(s.points[1][1])}</td>
+          <td class="px-3 py-1.5 text-right">${s.slope === null ? '∞' : s.slope.toFixed(3)}</td>
+          <td class="px-3 py-1.5 text-right">${s.pitch_apparent || 'steep'}</td>
+          <td class="px-3 py-1.5 text-right">${s.angle_deg.toFixed(1)}°</td>
+          <td class="px-3 py-1.5 text-right">${s.length_px.toFixed(0)} px</td>
+        </tr>`).join('');
+      const rows = g.planes.filter((p) => p.pitch_apparent || p.pitch_calibrated);
+      el.planeWrap.classList.toggle('hidden', rows.length === 0);
+      el.planeBody.innerHTML = rows.map((p) => {
+        const c = p.pitch_calibrated, a = p.pitch_apparent_standard;
+        return `<tr class="border-b border-rule/60 last:border-0"><td class="px-3 py-1.5">${p.plane}</td><td class="px-3 py-1.5">${p.polygon.length}</td>
+          <td class="px-3 py-1.5 text-right">${p.pitch_apparent ? `${p.pitch_apparent} (${p.pitch_apparent_deg}°)` : ''}</td>
+          <td class="px-3 py-1.5 text-right">${c ? `${c.pitch} (${c.pitch_deg}°)` : `<span class="text-muted">${g.info.pitch && g.info.pitch.focal_px ? 'not constrained in this view' : 'needs a focal length'}</span>`}</td>
+          <td class="px-3 py-1.5 text-right">${c ? `${c.standard.pitch} <span class="text-muted">${Math.round(c.standard.probability * 100)}%</span>` : (a && a.pitch ? `${a.pitch} <span class="text-muted">from the pitch as seen</span>` : '')}</td></tr>`;
+      }).join('');
+    }
+
+    function setHover(i) {
+      if (i === state.hover) return;
+      state.hover = i; draw();
+      for (const row of el.tableBody.rows) row.classList.toggle('hl', Number(row.dataset.i) === i);
+      const s = i >= 0 ? state.geometry.segments[i] : null;
+      el.hoverReadout.textContent = s ? `Segment ${s.id + 1}: ${s.role} of plane ${(s.planes || []).join(' + ')}, pitch as seen ${s.pitch_apparent || 'steep'}, ${s.length_px.toFixed(0)} px${s.inferred ? ', inferred through an occlusion' : ''}` : '';
+    }
+
+    // ───────────────────────────── Canvas interaction ─────────────────────────────
+    function canvasPoint(evt) { const rect = el.canvas.getBoundingClientRect(); return [(evt.clientX - rect.left) * el.canvas.width / rect.width, (evt.clientY - rect.top) * el.canvas.height / rect.height, el.canvas.width / rect.width]; }
+    function distanceToSegment(px, py, [[x1, y1], [x2, y2]]) { const dx = x2 - x1, dy = y2 - y1, len2 = dx * dx + dy * dy || 1, t = Math.max(0, Math.min(1, ((px - x1) * dx + (py - y1) * dy) / len2)); return Math.hypot(px - (x1 + t * dx), py - (y1 + t * dy)); }
+    el.canvas.addEventListener('mousemove', (evt) => {
+      if (!state.geometry) return;
+      const [px, py, scale] = canvasPoint(evt); let best = -1, bestD = 10 * scale;
+      state.geometry.segments.forEach((s, i) => { const d = distanceToSegment(px, py, s.points); if (d < bestD) { bestD = d; best = i; } });
+      setHover(best);
+      if (best >= 0) {
+        const s = state.geometry.segments[best], frameRect = el.roofFrame.getBoundingClientRect();
+        el.tooltip.innerHTML = `${s.role}${s.inferred ? ' (inferred)' : ''}, plane ${(s.planes || []).join(' + ')}<br>pitch as seen ${s.pitch_apparent || 'steep'}, ${s.angle_deg.toFixed(1)}°<br>${s.length_px.toFixed(0)} px${s.vp ? `, follows VP ${s.vp}` : ''}`;
+        el.tooltip.style.left = `${evt.clientX - frameRect.left}px`; el.tooltip.style.top = `${evt.clientY - frameRect.top}px`; el.tooltip.classList.remove('hidden');
+      } else el.tooltip.classList.add('hidden');
+    });
+    el.canvas.addEventListener('mouseleave', () => { setHover(-1); el.tooltip.classList.add('hidden'); });
+    el.canvas.addEventListener('click', (evt) => {
+      if (state.mode === 'threshold' || !state.session || state.useSampleMasks) return;
+      const [px, py, scale] = canvasPoint(evt);
+      const hit = state.points.findIndex(([x, y]) => Math.hypot(x - px, y - py) <= 14 * scale);
+      if (hit >= 0) state.points.splice(hit, 1); else state.points.push([Math.round(px), Math.round(py)]);
+      updatePointReadout(); draw(); runSegmentation();
+    });
+    el.canvas.style.cursor = 'crosshair';
+    function updatePointReadout() { const n = state.points.length; el.pointReadout.textContent = n ? `${n} point${n > 1 ? 's' : ''}` : 'none'; el.clearPoint.disabled = n === 0; }
+    el.clearPoint.addEventListener('click', () => { state.points = []; updatePointReadout(); draw(); runSegmentation(); });
+
+    // ───────────────────────────── Modes and controls ─────────────────────────────
+    function syncModeUi() {
+      const sample = state.useSampleMasks, mode = state.mode;
+      document.querySelectorAll('.mode-btn').forEach((b) => b.setAttribute('aria-pressed', String(!sample && b.dataset.mode === mode)));
+      el.sam3Controls.classList.toggle('hidden', sample || mode !== 'sam3');
+      el.pointControls.classList.toggle('hidden', sample || mode === 'threshold');
+      el.sampleNote.classList.toggle('hidden', !sample);
+    }
+    function setMode(mode, run = true) {
+      if (mode === 'sam3' && !state.config.sam_api) mode = 'mock';
+      state.mode = mode;
+      syncModeUi();
+      el.thresholdControls.classList.toggle('hidden', state.useSampleMasks || mode !== 'threshold');
+      el.pointHint.textContent = mode === 'sam3'
+        ? 'The text prompt returns one instance per roof plane. If a plane is missing, click it to add it as a point prompt; click a marker to remove it.'
+        : 'GrabCut runs locally and stands in for SAM 3. Click each roof plane to segment it from that point.';
+      updatePointReadout(); draw(); if (run) runSegmentation();
+    }
+    document.querySelectorAll('.mode-btn').forEach((btn) => btn.addEventListener('click', () => { state.useSampleMasks = false; setMode(btn.dataset.mode); }));
+
+    function bindSlider(input, out, key, format, call) {
+      input.addEventListener('input', () => { state[key] = Number(input.value); out.textContent = format(state[key]); call(); });
+    }
+    bindSlider(el.epsilon, el.epsilonOut, 'epsilon', (v) => v.toFixed(3), liveGeometry);
+    bindSlider(el.mergeAngle, el.mergeAngleOut, 'mergeAngle', (v) => `${v}°`, liveGeometry);
+    bindSlider(el.snap, el.snapOut, 'snap', (v) => `${(v * 100).toFixed(1)}% of the long edge`, liveGeometry);
+    bindSlider(el.wdir, el.wdirOut, 'wdir', (v) => (v === 0 ? 'off' : `${v}×`), liveGeometry);
+    bindSlider(el.threshold, el.thresholdOut, 'threshold', (v) => String(v), liveSegmentation);
+    el.invert.addEventListener('change', () => { state.invert = el.invert.checked; runSegmentation(); });
+    el.stage.addEventListener('change', () => { state.stage = Number(el.stage.value); runGeometry(); });
+    el.focal.addEventListener('change', () => { state.focal = Number(el.focal.value) || null; runGeometry(); });
+    el.layer.addEventListener('change', () => { state.layer = el.layer.value; showLayer(); });
+    el.prompt.addEventListener('input', () => { state.textPrompt = el.prompt.value.trim(); });
+    el.prompt.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); runSegmentation(); } });
+    el.runSam.addEventListener('click', () => runSegmentation());
+
+    el.file.addEventListener('change', () => uploadFile(el.file.files[0]));
+    el.dropzone.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); el.file.click(); } });
+    for (const target of [el.dropzone, el.roofFrame, el.maskFrame]) {
+      target.addEventListener('dragover', (e) => { e.preventDefault(); el.dropzone.classList.add('border-draft'); });
+      target.addEventListener('dragleave', () => el.dropzone.classList.remove('border-draft'));
+      target.addEventListener('drop', (e) => { e.preventDefault(); el.dropzone.classList.remove('border-draft'); uploadFile(e.dataTransfer.files[0]); });
+    }
+    $('sampleBtn').addEventListener('click', loadSample); $('sampleBtn2').addEventListener('click', loadSample);
+    document.querySelectorAll('.view-btn').forEach((btn) => btn.addEventListener('click', () => {
+      state.view = btn.dataset.view;
+      document.querySelectorAll('.view-btn').forEach((b) => b.setAttribute('aria-pressed', String(b === btn)));
+      el.maskView.classList.toggle('hidden', state.view === 'roof'); el.roofView.classList.toggle('hidden', state.view === 'mask');
+      el.viewports.classList.toggle('xl:grid-cols-2', state.view === 'both');
+    }));
+
+    // ───────────────────────────── Export ─────────────────────────────
+    el.exportBtn.addEventListener('click', () => {
+      const g = state.geometry, s = state.session; if (!g || !s) return;
+      const payload = {
+        exported_at: new Date().toISOString(),
+        source: { filename: s.filename, width: s.width, height: s.height, source_width: s.source_width, source_height: s.source_height, scale_from_source: s.scale_from_source, watermark: s.watermark },
+        parameters: { segmentation: state.segmentation.params, geometry: g.parameters },
+        conventions: {
+          points: 'pixel coordinates in the working image; origin top-left, y increases downward',
+          role: 'from topology: ridge / hip / valley are shared by two planes; eave / rake are free edges (a free sloped edge of a plane that narrows upward is a hip)',
+          slope: 'rise over run measured against the facade\'s own horizontal at that edge (from the vanishing points), so camera roll does not leak in; null when vertical',
+          slope_pixel: 'raw (y2 - y1) / (x2 - x1) in image coordinates',
+          pitch_apparent: 'rise:12 as seen in the photo. It is NOT the true roof pitch: perspective changes it.',
+          pitch_calibrated: 'true pitch from the focal length, the vertical vanishing point and the plane\'s eave direction. Trust it when the focal length comes from EXIF or was entered by hand.',
+          inferred: 'the segment or one of its ends was recovered through an occlusion (lines extended through a tree) rather than observed',
+        },
+        pitch: g.info.pitch, vanishing_points: state.segmentation.vanishing_points, graph: g.info.graph, hidden_creases: g.info.creases || [],
+        instances: state.segmentation.instances,
+        planes: g.planes,
+        roof_lines: g.segments.map((seg) => ({ id: seg.id, role: seg.role, planes: seg.planes, points: seg.points, slope: seg.slope, slope_pixel: seg.slope_pixel,
+          angle_deg: seg.angle_deg, pitch_apparent: seg.pitch_apparent, length_px: seg.length_px, follows_vanishing_point: seg.vp || null,
+          inferred: !!seg.inferred, hidden_crease: !!seg.crease })),
+        junctions: g.vertices,
+      };
+      const stem = (s.filename || 'image').replace(/\.[^.]+$/, '').replace(/[^\w-]+/g, '_');
+      const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+      const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `roof-geometry-${stem}.json`;
+      document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(a.href); setStatus(`Exported ${a.download}`);
+    });
+
+    // ───────────────────────────── Start-up ─────────────────────────────
+    // URL parameters preset the controls, e.g. ?sample=1&stage=5&eps=0.008&layer=arcs
+    (async function init() {
+      try { state.config = await api('/api/config'); } catch (_) {}
+      const c = state.config, d = c.defaults || {};
+      state.textPrompt = c.text_prompt || 'roof'; el.prompt.value = state.textPrompt;
+      const samBtn = document.querySelector('.mode-btn[data-mode="sam3"]');
+      samBtn.disabled = !c.sam_api; samBtn.title = c.sam_api ? '' : 'Put FAL_KEY in .env to enable';
+      el.samNote.classList.toggle('hidden', !!c.sam_api);
+      el.samHost.textContent = c.sam_api_host ? `Each run calls ${c.sam_model} on ${c.sam_api_host}, about half a cent. Results are cached per photo and prompt.` : '';
+      el.legend.innerHTML = Object.entries(c.role_colors || {}).map(([role, color]) => `<div class="flex items-center gap-2"><span class="inline-block w-5 h-0.5" style="background:${color}"></span>${role}</div>`).join('')
+        + '<div class="flex items-center gap-2"><span class="inline-block w-5 border-t-2 border-dashed border-neutral-400"></span>inferred through an occlusion</div>'
+        + '<div class="flex items-center gap-2"><span class="inline-block w-2.5 h-2.5 rounded-full" style="background:#FF3B30"></span>junction</div>';
+      Object.assign(state, { epsilon: d.epsilon ?? 0.01, mergeAngle: d.merge_angle_deg ?? 5, snap: d.snap_radius_frac ?? 0.008, wdir: d.w_dir ?? 3 });
+      const q = new URLSearchParams(location.search);
+      const num = (key, lo, hi) => { const v = Number(q.get(key)); return q.has(key) && Number.isFinite(v) ? Math.min(hi, Math.max(lo, v)) : null; };
+      for (const [key, input, param, lo, hi] of [['epsilon', el.epsilon, 'eps', 0.001, 0.05], ['mergeAngle', el.mergeAngle, 'merge', 1, 15], ['snap', el.snap, 'snap', 0.002, 0.03], ['wdir', el.wdir, 'wdir', 0, 30]]) {
+        const v = num(param, lo, hi); if (v !== null) state[key] = v;
+        input.value = state[key]; input.dispatchEvent(new Event('input'));
+      }
+      const stage = num('stage', 3, 7); if (stage !== null) { state.stage = Math.round(stage); el.stage.value = String(state.stage); }
+      if (q.get('layer') && LAYER_NOTES[q.get('layer')]) { state.layer = q.get('layer'); el.layer.value = state.layer; }
+      if (q.get('prompt')) { el.prompt.value = q.get('prompt'); state.textPrompt = q.get('prompt'); }
+      el.layerNote.textContent = LAYER_NOTES[state.layer];
+      const mode = q.get('mode');
+      setMode(['sam3', 'mock', 'threshold'].includes(mode) ? mode : (c.sam_api ? 'sam3' : 'mock'), false);
+      if (q.has('sample')) loadSample();
+    })();
+  </script>
+</body>
+</html>

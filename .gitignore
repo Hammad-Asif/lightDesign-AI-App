@@ -1,20 +1,35 @@
-.env
-storage/
-node_modules/
-dist/
+# Python
+.venv/
 __pycache__/
 *.pyc
-.venv/
+*.egg-info/
+.pytest_cache/
+
+# Secrets and local settings (the key lives only in .env; see .env.example)
+.env
+.env.*
+!.env.example
+web/.env*
+!web/.env.example
+
+# Local data: accounts database, session secret, saved project photos, SAM 3 response cache
+data/
+.sam_cache/
+params.json
+
+# Next.js frontend build output and dependencies
+web/node_modules/
+web/.next/
+web/out/
+web/next-env.d.ts
+web/tsconfig.tsbuildinfo
+web/*.log
+
+# OS and editor clutter
 .DS_Store
-tsconfig.tsbuildinfo
+.vscode/
+.idea/
+*.log
 
-# Claude Code session data
-.claude/
-
-# Test output and detection images
-detection-results/
-test-output/
-out/
-docs/
-CLAUDE.md
-Masking-Editor-Handbook.pdf
+# The client's own house photo stays local (the harness skips a photo that is missing)
+eval/photos/owner_house_annotated.png

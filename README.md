@@ -1,139 +1,112 @@
-# Light Design
+# Roofline
 
-AI holiday light design mock-up tool.
+Roof structure lines (ridges, hips, valleys, rakes, eaves) from one street-level photo of a
+house. Output is a set of straight vector segments drawn over the photo and exported as JSON,
+with pixel endpoints, role, slope, angle, roofing pitch (rise:12) and length per segment, and a
+closed polygon per roof plane.
 
-**Milestone 1 complete; Milestone 2 in progress.** Detection runs on SAM 3 via the fal.ai
-API — no local model weights, no GPU. See `docs/M1_STATUS.md` for measured results on the
-client's real photos.
+**Principle.** Masks are plane *support regions*, not the source of lines. Lines come from
+(a) plane-to-plane adjacency after a hard partition, which gives interior ridges, hips and
+valleys, and (b) robust line fits over trusted boundary arcs, which give exterior eaves and rakes.
+Raw mask boundary and raw LSD segments are never output.
 
-## Run (development)
-
-Needs Python 3.11, Node 20 and a local PostgreSQL.
-
-```bash
-createdb lightdesign
-cd api && python3.11 -m venv .venv && .venv/bin/pip install -r requirements.txt
-.venv/bin/alembic upgrade head
-.venv/bin/uvicorn app.main:app --reload
-
-cd web && npm install && npm run dev
-```
-
-Open http://localhost:5173 and create an account — every photo belongs to the account that
-uploaded it. API docs are at http://localhost:8000/docs. Settings come from `api/.env`;
-`DATABASE_URL` defaults to `postgresql+psycopg://localhost/lightdesign`.
-
-Schema changes go through Alembic: edit `app/models.py`, run
-`.venv/bin/alembic revision --autogenerate -m "..."`, and review the generated file.
-
-## Run on Windows (development)
-
-Same pieces, PowerShell paths. Needs Python 3.11, Node 20 and PostgreSQL for Windows. From the
-repository root, after `git pull`:
-
-```powershell
-cd api
-python -m venv .venv                                   # first time only
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-createdb -U postgres lightdesign                       # first time only; full path if not on PATH:
-                                                       # & "C:\Program Files\PostgreSQL\16\bin\createdb.exe" -U postgres lightdesign
-.\.venv\Scripts\alembic.exe upgrade head               # after every pull
-.\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
-```
-
-Second terminal:
-
-```powershell
-cd web
-npm install
-npm run dev
-```
-
-`api\.env` on a Windows machine needs the database spelled out — a Windows PostgreSQL install
-has a password on `postgres` — plus the detector and the roof-line mode:
-
-```ini
-DATABASE_URL=postgresql+psycopg://postgres:PASSWORD@localhost:5432/lightdesign
-SEGMENTATION_PROVIDER=fal
-FAL_KEY=...
-EDGE_EXTRACTOR=partition
-PARTITION_ENGINE=port
-```
-
-`PARTITION_ENGINE=port` is required on any machine without the `roofline` package (see
-`requirements.txt`); leave `PARTITION_JUNCTIONS` and `DETECT_BLOCKERS` unset so the defaults
-apply. Settings are read once at start, so restart the API after editing `.env`, then confirm at
-http://localhost:8000/health — it reports `edge_extractor` and `partition_engine` as the running
-server sees them. Offline checks: `createdb -U postgres lightdesign_test` once, then
-`.\.venv\Scripts\python.exe tests\smoke.py` and, in `web`, `npx tsc -b`.
-
-## Run (production)
+## Quick start
 
 ```bash
-cp .env.example .env      # set POSTGRES_PASSWORD and FAL_KEY; COOKIE_SECURE=true behind HTTPS
-docker compose up -d --build
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+uvicorn app:app --reload --port 8765        # backend (FastAPI)
+
+cd web && npm install && npm run dev        # frontend (Next.js), then open http://localhost:3000
 ```
 
-Everything is served from one origin on port 80: nginx serves the web app and forwards `/auth`,
-`/photos` and `/files` to the API, which applies migrations on start. Postgres data and uploaded
-photos live in the named volumes `pgdata` and `photos`.
+Create an account on the sign-in page, then start a project or open `/studio?sample=1`. The frontend
+proxies `/api/*` to the backend (`BACKEND_URL`, default `http://127.0.0.1:8765`), so both run on one
+origin and the session cookie just works.
 
-## Detection providers
+**Accounts and projects** (`accounts.py`). SQLite in `data/` (git-ignored): users with scrypt password
+hashes, and saved projects (the photo, the detected lines, the hand edits, the settings). The browser
+holds one HttpOnly cookie signed with `AUTH_SECRET` (from `.env`, or generated once into
+`data/secret.key`). Every endpoint except `/api/auth/*` needs a signed-in user, and a user only sees
+their own sessions and projects. `ALLOW_SIGNUP=false` closes sign-up; `COOKIE_SECURE=true` behind HTTPS.
 
-| `SEGMENTATION_PROVIDER` | What it does | Cost | Speed |
-|---|---|---|---|
-| `mock` (default) | Fixed placeholder shapes. For UI work, and what the smoke tests assert. | none | instant |
-| `fal` | SAM 3 on fal.ai — text, box and point prompts from one endpoint. Needs `FAL_KEY`. | ~$0.005/call | one call per class |
+**Lighting mock-ups** (`/new` → `/design`). A photo plus "Where do the lights go?" is read by
+`instruction.py` (fixed rules, no model call) into targets: places, roof edges, product, colours,
+spacing, twinkle, and what was assumed. *Automatic* then runs `POST /api/design/detect`: anything about
+the roof goes through the unchanged roof detector (the same `/api/segment` + `/api/geometry` calls with
+default settings), its segments are grouped per edge role into lines, and every detected line (eaves, rakes,
+hips, ridges, valleys) is lit and drawn solid; a line can be switched off (○) by hand. Other places (hedges, trees, palms,
+dormers, …) are SAM 3 concept masks, run in parallel with the roof. Lines passing behind an obstacle area
+you paint show which stretch is hidden. *Manual* detects nothing. The editor has one toolbar row:
+Select (drag a point, drag a line, double-click to add a point, Alt-click to remove one), Brush / Erase for
+areas, Find in box / Find by click (SAM 3 prompts, `POST /api/design/refine`; with no area selected, Find in box
+looks for roof the detection missed, `POST /api/design/roof-in-box`: a "roof" box prompt, only roof not yet
+detected, run through the pipeline with the planes already found, and only the roofline inside the box is
+kept, the upper outline and the eaves of full roof faces, not the inner edge of a trim band), zoom, undo/redo, Re-detect and
+Approve (locks the geometry), with a hint line that explains the current tool. The right panel lists lines
+and areas and holds per-request lighting settings.
+Everything autosaves into the project. Like the Light Design product, lighting is stored as settings;
+nothing is rendered on the photo yet.
 
-There are no local weights to download and no GPU requirement.
+**One line editor.** Lines are edited in one place only: the editor at `/design`. In the detection studio,
+"Edit lines" opens the current detected lines there (`POST /api/design/from-studio`: the segments grouped per
+edge, lit as for "roofline"); the studio itself only detects, inspects and tunes. Projects saved with the
+studio's former editor still show their edited lines, read-only.
+
+The sample house runs the whole pipeline with built-in SAM-like masks and no API call. For real
+photos put a fal.ai key in `.env` (`FAL_KEY=...`, see `.env.example`) and restart. Each SAM 3 call
+costs about half a cent and is cached on disk per photo and prompt (`.sam_cache/`).
+
+## Pipeline
+
+| Phase | Module | What it does |
+| --- | --- | --- |
+| 0 | `eval/` | Harness, two metrics, held-out split, watermark warning. Built first; nothing is tuned without it. |
+| 1 | `roofline/partition.py` | SAM 3 text prompt `roof` returns one instance per plane, overlapping. They become a hard label map: the smallest instance wins a contested pixel (children beat parents), score is folded into the priority with a soft floor at 0.35, and an instance is a duplicate only if nothing solid is left of it. Narrow gaps between planes are split between them. Borders between labels are the candidate interior lines. |
+| 2 | `roofline/cleanup.py` | Per plane: close, open, fill holes, drop specks, fill narrow notches from convexity defects (never a convex hull). Growth only takes background, so the partition stays hard. Foliage (excess green, or a SAM `tree` pass) marks boundary as *suspect*; a suspect stretch loses trust only if it does not split into long straight pieces, because a roof edge is straight and a tree outline is not. Output: ordered boundary with each pixel tagged free or adjacent-to-plane-j, trusted or not. |
+| 3 | `roofline/fitting.py` | `approxPolyDP` only seeds corners. Each edge is a Huber total-least-squares fit over its trusted pixels. Neighbours within the merge angle become one line, even across an occlusion gap. Every corner is the intersection of two fitted lines; a corner hidden by a tree is recovered by extending the neighbouring lines through the gap. |
+| 4 | `roofline/vanishing.py`, `directions.py` | Vanishing points from every LSD segment in the photo (walls, windows, doors), as one consistent Manhattan frame: the vertical VP fixes the horizon's orientation, a focal length fixes its offset, one horizontal VP fixes the other by orthogonality; the winners are then refit freely. Edges close to a VP direction get a quadratic direction prior. Sharing 2-D directions is the fallback when no VP is trustworthy. |
+| 5 | `roofline/graph.py` | Edges cluster into infinite lines (angle + offset), corners into junctions (snap radius), T-junctions are detected. Energy = pixel fit + direction prior + junction closure, minimised by block coordinate descent with closed-form steps (a 2x2 eigenproblem per line, a 2x2 solve per junction), so it never increases; it stops when the relative drop is under `energy_tol`. Junctions the relaxation has carried to within `junction_coalesce_frac` of each other are then merged (`coalesce`), so a plane thinner than the offset tolerance, whose two sides became one line, is emitted once rather than twice. Coverage (polygons vs partition) is reported before and after. |
+| 6 | `roofline/interior.py` | Only where one mask spans two faces: a chord between two corners of a plane is kept if LSD segments cover most of it, it is long, and it is not parallel to the eave (tile rows). LSD only confirms a hypothesis; it is never output. |
+| 7 | `roofline/roles.py` | Roles from topology: shared + horizontal in plan = ridge; shared + sloped = hip, or valley if its low end sits in a re-entrant corner; free + horizontal = eave or silhouette ridge by which side the plane lies on; free + sloped = rake, or hip when the plane narrows upward. Pitch is reported as seen, calibrated (needs a focal length: EXIF, typed in, or estimated from the VPs and labelled low-confidence), and as the nearest standard pitch by a MAP estimate. There is no height-cutoff slider. |
+| 8 | `eval/tune.py` | Random search plus coordinate refinement over the thresholds on the train split, reported against the held-out split. It writes `params.json` only if held-out does not get worse. |
+
+`POST /api/segment` runs phases 1, 2 and the VP estimation once per prompt. `POST /api/geometry`
+runs phases 3 to 7 in a few milliseconds on every slider tick; `stop_after` returns any
+intermediate stage. `GET /api/layer/<session>/<instances|partition|arcs|lines>.png` are the
+inspection images shown in view A.
+
+## Obstacles in front of the roof
+
+Work on carrying roof lines behind trees, palms and cars (detector rules, a SAM obstacle pass, and joining /
+extending lines through obstacles in the editor) was removed on 2026-09-26 at the owner's request: SAM 3
+detection in the editor was less accurate with it. The detector is back to its earlier behaviour (the harness
+reproduces `eval/results/baseline_before_obstacles.json` exactly). The sample houses with obstacles
+(`synth.OBSTACLE_SPECS`) stay in the evaluation set as test data. In the editor, an "Obstruction" area painted
+by hand still shows which stretch of a line passes behind it ("N % hidden"); it does not move any line.
+
+## Evaluation
 
 ```bash
-cd api
-FAL_KEY=... SEGMENTATION_PROVIDER=fal .venv/bin/uvicorn app.main:app --reload
+python -m eval.build_dataset                       # synthetic scenes with exact ground truth
+python -m eval.harness --pipeline legacy           # the pre-rebuild pipeline, the baseline
+python -m eval.harness                             # the phased pipeline (add --stop-after 3..7, --split heldout)
+python -m eval.debug_view out.png <stem> ...       # prediction vs ground truth, per photo
+python -m eval.ab_prompts owner_house_annotated    # SAM 3 prompt A/B, scored with the same metrics
+python -m eval.tune --write                        # outer tuning loop
 ```
 
-Before relying on it, run the contract probe once. It settles mask resolution, prompt
-support and the RLE encoding against the live API:
+Add a photo by putting `eval/photos/<stem>.jpg`, an annotation `eval/annotations/<stem>.json`
+(closed polygons, one per plane; format in `eval/build_dataset.py`), and cached instances
+`eval/cache/<stem>.npz`. List watermarked photos in `eval/watermarked.txt`: bold tiled watermarks
+are detected automatically, faint ones are not.
 
-```bash
-cd api && FAL_KEY=... .venv/bin/python tests/fal_probe.py
-```
+Metrics: **chamfer distance** both ways between predicted and ground-truth edge pixels, as a
+percentage of the image diagonal; and **matching F1** at endpoint tolerances of 0.5, 1 and 2 % of
+the diagonal, with mean angular error and the count of unmatched predictions.
 
-## Test detection on real photos
+## Files
 
-```bash
-cd api
-.venv/bin/python tests/detect_eval.py            # dry run: how many billed calls it needs
-.venv/bin/python tests/detect_eval.py --spend    # make only the uncached calls
-```
-
-Runs the production detection path on the client's photos and prints a per-class hit table
-against the old GroundingDINO + SAM 2 baseline. Every fal response is cached in
-`out/fal_cache/`, so re-running after a filter change, or with `--prompt kind="text"` on an
-already-tried prompt, costs nothing. Annotated overlays go to `out/detect-eval/`.
-
-## Verify
-
-```bash
-createdb lightdesign_test                                          # once
-cd api && .venv/bin/python tests/smoke.py                          # API, sign-in and ownership
-cd web && node tests/ui-smoke.mjs && node tests/manual-mask.mjs    # browser
-```
-
-`smoke.py` rebuilds `lightdesign_test` from the migrations on every run, refuses any database
-whose name doesn't end in `_test`, and writes photos to a temporary directory. The browser tests
-need both servers running with `SEGMENTATION_PROVIDER=mock`, and each run registers a fresh
-account in the development database. Screenshots go to `test-output/`, which is gitignored.
-
-## What M1 does
-
-1. Upload a photo with a plain-English instruction (stored, interpreted in M2).
-2. Choose **Automatic** or **Manual** masking.
-3. Automatic detects roofline, hedges, shrubs, topiaries, palm trunks, palm fronds and
-   tree canopies as separate regions. Rooflines come back as individually selectable
-   spans tagged front / left / right. Palm trunks are truncated at the bottom of the husk.
-4. Correct anything: brush and erase on area masks, drag/insert/delete vertices on
-   roofline spans, or drag a box to re-run segmentation on one area. Undo/redo throughout.
-5. Approve to lock the mask set.
-
-Shortcuts: `b` brush, `e` erase, `v` vertices, `[` / `]` brush size, `cmd+z` / `shift+cmd+z`.
+- `app.py`, `index.html`: API and the single-page frontend (Tailwind via CDN, vanilla JS).
+- `roofline/`: the pipeline, the SAM 3 client, local fallbacks, and the synthetic scene generator.
+- `eval/`: harness, metrics, tuning loop, prompt A/B, dataset builder, and `legacy_app.py` (the frozen baseline).
