@@ -1,0 +1,23 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-multipart==0.0.20
+pydantic==2.10.4
+pydantic-settings==2.7.0
+pillow==11.1.0
+numpy==2.2.1
+opencv-python-headless==4.10.0.84
+httpx==0.28.1
+fal-client==1.0.1
+sqlalchemy==2.0.52
+alembic==1.20.0
+psycopg[binary]==3.3.5
+argon2-cffi==25.1.0
+email-validator==2.3.0
+
+# Reference roof-line engine (PARTITION_ENGINE=reference, the default): the roof-detection
+# project installed as a package, so the product draws exactly what that project draws.
+# Local dev: pip install -e /Users/samibutt/Documents/freelance/roof-detection
+# Deploy: vendor that project's roofline/ package (pyproject.toml is in its root).
+# Not installed? The app still starts and every other mode runs — the package is imported on
+# first use, not at import time. Set PARTITION_ENGINE=port for this repo's own implementation
+# of the same method, or EDGE_EXTRACTOR=hybrid; only "reference" needs the package.

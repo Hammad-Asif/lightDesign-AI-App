@@ -1,2 +1,0 @@
-# One photo stem per line. Photos listed here are known to carry a watermark.
-owner_house_annotated

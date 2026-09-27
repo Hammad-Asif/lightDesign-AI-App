@@ -1,0 +1,922 @@
+/* Neutral working UI: grey surfaces, one blue accent for the active thing, no decoration.
+   The region colours are left alone because they carry meaning. */
+
+:root,
+:root[data-theme="light"] {
+  color-scheme: light;
+
+  --bg: #f4f5f7;
+  --surface: #ffffff;
+  --surface-2: #f7f8fa;
+  --raised: #ffffff;
+  --line: #dcdfe4;
+  --line-soft: #e8eaee;
+  --text: #16191d;
+  --muted: #646b75;
+  --accent: #2563eb;
+  --accent-ink: #ffffff;
+  --accent-soft: #e8f0fe;
+  /* A second, more vivid accent for the products dashboard's primary actions -- kept apart from
+     --accent so the rest of the app's blue is untouched. */
+  --accent-2: #6d5ce7;
+  --accent-2-ink: #ffffff;
+  --accent-2-soft: #eee9fd;
+  --danger: #fdecec;
+  --danger-text: #96231f;
+  --ok: #e3f5e9;
+  --ok-text: #16663c;
+  --warn: #fdf3d8;
+  --warn-text: #8a5b00;
+  --canvas-bed: #e4e6ea;
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+
+  --bg: #16191d;
+  --surface: #1c2025;
+  --surface-2: #23282f;
+  --raised: #262c33;
+  --line: #333a43;
+  --line-soft: #2a3038;
+  --text: #e7eaee;
+  --muted: #98a1ad;
+  --accent: #4b8cf5;
+  --accent-ink: #0d1117;
+  --accent-soft: #1e2c44;
+  --accent-2: #8b7cf6;
+  --accent-2-ink: #14101f;
+  --accent-2-soft: #2a2550;
+  --danger: #4a1f1f;
+  --danger-text: #ffd9d6;
+  --ok: #17351f;
+  --ok-text: #86e0a5;
+  --warn: #3a2f10;
+  --warn-text: #f0c04b;
+  --canvas-bed: #101317;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 400 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+h1, h2, h3 { margin: 0; font-weight: 600; letter-spacing: -0.01em; }
+h1 { font-size: 20px; }
+h2 { font-size: 14px; }
+h3 { font-size: 13px; }
+
+button {
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.2;
+  color: var(--text);
+  background: var(--raised);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 7px 12px;
+  cursor: pointer;
+}
+
+button:hover:not(:disabled) { background: var(--surface-2); border-color: var(--muted); }
+button:disabled { opacity: 0.45; cursor: not-allowed; }
+
+button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-ink);
+}
+
+/* Each of these restates its own background: the plain button:hover above is more specific
+   than .primary/.active, so without this it repaints them grey on hover. */
+button.primary:hover:not(:disabled) {
+  background: var(--accent);
+  border-color: var(--accent);
+  filter: brightness(1.08);
+}
+
+button.link {
+  background: none;
+  border-color: transparent;
+  color: var(--accent);
+  padding: 2px 0;
+  text-align: left;
+}
+
+button.link:hover:not(:disabled) { background: none; border-color: transparent; text-decoration: underline; }
+
+input, textarea, select {
+  font-family: inherit;
+  font-size: 13.5px;
+  line-height: 1.45;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 8px 10px;
+}
+
+input:focus-visible,
+textarea:focus-visible,
+select:focus-visible,
+button:focus-visible,
+label.dropzone:focus-within {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.muted { color: var(--muted); }
+.small { font-size: 12.5px; }
+
+.app { min-height: 100vh; display: flex; flex-direction: column; }
+
+.error {
+  background: var(--danger);
+  color: var(--danger-text);
+  padding: 10px 16px;
+  font-size: 13.5px;
+  cursor: pointer;
+}
+
+/* ---- Entry screens: sign in, upload, masking mode ---------------------------- */
+
+.topbar,
+.account-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--line);
+  background: var(--surface);
+}
+
+.brand { font-weight: 600; font-size: 14px; }
+
+.entry {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 40px 20px;
+}
+
+.panel {
+  width: 100%;
+  max-width: 400px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 24px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.panel .lede { margin: -8px 0 0; color: var(--muted); font-size: 13.5px; }
+
+.field { display: flex; flex-direction: column; gap: 5px; }
+.field > span { font-size: 12.5px; color: var(--muted); }
+
+.form-error {
+  margin: 0;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: var(--danger);
+  color: var(--danger-text);
+  font-size: 12.5px;
+}
+
+.dropzone {
+  display: block;
+  padding: 18px;
+  text-align: center;
+  font-size: 13px;
+  color: var(--muted);
+  border: 1px dashed var(--line);
+  border-radius: 6px;
+  background: var(--surface-2);
+  cursor: pointer;
+}
+
+.dropzone:hover { border-color: var(--accent); color: var(--text); }
+.dropzone input { display: none; }
+
+.mode-grid { display: grid; gap: 8px; }
+
+.mode-card {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  text-align: left;
+  padding: 12px 14px;
+}
+
+.mode-card:hover:not(:disabled) { border-color: var(--accent); }
+.mode-card strong { font-size: 13.5px; }
+.mode-card span { color: var(--muted); font-size: 12.5px; font-weight: 400; line-height: 1.45; }
+
+.theme-toggle { display: inline-flex; align-items: center; gap: 6px; }
+.theme-toggle svg { width: 14px; height: 14px; }
+
+/* ---- Account menu: every global/account-level control lives behind one trigger so it never
+   competes with the per-photo actions in the header. ---------------------------------------- */
+.account-menu { position: relative; }
+
+.avatar-trigger { padding: 0; border: none; background: none; border-radius: 50%; }
+.avatar-trigger:hover:not(:disabled) { background: none; border-color: transparent; }
+
+.avatar {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  background: var(--accent);
+  color: var(--accent-ink);
+  font-size: 13px;
+  font-weight: 600;
+  flex: none;
+}
+
+.menu-panel {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  width: 230px;
+  padding: 8px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
+}
+
+.menu-header { display: flex; align-items: center; gap: 10px; padding: 6px 8px 10px; }
+.menu-header .avatar { width: 34px; height: 34px; font-size: 14px; }
+.menu-header-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.menu-header-text strong { font-size: 13.5px; }
+.menu-header-text span { max-width: 168px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+
+.menu-divider { height: 1px; margin: 4px 0; background: var(--line); }
+
+.menu-item {
+  display: block;
+  width: 100%;
+  padding: 8px;
+  text-align: left;
+  background: none;
+  border: none;
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 500;
+}
+.menu-item:hover:not(:disabled) { background: var(--surface-2); border-color: transparent; }
+
+/* ---- Workspace --------------------------------------------------------------- */
+
+.workspace { display: flex; flex-direction: column; height: 100vh; }
+
+.header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+  padding: 9px 16px;
+  border-bottom: 1px solid var(--line);
+  background: var(--surface);
+}
+
+.header-title { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.header-title .status { min-width: 0; max-width: 320px; font-size: 12.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.header-title strong { font-size: 14px; font-weight: 600; }
+.header-actions { display: flex; align-items: center; gap: 7px; }
+
+.badge {
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.badge.ok { background: var(--ok); color: var(--ok-text); border-color: transparent; }
+.badge.warn { background: var(--warn); color: var(--warn-text); border-color: transparent; }
+.badge.status { cursor: pointer; }
+
+/* Tools that act on the same thing sit together; a hairline separates the groups. */
+.tool-group { display: flex; gap: 3px; padding-right: 10px; border-right: 1px solid var(--line); }
+.tool-group:last-of-type { border-right: none; padding-right: 0; }
+.zoom-level { min-width: 52px; }
+
+.slider { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12.5px; }
+.slider span { min-width: 40px; }
+
+/* The native track ignores the theme, so both parts are drawn here. */
+.slider input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100px;
+  height: 16px;
+  padding: 0;
+  background: none;
+  border: none;
+}
+
+.slider input[type="range"]::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 999px;
+  background: var(--line);
+}
+
+.slider input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 12px;
+  height: 12px;
+  margin-top: -4px;
+  border: none;
+  border-radius: 50%;
+  background: var(--accent);
+}
+
+.slider input[type="range"]::-moz-range-track {
+  height: 4px;
+  border-radius: 999px;
+  background: var(--line);
+}
+
+.slider input[type="range"]::-moz-range-thumb {
+  width: 12px;
+  height: 12px;
+  border: none;
+  border-radius: 50%;
+  background: var(--accent);
+}
+
+.spacer { flex: 1; }
+
+.interpreted {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 9px 16px;
+  border-bottom: 1px solid var(--line);
+  background: var(--accent-soft);
+  font-size: 13px;
+}
+
+.interpreted strong { color: var(--text); font-weight: 600; }
+.interpreted-actions { display: flex; gap: 6px; flex: none; }
+
+/* ---- Instruction as requests --------------------------------------------------- */
+.panel.wide { max-width: 560px; }
+.spec-heading { margin: 6px 0 0; font-size: 13.5px; font-weight: 600; }
+
+.spec-bar {
+  max-height: 45vh;
+  overflow: auto;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--line);
+  background: var(--surface);
+}
+
+.spec-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+
+.spec-row {
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface-2);
+  font-size: 13px;
+}
+
+.spec-place strong { font-weight: 600; }
+.spec-quote { margin-top: 2px; }
+
+.spec-lighting { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 7px; }
+.spec-lighting select, .spec-lighting input[type="number"] { padding: 3px 6px; font-size: 12.5px; }
+.spec-lighting input[type="number"] { width: 52px; }
+.spec-check { display: inline-flex; align-items: center; gap: 5px; font-size: 12.5px; }
+.spec-pattern { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.spec-step { display: inline-flex; align-items: center; gap: 4px; }
+
+.spec-note { margin-top: 6px; }
+.spec-problem {
+  margin-top: 6px;
+  padding: 5px 7px;
+  border-radius: 4px;
+  background: var(--danger);
+  color: var(--danger-text);
+  font-size: 12px;
+}
+
+.spec-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; margin-top: 10px; }
+
+.stage { display: flex; flex: 1; min-height: 0; }
+
+.canvas-area { position: relative; flex: 1; min-width: 0; min-height: 0; display: flex; }
+
+/* The photo sits centred in its bed; margin auto (not justify-content) keeps a zoomed photo
+   scrollable to its left edge. */
+.canvas-scroll { display: flex; flex: 1; min-width: 0; overflow: auto; background: var(--canvas-bed); padding: 12px; }
+
+/* ---- Floating canvas overlays: the drawing tools and the viewport controls sit over the
+   photo itself rather than in a bar that competes with the header for space. ---- */
+.tool-dock {
+  position: absolute;
+  top: 14px;
+  left: 14px;
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-height: calc(100% - 28px);
+  padding: 8px;
+  overflow: auto;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.14);
+}
+
+.dock-group { display: flex; flex-direction: column; gap: 3px; padding-bottom: 8px; border-bottom: 1px solid var(--line); }
+.dock-group:last-of-type { padding-bottom: 0; border-bottom: none; }
+
+.dock-tool { display: flex; align-items: center; gap: 8px; justify-content: flex-start; padding: 7px 10px; white-space: nowrap; }
+.dock-tool svg { width: 16px; height: 16px; flex: none; }
+.dock-tool.active { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+.dock-tool.active:hover:not(:disabled) { background: var(--accent); border-color: var(--accent); }
+
+.dock-slider { padding: 6px 4px 2px; }
+
+.viewport-controls {
+  position: absolute;
+  left: 14px;
+  bottom: 14px;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 8px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.14);
+}
+
+.viewport-controls button { padding: 5px 10px; }
+
+/* A hairline keeps the photo's edge from dissolving into the bed, which are close in tone. */
+.canvas { display: block; flex: none; margin: auto; height: auto; touch-action: none; outline: 1px solid var(--line); }
+.canvas.tool-brush, .canvas.tool-erase { cursor: crosshair; }
+.canvas.tool-vertex { cursor: pointer; }
+.canvas.tool-move { cursor: move; }
+.canvas.tool-box { cursor: cell; }
+
+.sidebar {
+  display: flex;
+  flex-direction: column;
+  width: 360px;
+  flex: none;
+  min-height: 0;
+  border-left: 1px solid var(--line);
+  background: var(--surface);
+}
+
+.sidebar-body { flex: 1; min-height: 0; overflow: auto; padding: 14px; }
+
+/* Pinned so the primary workflow actions are always reachable, whichever tab is open and
+   however far the list above has scrolled. */
+.sidebar-footer { display: flex; flex: none; gap: 8px; padding: 12px 14px; border-top: 1px solid var(--line); background: var(--surface-2); }
+.sidebar-footer button { flex: 1; }
+.sidebar-footer button.primary { flex: 1.4; font-weight: 600; }
+
+.tabs { display: flex; border-bottom: 1px solid var(--line); flex: none; }
+.tab {
+  flex: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 10px 8px;
+  border: none;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  background: none;
+  color: var(--muted);
+  font-weight: 500;
+}
+.tab:hover:not(:disabled) { background: var(--surface-2); color: var(--text); border-color: transparent; }
+.tab.active, .tab.active:hover:not(:disabled) { color: var(--text); border-bottom-color: var(--accent); }
+.tab-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); }
+
+.sidebar h2 {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 18px 0 8px;
+}
+
+.sidebar h2:first-child { margin-top: 0; }
+.sidebar h2 .count { font-size: 12.5px; font-weight: 400; color: var(--muted); }
+.sidebar ul { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+
+/* Colour key for the lines on the photo: only the edge types actually present. */
+.sidebar ul.legend {
+  flex-direction: row;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  margin: -2px 0 10px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.sidebar ul.legend li { display: inline-flex; align-items: center; gap: 5px; }
+
+.region {
+  padding: 5px 7px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface-2);
+  cursor: pointer;
+}
+
+.region.active { border-color: var(--accent); background: var(--accent-soft); }
+
+.region-head { display: flex; align-items: center; gap: 6px; min-height: 24px; }
+.region-name { flex: 1; min-width: 0; padding: 0 6px; font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.region-flag { flex: none; padding: 1px 6px; border-radius: 4px; background: var(--accent-soft); color: var(--muted); font-size: 11.5px; }
+.region-flag.warn { background: var(--danger); color: var(--danger-text); }
+.region-head input { flex: 1; min-width: 0; padding: 3px 6px; background: transparent; border-color: transparent; }
+.region-head input:hover { border-color: var(--line); }
+
+.swatch { width: 10px; height: 10px; border-radius: 2px; flex: none; }
+
+.icon { padding: 2px 6px; background: none; border-color: transparent; color: var(--muted); }
+.icon:hover:not(:disabled) { color: var(--text); background: none; border-color: transparent; }
+
+.region-meta { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.region-meta select { flex: 1 1 92px; min-width: 92px; padding: 3px 5px; font-size: 12px; }
+.region-meta .source { font-size: 12px; color: var(--muted); }
+
+.region .hidden-note {
+  margin: 7px 0 0;
+  padding: 5px 7px;
+  border-radius: 4px;
+  background: var(--accent-soft);
+  color: var(--text);
+  font-size: 12px;
+}
+
+/* An edge the pipeline could not identify: flagged for the user to set, not trusted. */
+.region .unknown-note {
+  margin: 7px 0 0;
+  padding: 5px 7px;
+  border-radius: 4px;
+  background: var(--danger);
+  color: var(--danger-text);
+  font-size: 12px;
+}
+
+.colour { width: 30px; height: 24px; padding: 2px; flex: none; cursor: pointer; }
+
+/* A collapsible part of the panel: open when it holds the selection or on request. */
+.panel-section { margin: 16px 0 0; border-top: 1px solid var(--line); padding-top: 10px; }
+.panel-section > summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  list-style: none;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+.panel-section > summary::-webkit-details-marker { display: none; }
+.panel-section > summary::before { content: "▸"; color: var(--muted); font-size: 13px; width: 12px; }
+.panel-section[open] > summary::before { content: "▾"; }
+.panel-section > summary .count { margin-left: auto; font-size: 12.5px; font-weight: 400; color: var(--muted); }
+.panel-section > summary .summary-actions { display: inline-flex; }
+.panel-section > summary .summary-actions .icon { padding: 2px 4px; }
+.panel-section > p { margin: 8px 0; }
+.panel-section > ul { margin-top: 8px; }
+.check { display: inline-flex; align-items: center; gap: 6px; margin: 0 0 8px; font-size: 12.5px; }
+
+.add-group h3 { margin: 14px 0 6px; color: var(--muted); font-size: 12.5px; font-weight: 600; }
+.add-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 5px; }
+
+.add-kind {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  text-align: left;
+  font-size: 12px;
+  padding: 6px 8px;
+  background: var(--surface-2);
+}
+
+.add-kind.drawing,
+.add-kind.drawing:hover:not(:disabled) { border-color: var(--accent); background: var(--accent-soft); }
+
+.drawing-hint {
+  margin: 0 0 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  background: var(--accent-soft);
+  font-size: 12.5px;
+}
+
+@media (max-width: 960px) {
+  .entry { padding: 24px 16px; }
+  .stage { flex-direction: column; }
+  .canvas-area { min-height: 280px; }
+  .sidebar { width: auto; max-height: 45vh; border-left: none; border-top: 1px solid var(--line); }
+
+  /* Not enough height for a tall vertical dock once the sidebar takes its own share below;
+     lay the tools out in a compact icon-only strip along the top instead. */
+  .tool-dock {
+    top: 10px;
+    left: 50%;
+    right: auto;
+    max-width: calc(100% - 20px);
+    max-height: none;
+    flex-direction: row;
+    align-items: center;
+    overflow-x: auto;
+    transform: translateX(-50%);
+  }
+  .dock-group { flex-direction: row; padding-bottom: 0; padding-right: 8px; border-bottom: none; border-right: 1px solid var(--line); }
+  .dock-group:last-of-type { padding-right: 0; border-right: none; }
+  .dock-tool span { display: none; }
+  .dock-slider { display: none; }
+}
+
+/* ---- products dashboard ----------------------------------------------------------------- */
+
+button.ghost { background: none; }
+button.ghost:hover:not(:disabled) { background: var(--surface-2); }
+button.small { font-size: 12px; padding: 4px 9px; }
+
+/* The library is its own full-width dashboard, not another centred narrow panel: it is a
+   catalogue meant to be scanned in a grid, not a form read top to bottom. */
+.product-dashboard {
+  width: 100%;
+  max-width: 1180px;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.product-dashboard-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+.breadcrumb { display: block; margin-bottom: 4px; }
+.product-dashboard-head h1 { margin: 0 0 4px; font-size: 22px; }
+.product-dashboard .lede { margin: 0; color: var(--muted); font-size: 13.5px; max-width: 620px; }
+
+.product-stats { display: flex; flex-wrap: wrap; gap: 10px; }
+.stat-tile {
+  flex: 1;
+  min-width: 140px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 14px 16px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+}
+.stat-number { font-size: 22px; font-weight: 700; letter-spacing: -0.02em; }
+.stat-label { font-size: 12px; color: var(--muted); }
+
+.product-toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.product-pills { display: flex; flex-wrap: wrap; gap: 6px; }
+
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 14px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 12.5px;
+  font-weight: 500;
+}
+.pill:hover:not(:disabled) { background: var(--surface); border-color: var(--muted); color: var(--text); }
+.pill.active, .pill.active:hover:not(:disabled) { background: var(--accent-2-soft); border-color: var(--accent-2); color: var(--text); }
+.pill .count { color: inherit; opacity: 0.65; }
+
+/* The primary "add a product" call to action: the one place on this page that gets the vivid
+   accent, so it reads as the one thing to do first. */
+.product-cta {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--accent-2);
+  border-color: var(--accent-2);
+  color: var(--accent-2-ink);
+  font-weight: 600;
+}
+.product-cta:hover:not(:disabled) { background: var(--accent-2); border-color: var(--accent-2); filter: brightness(1.08); }
+.product-cta svg { width: 14px; height: 14px; }
+
+.badge.accent2 { background: var(--accent-2-soft); color: var(--accent-2); border-color: transparent; font-weight: 600; }
+
+.product-filters { display: flex; align-items: center; flex-wrap: wrap; gap: 16px; margin-top: -4px; }
+.product-filters .check { margin: 0; }
+.product-summary { margin-left: auto; font-style: italic; color: var(--muted); font-size: 12.5px; }
+
+.search-field { position: relative; flex: 1; min-width: 200px; }
+.search-field svg {
+  position: absolute;
+  left: 10px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 14px;
+  height: 14px;
+  color: var(--muted);
+  pointer-events: none;
+}
+.product-search {
+  width: 100%;
+  font-family: inherit;
+  font-size: 13px;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 8px 12px 8px 30px;
+}
+.product-search:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
+
+.product-form-title { margin: 0 0 12px; font-size: 15px; }
+.product-empty { grid-column: 1 / -1; padding: 6px 8px; }
+
+.product-group { margin-top: 6px; }
+.product-group-head { display: flex; align-items: baseline; gap: 10px; border-bottom: 1px solid var(--line); padding-bottom: 6px; }
+.product-group-head h2 { margin: 0; font-size: 15px; }
+
+.product-category { display: flex; align-items: center; gap: 8px; margin: 14px 0 10px; }
+.product-category span { flex: 1; }
+/* Two classes beat button.small's element+class specificity without an !important. */
+.product-category .add-pill { display: inline-flex; align-items: center; gap: 4px; border-radius: 999px; padding: 6px 12px; }
+.add-pill svg { width: 12px; height: 12px; }
+
+/* A responsive card grid replaces the old stacked rows: as many cards per row as fit at
+   least 260px, so the library reads as a catalogue rather than a list. */
+.product-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 12px;
+}
+
+.product {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px;
+  border: 1px solid var(--line-soft);
+  border-radius: 14px;
+  background: var(--surface);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.03);
+  transition: box-shadow 0.15s ease, border-color 0.15s ease, transform 0.15s ease;
+}
+.product:hover { border-color: var(--line); box-shadow: 0 8px 20px rgba(0, 0, 0, 0.08); transform: translateY(-1px); }
+
+.product-card-top { display: flex; align-items: center; gap: 10px; width: 100%; }
+.product-main { display: flex; flex-direction: column; gap: 3px; flex: 1; min-width: 0; }
+.product-name-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.product-name { font-weight: 600; font-size: 13.5px; }
+.product-colours { display: flex; gap: 3px; flex: none; }
+/* Pure and cool white are all but invisible on the panel without an outline. */
+.product-colours .swatch, .chip .swatch { border: 1px solid var(--line); }
+
+.product-thumb {
+  width: 44px;
+  height: 44px;
+  flex: none;
+  border-radius: 50%;
+  border: 1px solid var(--line-soft);
+  object-fit: cover;
+  background: var(--surface-2);
+}
+.product-thumb.large { width: 72px; height: 72px; }
+/* A product with no picture still holds the space so the rows stay in line. It is drawn as a
+   coloured icon avatar keyed to the category, with a dot for the product's own colour, rather
+   than a photo placeholder that would otherwise read as a picture that failed to load. */
+.product-thumb.empty {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  color: #fff;
+}
+.product-thumb.empty svg { width: 20px; height: 20px; }
+.product-thumb.large.empty svg { width: 30px; height: 30px; }
+.thumb-dot {
+  position: absolute;
+  right: -2px;
+  bottom: -2px;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 2px solid var(--surface);
+}
+
+.product-picture-field { display: flex; align-items: flex-start; gap: 12px; margin-bottom: 12px; }
+.product-picture-field .spec-actions { margin: 4px 0; }
+.field-label { display: block; font-size: 12px; color: var(--muted); }
+
+/* A file input styled as the button that opens it. */
+.button-like {
+  display: inline-flex;
+  align-items: center;
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.2;
+  color: var(--text);
+  background: var(--raised);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 7px 12px;
+  cursor: pointer;
+}
+.button-like:hover { background: var(--surface-2); border-color: var(--muted); }
+.button-like input[type="file"] { display: none; }
+.product-actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: auto; padding-top: 2px; }
+
+/* Edit/remove on an owned product are icon-only squares; a built-in only ever offers
+   "Duplicate to edit" in words, since it cannot be changed or removed directly. */
+.icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border-radius: 8px;
+}
+.icon-btn svg { width: 15px; height: 15px; }
+.icon-btn.danger:hover:not(:disabled) { background: var(--danger); border-color: transparent; color: var(--danger-text); }
+
+.product-actions .duplicate-btn { display: inline-flex; align-items: center; gap: 6px; border-radius: 999px; }
+.duplicate-btn svg { width: 13px; height: 13px; }
+
+/* Slide-over drawer: the form opens over the catalogue rather than pushing it down the page,
+   so the library underneath stays put and never re-flows around it. */
+.drawer-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+  display: flex;
+  justify-content: flex-end;
+  background: rgba(10, 12, 16, 0.4);
+  animation: drawer-fade 0.15s ease;
+}
+.drawer-panel {
+  width: min(420px, 100%);
+  height: 100%;
+  overflow-y: auto;
+  background: var(--surface);
+  border-left: 1px solid var(--line);
+  box-shadow: -12px 0 32px rgba(0, 0, 0, 0.16);
+  animation: drawer-in 0.18s ease;
+}
+.drawer-panel .product-form { border: none; border-radius: 0; margin: 0; padding: 20px; background: var(--surface); }
+@keyframes drawer-fade { from { opacity: 0; } to { opacity: 1; } }
+@keyframes drawer-in { from { transform: translateX(24px); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+
+.product-form-row { display: flex; gap: 12px; flex-wrap: wrap; }
+.product-form-row .field { flex: 1; min-width: 150px; }
+
+.chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; padding: 4px 9px; }
+.chip.on { background: var(--accent-soft); border-color: var(--accent); }
+.chip.on:hover:not(:disabled) { background: var(--accent-soft); border-color: var(--accent); }
+
+@media (max-width: 620px) {
+  .product-list { grid-template-columns: 1fr; }
+  .drawer-panel { width: 100%; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
+}
