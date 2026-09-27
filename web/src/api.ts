@@ -7,6 +7,7 @@ import type {
   Photo,
   PhotoDetail,
   Product,
+  ProductDraft,
   Region,
   RegionKind,
   Side,
@@ -104,8 +105,35 @@ export const refineRegion = (
 export const interpret = (id: string, prompt?: string) =>
   send<Photo>(`/photos/${id}/interpret`, "POST", { prompt: prompt ?? null });
 
-export const listProducts = () => send<Product[]>("/products", "GET");
+export const listProducts = (archived = false) =>
+  send<Product[]>(`/products${archived ? "?archived=true" : ""}`, "GET");
 export const palette = () => send<PaletteColour[]>("/products/palette", "GET");
+
+export const createProduct = (draft: ProductDraft) => send<Product>("/products", "POST", draft);
+
+export const updateProduct = (id: string, draft: ProductDraft) =>
+  send<Product>(`/products/${id}`, "PATCH", draft);
+
+export const restoreProduct = (id: string) =>
+  send<Product>(`/products/${id}/restore`, "POST");
+
+export async function putProductImage(id: string, file: File): Promise<Product> {
+  const form = new FormData();
+  form.append("file", file);
+  return json<Product>(await request(`/products/${id}/image`, { method: "PUT", body: form }));
+}
+
+export const deleteProductImage = (id: string) =>
+  send<Product>(`/products/${id}/image`, "DELETE");
+
+export async function deleteProduct(id: string): Promise<void> {
+  const response = await request(`/products/${id}`, { method: "DELETE" });
+  if (response.status === 401) throw new UnauthorizedError("Sign in required");
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({}));
+    throw new Error(detailOf(body, `Could not remove the product (${response.status})`));
+  }
+}
 
 // null until the lighting has been confirmed for the photo.
 export const getDesign = (id: string) => send<Design | null>(`/photos/${id}/design`, "GET");

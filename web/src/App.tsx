@@ -2,11 +2,13 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import * as api from "./api";
 import { MaskCanvas, type MaskCanvasHandle } from "./canvas/MaskCanvas";
+import { AccountMenu } from "./components/AccountMenu";
 import { Auth } from "./components/Auth";
 import { ModeChooser } from "./components/ModeChooser";
+import { Products } from "./components/Products";
 import { ThemeToggle, type Theme } from "./components/ThemeToggle";
 import { RegionPanel } from "./components/RegionPanel";
-import { Toolbar } from "./components/Toolbar";
+import { ToolDock, ViewportControls } from "./components/Toolbar";
 import { Upload } from "./components/Upload";
 import { Specification } from "./components/Specification";
 import { BLOCKER_KINDS, geometryOf, KIND_COLORS } from "./types";
@@ -45,6 +47,7 @@ export default function App() {
   const [design, setDesign] = useState<Design | null>(null);
   // The sidebar shows either the lines and areas, or the lighting for them.
   const [sidebarTab, setSidebarTab] = useState<"regions" | "lighting">("regions");
+  const [showProducts, setShowProducts] = useState(false);
   const [showObstacles, setShowObstacles] = useState(false);
 
   const canvasRef = useRef<MaskCanvasHandle>(null);
@@ -130,6 +133,17 @@ export default function App() {
       const uploaded = await api.uploadPhoto(file, prompt);
       setDesign(null);
       setPhoto(await api.getPhoto(uploaded.id));
+    });
+
+  // The library changed under us. Refresh it, and read the instruction again so the
+  // confirmation screen resolves against the new list without a reload.
+  const handleLibraryChanged = () =>
+    guard(async () => {
+      setProducts(await api.listProducts());
+      if (photo) {
+        await api.interpret(photo.id);
+        setPhoto(await api.getPhoto(photo.id));
+      }
     });
 
   const handleInterpret = (prompt: string) =>
@@ -360,17 +374,27 @@ export default function App() {
         </div>
       )}
 
-      {!(photo && photo.mode) && (
+      {(!(photo && photo.mode) || showProducts) && (
         <>
           <div className="account-bar">
             <span className="brand">Light Design</span>
             <div className="spacer" />
-            <span className="muted small">{user.email}</span>
-            <ThemeToggle theme={theme} onChange={setTheme} />
-            <button onClick={handleSignOut}>Sign out</button>
+            <AccountMenu
+              user={user}
+              theme={theme}
+              onThemeChange={setTheme}
+              onOpenProducts={() => setShowProducts(true)}
+              onSignOut={handleSignOut}
+            />
           </div>
           <main className="entry">
-            {photo ? (
+            {showProducts ? (
+              <Products
+                palette={palette}
+                onClose={() => setShowProducts(false)}
+                onChanged={handleLibraryChanged}
+              />
+            ) : photo ? (
               <ModeChooser
                 photo={photo}
                 products={products}
@@ -386,7 +410,7 @@ export default function App() {
         </>
       )}
 
-      {photo && photo.mode && (
+      {photo && photo.mode && !showProducts && (
         <div className="workspace">
           <header className="header">
             <div className="header-title">
@@ -398,7 +422,15 @@ export default function App() {
               )}
               {photo.interpreted && (
                 <button
-                  className="link status"
+                  className={
+                    requests.length
+                      ? design
+                        ? "badge ok status"
+                        : "badge warn status"
+                      : photo.interpreted.matched
+                        ? "badge status"
+                        : "badge warn status"
+                  }
                   title="Open the lighting for this photo"
                   onClick={() => setSidebarTab("lighting")}
                 >
@@ -415,61 +447,56 @@ export default function App() {
               )}
             </div>
             <div className="header-actions">
-              <span className="muted small">{user.email}</span>
-              <ThemeToggle theme={theme} onChange={setTheme} />
-              {photo.approved && <button onClick={handleReopen}>Reopen for correction</button>}
-              <button
-                onClick={() => {
+              <AccountMenu
+                user={user}
+                theme={theme}
+                onThemeChange={setTheme}
+                onOpenProducts={() => setShowProducts(true)}
+                onSignOut={handleSignOut}
+                onReopen={photo.approved ? handleReopen : undefined}
+                onNewPhoto={() => {
                   setPhoto(null);
                   setActiveId(null);
                 }}
-              >
-                New photo
-              </button>
-              <button onClick={handleSignOut}>Sign out</button>
+              />
             </div>
           </header>
 
-          {!photo.approved && (
-            <Toolbar
-              tool={tool}
-              setTool={chooseTool}
-              brushSize={brushSize}
-              setBrushSize={setBrushSize}
-              zoom={zoom}
-              setZoom={setZoom}
-              active={active}
-              history={history}
-              busy={busy}
-              onUndo={() => canvasRef.current?.undo()}
-              onRedo={() => canvasRef.current?.redo()}
-              onRedetect={() => handleRedetect(false)}
-              onDetectAll={() => handleRedetect(true)}
-              onApprove={handleApprove}
-            />
-          )}
-
           <div className="stage">
-            <MaskCanvas
-              ref={canvasRef}
-              photo={photo}
-              regions={photo.regions}
-              activeId={photo.approved ? null : activeId}
-              tool={tool}
-              brushSize={brushSize}
-              zoom={zoom}
-              showObstacles={showObstacles}
-              onMaskCommit={handleMaskCommit}
-              onPolylineCommit={handlePolylineCommit}
-              onSelect={setActiveId}
-              onBox={handleBox}
-              onPoint={handlePoint}
-              onRemoveAt={handleDelete}
-              onHistoryChange={setHistory}
-              drawingColor={drawingKind ? KIND_COLORS[drawingKind] : null}
-              onDrawFinish={handleDrawFinish}
-              onDrawCancel={() => setDrawingKind(null)}
-            />
+            <div className="canvas-area">
+              <MaskCanvas
+                ref={canvasRef}
+                photo={photo}
+                regions={photo.regions}
+                activeId={photo.approved ? null : activeId}
+                tool={tool}
+                brushSize={brushSize}
+                zoom={zoom}
+                showObstacles={showObstacles}
+                onMaskCommit={handleMaskCommit}
+                onPolylineCommit={handlePolylineCommit}
+                onSelect={setActiveId}
+                onBox={handleBox}
+                onPoint={handlePoint}
+                onRemoveAt={handleDelete}
+                onHistoryChange={setHistory}
+                drawingColor={drawingKind ? KIND_COLORS[drawingKind] : null}
+                onDrawFinish={handleDrawFinish}
+                onDrawCancel={() => setDrawingKind(null)}
+              />
+              {!photo.approved && (
+                <>
+                  <ToolDock tool={tool} setTool={chooseTool} brushSize={brushSize} setBrushSize={setBrushSize} active={active} />
+                  <ViewportControls
+                    zoom={zoom}
+                    setZoom={setZoom}
+                    history={history}
+                    onUndo={() => canvasRef.current?.undo()}
+                    onRedo={() => canvasRef.current?.redo()}
+                  />
+                </>
+              )}
+            </div>
             <aside className="sidebar">
               <div className="tabs" role="tablist">
                 <button
@@ -522,6 +549,27 @@ export default function App() {
                   </p>
                 )}
               </div>
+              {!photo.approved && (
+                <div className="sidebar-footer">
+                  <button
+                    title="Detect again from the instruction. Replaces every detected line and area; ones you drew stay."
+                    disabled={busy}
+                    onClick={() => handleRedetect(false)}
+                  >
+                    Re-detect
+                  </button>
+                  <button
+                    title="Detect every kind of area, not only the ones the instruction names"
+                    disabled={busy}
+                    onClick={() => handleRedetect(true)}
+                  >
+                    Detect everything
+                  </button>
+                  <button className="primary" title="Lock these lines and areas" disabled={busy} onClick={handleApprove}>
+                    Approve
+                  </button>
+                </div>
+              )}
             </aside>
           </div>
         </div>

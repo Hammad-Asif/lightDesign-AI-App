@@ -136,6 +136,14 @@ class Product(Timestamped, Base):
     # whose bulbs are chosen per design.
     colours: Mapped[list] = mapped_column(JSONB, default=list, server_default=text("'[]'::jsonb"))
     twinkle: Mapped[bool] = mapped_column(default=False, server_default=text("false"))
+    # Retired rather than deleted: design_regions.settings holds this id inside JSONB, where no
+    # foreign key can protect it. An archived product leaves the library and the parser, and
+    # still resolves for the designs that already chose it.
+    archived: Mapped[bool] = mapped_column(default=False, server_default=text("false"))
+    # A picture of the product, so it can be chosen by sight. The file sits under
+    # storage_dir/products; this is the URL for it, carrying a version so a replacement shows
+    # immediately. None when none was uploaded.
+    image_url: Mapped[str | None] = mapped_column(Text)
 
 
 class Design(Timestamped, Base):

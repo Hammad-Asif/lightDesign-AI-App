@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from app.config import get_settings
 from app.models import Region as RegionRow
 from app.providers.base import get_provider
+from app.providers import roofline_v3
 from app.schemas import CreateRegionRequest, DetectRequest, RefineRequest, Region, RegionPatch
 from app.services import detect, intent, lighting, occlusion, partition, partition_reference, roofline, snap
 from app.storage import Store, get_store, region_dict
@@ -186,7 +187,10 @@ def run_detection(photo_id: str, body: DetectRequest, store: Store = Depends(get
     store.update_photo(photo, interpreted=lighting.interpretation(photo.prompt, store.products()))
 
     settings = get_settings()
-    partitioned = settings.edge_extractor == "partition"
+    direct_roof = settings.roofline_detector == "v3_sol" and "roof" in (selected or detect.DEFAULT_KINDS)
+    partitioned = settings.edge_extractor == "partition" and not direct_roof
+    direct_lines: list[dict] = []
+    detection_run: dict | None = None
     clock = time.perf_counter()
 
     def lap(stage: str) -> None:
@@ -208,15 +212,28 @@ def run_detection(photo_id: str, body: DetectRequest, store: Store = Depends(get
         reference = {"working_bgr": working_bgr, "scale": scale, "focal_35mm": None}
     else:
         small, _ = detect.working_copy(
-            image, settings.partition_detect_max_edge if partitioned else settings.detect_max_edge
+            image, settings.partition_detect_max_edge if settings.edge_extractor == "partition" else settings.detect_max_edge
         )
     try:
-        provider = get_provider()
-        if partitioned and settings.segmentation_provider == "fal":
-            from app.providers.fal import FalProvider
+        if direct_roof:
+            direct_lines, detection_run = roofline_v3.detect(image, settings)
+            # An empty list means no segmentation, not detect.run's default "all kinds".
+            remaining = [kind for kind in (selected or detect.DEFAULT_KINDS) if kind != "roof"]
+            detections = []
+            if remaining:
+                provider = get_provider()
+                if settings.edge_extractor == "partition" and settings.segmentation_provider == "fal":
+                    from app.providers.fal import FalProvider
 
-            provider = FalProvider(max_masks=settings.partition_fal_max_masks, image_format="jpeg")
-        detections = detect.run(small, provider, selected, settings.detect_blockers)
+                    provider = FalProvider(max_masks=settings.partition_fal_max_masks, image_format="jpeg")
+                detections = detect.run(small, provider, remaining, False)
+        else:
+            provider = get_provider()
+            if partitioned and settings.segmentation_provider == "fal":
+                from app.providers.fal import FalProvider
+
+                provider = FalProvider(max_masks=settings.partition_fal_max_masks, image_format="jpeg")
+            detections = detect.run(small, provider, selected, settings.detect_blockers)
         if use_reference and settings.partition_tree_pass and hasattr(provider, "_call"):
             trees = np.zeros((small.height, small.width), bool)
             for _, mask in provider._instances(provider._call(small, "tree"), small.size):
@@ -237,6 +254,18 @@ def run_detection(photo_id: str, body: DetectRequest, store: Store = Depends(get
     blockers = occlusion.blocker_union([d.mask for d in detections if _blocks(d.kind)], frame)
     solid = occlusion.blocker_union([d.mask for d in detections if d.kind in occlusion.SOLID_KINDS], frame)
     fresh: list[RegionRow] = []
+
+    for index, line in enumerate(direct_lines):
+        edge, points = line["type"], line["points"]
+        # V3 has no facade-side field. Retain all geometry for review; never guess a side
+        # from image slope or silently light every facade for a side-specific instruction.
+        requested = not parsed.sides and (not parsed.edges or edge in parsed.edges or edge == "unknown")
+        suffix = " (assign side and enable)" if parsed.sides else "" if requested else " (not lit)"
+        fresh.append(RegionRow(
+            kind="roof", label=f"{EDGE_LABEL[edge]} {index + 1}{suffix}", geometry="line",
+            source="auto", color=detect.edge_color(edge), score=0.5, visible=requested,
+            side=None, edge=edge, polyline=[points[:2], points[2:]], mask_url=None,
+        ))
 
     roofs = [d for d in detections if d.kind == "roof"]
     roof_masks = [d.mask for d in roofs]
@@ -340,6 +369,9 @@ def run_detection(photo_id: str, body: DetectRequest, store: Store = Depends(get
             interpreted={**(photo.interpreted or {}), "pitch": {str(k): v for k, v in (details.get("pitch") or {}).items()},
                          "planes": details.get("planes")},
         )
+    if detection_run is not None:
+        detection_run["side_review_required"] = bool(parsed.sides)
+        store.update_photo(photo, interpreted={**(photo.interpreted or {}), "detection_run": detection_run})
     store.replace_auto_regions(photo, fresh)
     result = [region_dict(region) for region in store.refresh_hidden(photo)]
     lap("store")

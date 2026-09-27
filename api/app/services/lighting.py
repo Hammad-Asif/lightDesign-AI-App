@@ -128,14 +128,30 @@ def resolve(spec: intent.Specification, products: list) -> list[dict]:
 
 
 def interpretation(prompt: str, products: list) -> dict:
-    """Everything `/detect` and the confirmation step read from an instruction, JSON-ready."""
-    spec = intent.specification(prompt)
+    """Everything `/detect` and the confirmation step read from an instruction, JSON-ready.
+
+    The reading itself may come from the fixed rules or from a language model -- see
+    services/intent_llm. Either way it is the same Specification from here on, so nothing below
+    this line knows the difference. `read_with` carries which one answered, so the confirmation
+    screen can say so rather than leaving a silent fallback looking like a reading.
+    """
+    from app.config import get_settings
+    from app.services import intent_llm
+
+    spec, note = intent_llm.read(prompt, products, get_settings())
     return {
         "kinds": spec.intent.kinds,
         "sides": spec.intent.sides,
         "edges": spec.intent.edges,
         "matched": spec.intent.matched,
         "requests": resolve(spec, products),
+        "read_with": {
+            "reader": note["reader"],
+            "sentence": intent_llm.sentence(note),
+            "unclear": note["unclear"],
+            "dropped": note["dropped"],
+            "by_hand": note["by_hand"],
+        },
     }
 
 

@@ -72,6 +72,11 @@ class Interpreted(BaseModel):
     # Partition mode: the detected roof planes as closed polygons in photo pixels, each with the
     # colour it has in the partition, so the editor can fill them under the lines.
     planes: list[dict] | None = None
+    # Direct roof detector provenance and measured billing/latency; absent on the SAM path.
+    detection_run: dict | None = None
+    # Which reader produced the requests above -- the fixed rules or the language model -- and
+    # anything it could not read. A silent fallback would otherwise look like a clean reading.
+    read_with: dict | None = None
 
 
 class Photo(BaseModel):
@@ -200,6 +205,10 @@ class Product(ProductBase):
     id: str
     # Built-in catalogue entries are shared and read-only; everything else belongs to its user.
     builtin: bool
+    # Retired: out of the library and out of the parser, still resolvable for saved designs.
+    archived: bool = False
+    # A picture of the product, or None when none was uploaded.
+    image_url: str | None = None
 
 
 class PaletteColour(BaseModel):

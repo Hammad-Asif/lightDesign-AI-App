@@ -1,7 +1,8 @@
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
-from pydantic import field_validator
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 API_DIR = Path(__file__).resolve().parents[1]
@@ -27,6 +28,21 @@ class Settings(BaseSettings):
 
     # fal | mock — mock is offline and is what the smoke tests assert against.
     segmentation_provider: str = "mock"
+
+    # Replaces roof extraction only. Other kinds continue to use segmentation_provider.
+    roofline_detector: Literal["sam", "v3_sol"] = "sam"
+
+    # How a typed instruction is read into requests. "rules" is the hand-written patterns in
+    # services/intent.py; "llm" asks a model and falls back to the rules whenever it cannot
+    # answer. Both produce the same Specification, so detection and the confirmation screen
+    # are unaffected either way. Reuses openrouter_api_key.
+    instruction_parser: Literal["rules", "llm"] = "llm"
+    parser_model: str = "openai/gpt-6-sol"
+    parser_timeout: float = 20
+    openrouter_api_key: str = Field(default="", repr=False)
+    roofline_model: str = "openai/gpt-6-sol"
+    roofline_reasoning: Literal["none", "low", "medium", "high", "xhigh", "max"] = "low"
+    roofline_timeout: float = Field(default=360, gt=0, le=600)
 
     # SAM 3 on fal.ai: text, box and point prompts from one endpoint.
     fal_key: str = ""

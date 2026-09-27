@@ -15,6 +15,7 @@ interface Props {
 export function ModeChooser({ photo, products, palette, busy, onInterpret, onChoose }: Props) {
   const [prompt, setPrompt] = useState(photo.prompt);
   const requests = photo.interpreted?.requests ?? [];
+  const read = photo.interpreted?.read_with ?? null;
   const changed = prompt.trim() !== photo.prompt;
   const detectable = photo.interpreted?.matched ?? false;
 
@@ -31,6 +32,14 @@ export function ModeChooser({ photo, products, palette, busy, onInterpret, onCho
         <button disabled={busy} onClick={() => onInterpret(prompt)}>
           Read it again
         </button>
+      )}
+
+      {read && (
+        <p className="muted small spec-note">
+          {read.sentence}
+          {read.unclear.length > 0 && ` Not read: ${read.unclear.join("; ")}.`}
+          {read.dropped.length > 0 && ` Left out: ${read.dropped.join("; ")}.`}
+        </p>
       )}
 
       {requests.length > 0 ? (

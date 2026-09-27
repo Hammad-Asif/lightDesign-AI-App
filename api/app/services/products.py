@@ -39,24 +39,46 @@ REQUIRED: dict[str, set[str]] = {
 }
 
 
+# These sentences are shown to the salesperson as they are, on the product form and wherever a
+# product is chosen, so they name the thing the way the form labels it. The phrasing is
+# imperative to sidestep the agreement problem in "mini lights needs a length".
+CATEGORY_NAMES: dict[str, str] = {
+    "c9": "the C9", "c7": "the C7", "mini": "the mini lights",
+    "icicle": "the icicle lights", "wreath": "the wreath", "garland": "the garland",
+}
+
+FIELD_NAMES: dict[str, str] = {
+    "bulb_diameter_in": "a bulb size",
+    "spacing_in": "a spacing",
+    "strand_length_ft": "a length",
+    "diameter_in": "a diameter",
+    "drops_in": "its drop lengths",
+    "colours": "at least one colour",
+}
+
+
 def problems(product: dict) -> list[str]:
     """Everything wrong with a product description, as sentences; empty when it is valid."""
     category = product["category"]
-    found = [
-        f"{category} needs {field.replace('_', ' ')}"
-        for field in sorted(REQUIRED[category])
-        if product.get(field) in (None, [], "")
-    ]
+    named = CATEGORY_NAMES[category]
+    found = []
+    for field in sorted(REQUIRED[category]):
+        if product.get(field) not in (None, [], ""):
+            continue
+        # A garland's diameter is how thick it is, not how wide across like a wreath.
+        wanted = "a thickness" if field == "diameter_in" and category == "garland" \
+            else FIELD_NAMES[field]
+        found.append(f"Give {named} {wanted}")
     if category in SOCKET_CATEGORIES and product.get("colours"):
-        found.append(f"{category} bulbs take their colours from the design, so leave colours empty")
+        found.append(f"Bulbs for {named} are chosen per design, so leave the colours empty")
     if product.get("drops_in") and category != "icicle":
-        found.append("only icicle lights have drops")
+        found.append("Only icicle lights have drops")
     options = product.get("spacing_options_in") or []
     if options and category not in SOCKET_CATEGORIES:
-        found.append(f"{category} has a fixed spacing; spacing options are for socket lines")
+        found.append(f"Spacing options are for socket lines; {named} has one fixed spacing")
     if options and product.get("spacing_in") not in options:
-        found.append("the default spacing must be one of the spacing options")
+        found.append("The default spacing has to be one of the spacings it is sold at")
     unknown = [c for c in product.get("colours") or [] if c not in COLOURS]
     if unknown:
-        found.append(f"unknown colours: {', '.join(unknown)}")
+        found.append(f"We do not carry {', '.join(unknown)}")
     return found

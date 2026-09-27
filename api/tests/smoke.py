@@ -20,6 +20,10 @@ if not TEST_DB.split("?")[0].rsplit("/", 1)[-1].endswith("_test"):
     raise SystemExit(f"Refusing to run: {TEST_DB} is not a *_test database.")
 os.environ.setdefault("STORAGE_DIR", tempfile.mkdtemp(prefix="ld-smoke-"))
 os.environ.setdefault("SEGMENTATION_PROVIDER", "mock")
+# The suite asserts the hand-written reading and must never reach the network or bill an
+# account, so both model-backed paths are pinned off here regardless of what api/.env says.
+os.environ["INSTRUCTION_PARSER"] = "rules"
+os.environ["ROOFLINE_DETECTOR"] = "sam"
 
 from alembic import command  # noqa: E402
 from alembic.config import Config  # noqa: E402
@@ -715,6 +719,39 @@ check("another user sees the built-in catalogue", any(p["id"] == builtin_id for 
 check("another user cannot see my products", intruder.get(f"/products/{strand_id}").status_code == 404
       and all(p["id"] != strand_id for p in intruder.get("/products").json()))
 check("own product can be deleted", client.delete(f"/products/{strand_id}").status_code == 204)
+# ---- a picture of the product -----------------------------------------------------------
+picture = client.post("/products", json={
+    "category": "wreath", "name": "Pictured wreath", "diameter_in": 24, "colours": ["warm_white"],
+}).json()
+check("a product starts with no picture", picture["image_url"] is None)
+check("a product picture must be an image",
+      client.put(f"/products/{picture['id']}/image",
+                 files={"file": ("n.txt", b"not an image", "text/plain")}).status_code == 415)
+with_image = client.put(f"/products/{picture['id']}/image",
+                        files={"file": ("w.png", sample_photo(), "image/png")}).json()
+check("a picture can be uploaded", with_image["image_url"] is not None)
+check("the picture is served where the product says it is",
+      client.get(with_image["image_url"].split("?")[0]).status_code == 200)
+check("the picture is listed with the product",
+      next(p["image_url"] for p in client.get("/products").json() if p["id"] == picture["id"]) is not None)
+# A phone photo would otherwise be sent in full for a thumbnail.
+shrunk = Image.open(io.BytesIO(client.get(with_image["image_url"].split("?")[0]).content))
+check(f"the picture is held to a thumbnail ({shrunk.width}x{shrunk.height})",
+      max(shrunk.size) <= 600)
+replaced = client.put(f"/products/{picture['id']}/image",
+                      files={"file": ("w.png", sample_photo(), "image/png")}).json()
+check("replacing the picture changes the address so the old one is not shown",
+      replaced["image_url"] != with_image["image_url"])
+check("another user cannot picture my product",
+      intruder.put(f"/products/{picture['id']}/image",
+                   files={"file": ("w.png", sample_photo(), "image/png")}).status_code == 404)
+check("built-in products cannot be pictured either",
+      client.put(f"/products/{builtin_id}/image",
+                 files={"file": ("w.png", sample_photo(), "image/png")}).status_code == 403)
+check("a picture can be taken off again",
+      client.delete(f"/products/{picture['id']}/image").json()["image_url"] is None)
+check("the file goes with it", client.get(with_image["image_url"].split("?")[0]).status_code == 404)
+
 check("a deleted product is gone", client.get(f"/products/{strand_id}").status_code == 404)
 
 # ---- colour patterns ----------------------------------------------------------------------
@@ -809,6 +846,153 @@ check("a colour we do not carry is reported, not guessed",
 check("steady means no twinkle", intent.specification("steady white C9 on the gutters").requests[0].lighting.twinkle is False)
 check("an instruction with no lighting gives no requests", intent.specification("make it look nice").requests == [])
 
+# ---------------------------------------------------------------------------
+# The language-model reader. Every answer here is canned: the suite must not
+# reach the network or bill the account, so httpx.post is replaced throughout.
+# What is checked is the plumbing around the model -- that a good answer becomes
+# the same Specification the rules produce, that a bad one is dropped rather
+# than believed, and that every failure lands back on the rules.
+# ---------------------------------------------------------------------------
+import json  # noqa: E402
+from contextlib import contextmanager  # noqa: E402
+
+import httpx as _httpx  # noqa: E402
+from sqlalchemy import select as _select  # noqa: E402
+
+from app.db import _sessions as _llm_sessions  # noqa: E402
+from app.models import Product as _ProductRow  # noqa: E402
+from app.services import intent_llm  # noqa: E402
+
+llm_settings = get_settings().model_copy(update={
+    "instruction_parser": "llm", "openrouter_api_key": "test-key", "parser_model": "test/model",
+})
+with _llm_sessions()() as _db:
+    llm_products = list(_db.scalars(_select(_ProductRow).where(_ProductRow.owner_id.is_(None))
+                                    .order_by(_ProductRow.name)))
+
+
+def answer(payload: dict):
+    """An OpenRouter reply carrying `payload` as the model's JSON content."""
+    return {"choices": [{"message": {"content": json.dumps(payload)}}], "usage": {"cost": 0.001}}
+
+
+@contextmanager
+def replying(result):
+    """Every call to the model answers with `result`, or raises it when it is an exception."""
+    calls = []
+    real = _httpx.post
+
+    def fake(url, **kwargs):
+        calls.append(kwargs)
+        if isinstance(result, Exception):
+            raise result
+        return _httpx.Response(200, json=result, request=_httpx.Request("POST", url))
+
+    _httpx.post = fake
+    intent_llm._CACHE.clear()
+    try:
+        yield calls
+    finally:
+        _httpx.post = real
+        intent_llm._CACHE.clear()
+
+
+one_request = {"requests": [{"text": "red C9 on the front roofline", "kinds": ["roof"],
+                             "sides": ["front"], "edges": ["eave", "rake", "hip"],
+                             "category": "c9", "colours": ["red"], "counts": [],
+                             "spacing_in": 12, "size_in": None, "twinkle": None,
+                             "per_turn": False}],
+               "unclear": []}
+
+with replying(answer(one_request)) as calls:
+    spec, note = intent_llm.read("red C9 on the front roofline", llm_products, llm_settings)
+    check("the model's reading becomes one request", len(spec.requests) == 1)
+    check("the model's reading keeps the place", spec.requests[0].kinds == ["roof"])
+    check("the model's reading keeps the edges", spec.requests[0].edges == ["eave", "rake", "hip"])
+    check("the model's reading keeps the product and colour",
+          (spec.requests[0].lighting.category, spec.requests[0].lighting.colours) == ("c9", ["red"]))
+    check("the model's reading keeps the spacing", spec.requests[0].lighting.spacing_in == 12)
+    check("a model reading is reported as one", note["reader"] == "llm")
+    check("the reading records what it cost", note.get("cost_usd") == 0.001)
+    check("the union intent is built alongside the requests", spec.intent.kinds == ["roof"])
+    check("only the instruction is sent, never a photo",
+          "image" not in json.dumps(calls[0]["json"]["messages"]).lower())
+    check("the live product library reaches the prompt",
+          llm_products[0].name in calls[0]["json"]["messages"][0]["content"])
+
+# A second identical reading must not be bought twice.
+with replying(answer(one_request)) as calls:
+    intent_llm.read("red C9 on the front roofline", llm_products, llm_settings)
+    intent_llm.read("red C9 on the front roofline", llm_products, llm_settings)
+    check("an identical instruction is read once and remembered", len(calls) == 1)
+
+# Nothing the model invents is believed: it is dropped and said out loud.
+invented = {"requests": [{"text": "teal C15 on the roof", "kinds": ["roof", "spaceship"],
+                          "sides": [], "edges": ["eave"], "category": "c15",
+                          "colours": ["teal"], "counts": [], "spacing_in": None,
+                          "size_in": None, "twinkle": None, "per_turn": False}],
+            "unclear": []}
+with replying(answer(invented)):
+    spec, note = intent_llm.read("teal C15 on the roof", llm_products, llm_settings)
+    check("a place we do not know is dropped", spec.requests[0].kinds == ["roof"])
+    check("a product we do not sell is dropped", spec.requests[0].lighting.category is None)
+    check("a colour we do not carry is dropped", spec.requests[0].lighting.colours == [])
+    check("a product and a colour we do not have are both reported",
+          len(note["dropped"]) == 2)
+    check("a place we have no kind for is reported as one to draw by hand",
+          note["by_hand"] == ["spaceship"])
+
+# An empty reading means one of two things, and the model says which.
+with replying(answer({"requests": [], "unclear": []})):
+    spec, note = intent_llm.read("nothing on the garage", llm_products, llm_settings)
+    check("a confident empty reading is kept", note["reader"] == "llm" and spec.requests == [])
+with replying(answer({"requests": [], "unclear": ["could not tell what to light"]})):
+    spec, note = intent_llm.read("C9 on the roofline", llm_products, llm_settings)
+    check("an unsure empty reading falls back to the rules", note["reader"] == "rules")
+    check("the fallback still answers with the rules' reading", spec.requests[0].kinds == ["roof"])
+
+# Every way the model can fail lands on the rules, and says why.
+request = _httpx.Request("POST", intent_llm.API)
+failures = [
+    (_httpx.TimeoutException("slow", request=request), "timed out"),
+    (_httpx.HTTPStatusError("boom", request=request,
+                            response=_httpx.Response(500, request=request)), "HTTP 500"),
+    (_httpx.ConnectError("down", request=request), "could not be reached"),
+]
+for failure, expected in failures:
+    with replying(failure):
+        spec, note = intent_llm.read("C9 on the roofline", llm_products, llm_settings)
+        check(f"a model failure falls back to the rules ({expected})",
+              note["reader"] == "rules" and expected in note["why"])
+        check(f"the fallback reading is still complete ({expected})",
+              spec.requests[0].kinds == ["roof"])
+
+with replying({"choices": [{"message": {"content": "not json at all"}}]}):
+    spec, note = intent_llm.read("C9 on the roofline", llm_products, llm_settings)
+    check("an unreadable answer falls back to the rules", note["reader"] == "rules")
+
+# Configuration, with no model involved at all.
+no_key = llm_settings.model_copy(update={"openrouter_api_key": "   "})
+spec, note = intent_llm.read("C9 on the roofline", llm_products, no_key)
+check("with no key the rules answer and say so",
+      note["reader"] == "rules" and "no OpenRouter key" in note["why"])
+check("with no key the reading is still complete", spec.requests[0].kinds == ["roof"])
+check("with no key nothing is left unread", note["unclear"] == [])
+
+rules_only = llm_settings.model_copy(update={"instruction_parser": "rules"})
+check("configuring the rules keeps the model out of it",
+      intent_llm.read("C9 on the roofline", llm_products, rules_only)[1]["reader"] == "rules")
+
+check("the reader is named for the screen",
+      intent_llm.sentence({"reader": "llm", "model": "test/model"}) == "Read by test/model.")
+check("a fallback says which reader answered and why",
+      intent_llm.sentence({"reader": "rules", "why": "the language model timed out"})
+      == "Read with the fixed rules: the language model timed out.")
+
+check("the library fingerprint changes when a product changes",
+      intent_llm.library_fingerprint(llm_products) != intent_llm.library_fingerprint(llm_products[1:]))
+
+
 spec_photo = client.post(
     "/photos", files={"file": ("h.png", sample_photo(), "image/png")},
     data={"prompt": "C9 warm white on the front roofline at 12 inch spacing, mini lights in the hedges, "
@@ -860,7 +1044,26 @@ check("re-confirming replaces the design rather than adding to it",
 own = client.post("/products", json={"category": "c9", "name": "My C9", "bulb_diameter_in": 1.125, "spacing_in": 12}).json()
 mine = {**confirmable[0], "settings": {**confirmable[0]["settings"], "product_id": own["id"]}}
 client.put(f"/photos/{spec_photo['id']}/design", json={"requests": [mine]})
-check("a product in a confirmed design cannot be deleted", client.delete(f"/products/{own['id']}").status_code == 409)
+# A product a design already names is retired, not removed: the design still has to resolve it.
+check("retiring a product a design uses succeeds", client.delete(f"/products/{own['id']}").status_code == 204)
+check("a retired product leaves the library", all(p["id"] != own["id"] for p in client.get("/products").json()))
+check("a retired product is still there to be found",
+      client.get(f"/products/{own['id']}").json()["archived"] is True)
+check("a retired product is listed among the retired",
+      any(p["id"] == own["id"] for p in client.get("/products?archived=true").json()))
+check("a design keeps resolving the product it was saved with",
+      client.get(f"/photos/{spec_photo['id']}/design").json()["regions"][0]["settings"]["product_id"] == own["id"])
+# The reader resolves against the library, so a retired product must stop being offered as a
+# choice for an instruction -- not merely stop being listed on the products screen.
+reread = client.post(f"/photos/{spec_photo['id']}/interpret", json={"prompt": None}).json()
+offered = [c["id"] for r in reread["interpreted"]["requests"] for c in r["choices"]]
+check("the instruction reader no longer offers a retired product", own["id"] not in offered)
+check("the reader still offers the products that remain", len(offered) > 0)
+check("a retired product can be brought back",
+      client.post(f"/products/{own['id']}/restore").json()["archived"] is False
+      and any(p["id"] == own["id"] for p in client.get("/products").json()))
+check("built-in products cannot be restored either",
+      intruder.post(f"/products/{builtin_id}/restore").status_code == 403)
 check("another user cannot read my design", intruder.get(f"/photos/{spec_photo['id']}/design").status_code == 404)
 
 # ---- a painted obstacle mends the roofline behind it ------------------------------------------

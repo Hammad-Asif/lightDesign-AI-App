@@ -51,14 +51,28 @@ export type ProductCategory = "c9" | "c7" | "mini" | "icicle" | "wreath" | "garl
 export interface Product {
   id: string;
   builtin: boolean;
+  // Retired: out of the library and out of the parser, still resolvable for saved designs.
+  archived: boolean;
   category: ProductCategory;
   name: string;
+  bulb_diameter_in: number | null;
   spacing_in: number | null;
+  // Socket lines can be ordered at several spacings; empty means spacing_in is fixed.
   spacing_options_in: number[];
+  strand_length_ft: number | null;
+  // A wreath's diameter, or a garland's thickness.
   diameter_in: number | null;
+  bulb_count: number | null;
+  // Icicle drop lengths, repeating along the strand.
+  drops_in: number[];
   colours: string[];
   twinkle: boolean;
+  // A picture of the product, or null. Uploaded separately, not part of the JSON body.
+  image_url: string | null;
 }
+
+// What a product looks like before it has an id: the fields the forms edit.
+export type ProductDraft = Omit<Product, "id" | "builtin" | "archived" | "image_url">;
 
 export interface PaletteColour {
   key: string;
@@ -135,6 +149,20 @@ export interface Interpreted {
   requests?: InterpretedRequest[] | null;
   // Partition mode: the detected roof planes, closed polygons in photo pixels with their partition colour.
   planes?: { plane: number; polygon: number[][]; color: string }[] | null;
+  // Which reader produced `requests`, and what it could not read.
+  read_with?: ReadWith | null;
+}
+
+export interface ReadWith {
+  reader: "rules" | "llm";
+  // One line naming the reader, and the reason when it fell back to the rules.
+  sentence: string;
+  // What the reader could not read, in its own words.
+  unclear: string[];
+  // What it asked for that we do not sell, dropped rather than guessed at.
+  dropped: string[];
+  // Places it named that detection never finds, so the salesperson draws them.
+  by_hand: string[];
 }
 
 export interface Photo {

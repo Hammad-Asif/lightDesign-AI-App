@@ -56,7 +56,9 @@ def product_fields(product: Product) -> dict:
 
 
 def product_dict(product: Product) -> dict:
-    return {"id": str(product.id), "builtin": product.owner_id is None, **product_fields(product)}
+    return {"id": str(product.id), "builtin": product.owner_id is None,
+            "archived": product.archived, "image_url": product.image_url,
+            **product_fields(product)}
 
 
 class Store:
@@ -71,6 +73,8 @@ class Store:
         self.user = user
         self.photos = root / "photos"
         self.photos.mkdir(parents=True, exist_ok=True)
+        self.product_images = root / "products"
+        self.product_images.mkdir(parents=True, exist_ok=True)
 
     # -- access ----------------------------------------------------------------
 
@@ -269,13 +273,16 @@ class Store:
         """The one query deciding which products a user sees: the built-in catalogue and their own."""
         return select(Product).where(or_(Product.owner_id.is_(None), Product.owner_id == self.user.id))
 
-    def products(self, category: str | None = None) -> list[Product]:
-        query = self._products()
+    def products(self, category: str | None = None, *, archived: bool = False) -> list[Product]:
+        """The library. Archived products are left out unless they are asked for by name."""
+        query = self._products().where(Product.archived.is_(archived))
         if category:
             query = query.where(Product.category == category)
         return list(self.db.scalars(query.order_by(Product.owner_id.is_not(None), Product.category, Product.name)))
 
     def product(self, product_id: str, *, editable: bool = False) -> Product:
+        # No archived filter here on purpose: a design saved before the product was retired
+        # still names it, and must still be able to resolve it.
         product = self.db.scalar(
             self._products().where(Product.id == _uuid(product_id, "Product not found"))
         )
@@ -298,16 +305,67 @@ class Store:
         return product
 
     def delete_product(self, product: Product) -> None:
-        # Settings reference products by id inside JSON, where no foreign key can guard them.
+        """Remove a product the library can afford to forget, or retire one it cannot.
+
+        Settings reference products by id inside JSON, where no foreign key can guard them.
+        A product no design has chosen is deleted outright; one a design already names is
+        archived instead, so the saved design keeps resolving.
+        """
         used = self.db.scalar(
             select(DesignRegion.id)
             .where(DesignRegion.settings["product_id"].astext == str(product.id))
             .limit(1)
         )
         if used is not None:
-            raise HTTPException(409, "This product is used in a design")
-        self.db.delete(product)
+            product.archived = True
+        else:
+            self.product_image_path(product.id).unlink(missing_ok=True)
+            self.db.delete(product)
         self.db.commit()
+
+    def restore_product(self, product: Product) -> Product:
+        product.archived = False
+        self.db.commit()
+        return product
+
+    # A product picture is a thumbnail in a list, never a source image, so it is held down to a
+    # size that suits that: a 4000px phone photo of a wreath would otherwise be sent to the
+    # browser in full for a 44px square.
+    PRODUCT_IMAGE_EDGE = 600
+
+    def product_image_path(self, product_id) -> Path:
+        return self.product_images / f"{product_id}.png"
+
+    def write_product_image(self, product: Product, data: bytes) -> Product:
+        """Store the picture as a PNG thumbnail and point the product at it."""
+        image = ImageOps.exif_transpose(Image.open(io.BytesIO(data)))
+        # Flattened onto white: a transparent PNG of a wreath would otherwise be invisible
+        # against the panel in one theme and fine in the other.
+        if image.mode in ("RGBA", "LA", "P"):
+            image = image.convert("RGBA")
+            flat = Image.new("RGB", image.size, (255, 255, 255))
+            flat.paste(image, mask=image.getchannel("A"))
+            image = flat
+        else:
+            image = image.convert("RGB")
+        image.thumbnail((self.PRODUCT_IMAGE_EDGE, self.PRODUCT_IMAGE_EDGE), Image.LANCZOS)
+        image.save(self.product_image_path(product.id), format="PNG", optimize=True)
+        # The version makes a replacement show at once despite the private cache on /files.
+        product.image_url = f"/files/products/{product.id}/image.png?v={time.time_ns()}"
+        self.db.commit()
+        return product
+
+    def delete_product_image(self, product: Product) -> Product:
+        self.product_image_path(product.id).unlink(missing_ok=True)
+        product.image_url = None
+        self.db.commit()
+        return product
+
+    def product_image_file(self, product: Product) -> Path:
+        path = self.product_image_path(product.id)
+        if not path.is_file():
+            raise HTTPException(404, "File not found")
+        return path
 
     # -- designs ---------------------------------------------------------------
 

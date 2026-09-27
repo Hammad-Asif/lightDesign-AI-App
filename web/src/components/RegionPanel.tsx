@@ -49,6 +49,7 @@ function Section({
   open,
   onToggle,
   note,
+  actions,
   children,
 }: {
   title: string;
@@ -56,6 +57,7 @@ function Section({
   open: boolean;
   onToggle: (open: boolean) => void;
   note?: ReactNode;
+  actions?: ReactNode;
   children: ReactNode;
 }) {
   return (
@@ -63,11 +65,39 @@ function Section({
       <summary>
         <span>{title}</span>
         {count !== undefined && <span className="count">{count}</span>}
+        {actions && (
+          // A click here must not also toggle the <details> it sits inside.
+          <span className="summary-actions" onClick={(event) => event.preventDefault()}>
+            {actions}
+          </span>
+        )}
       </summary>
       {note}
       {children}
     </details>
   );
+}
+
+// A named roof edge groups under its role; every other line kind (driveway edge, fence, ...)
+// groups under itself. Matches how the reference tool talks about a house: "5 eaves, 3 rakes".
+function groupLines(lines: Region[]): { key: string; label: string; regions: Region[] }[] {
+  const order = ["eave", "rake", "hip"];
+  const groups = new Map<string, { key: string; label: string; regions: Region[] }>();
+  for (const region of lines) {
+    const key = region.kind === "roof" ? region.edge ?? "unknown" : region.kind;
+    const label =
+      region.kind === "roof"
+        ? (LIT_EDGES.find((item) => item.edge === key)?.name ?? key[0].toUpperCase() + key.slice(1))
+        : KIND_LABELS[region.kind];
+    if (!groups.has(key)) groups.set(key, { key, label, regions: [] });
+    groups.get(key)!.regions.push(region);
+  }
+  return [...groups.values()].sort((a, b) => {
+    const pa = order.indexOf(a.key);
+    const pb = order.indexOf(b.key);
+    if (pa === -1 && pb === -1) return 0;
+    return (pa === -1 ? order.length : pa) - (pb === -1 ? order.length : pb);
+  });
 }
 
 export function RegionPanel({
@@ -91,6 +121,8 @@ export function RegionPanel({
 
   const holds = (group: Region[]) => group.some((region) => region.id === activeId);
   const [open, setOpen] = useState({ unlit: false, blockers: false, add: false });
+  // Lit-line groups (Eave, Rake, ...) start open; collapsed ones are remembered by key.
+  const [litGroupsOpen, setLitGroupsOpen] = useState<Record<string, boolean>>({});
   // A selection made on the photo opens the section it sits in, so it is never selected unseen.
   useEffect(() => {
     setOpen((current) => ({
@@ -98,6 +130,13 @@ export function RegionPanel({
       blockers: current.blockers || holds(blockers),
       add: current.add || Boolean(drawingKind),
     }));
+    if (activeId) {
+      const activeGroupKey = lit.find((region) => region.id === activeId);
+      if (activeGroupKey) {
+        const key = activeGroupKey.kind === "roof" ? activeGroupKey.edge ?? "unknown" : activeGroupKey.kind;
+        setLitGroupsOpen((current) => (current[key] === false ? { ...current, [key]: true } : current));
+      }
+    }
   }, [activeId, drawingKind]);
 
   // Selecting on the photo has to show up here, even when the row is scrolled out of sight.
@@ -267,7 +306,32 @@ export function RegionPanel({
         </ul>
       )}
       {lit.length ? (
-        <ul>{lit.map(row)}</ul>
+        groupLines(lit).map((group) => {
+          const allVisible = group.regions.every((region) => region.visible);
+          return (
+            <Section
+              key={group.key}
+              title={group.label}
+              count={group.regions.length}
+              open={litGroupsOpen[group.key] ?? true}
+              onToggle={(value) => setLitGroupsOpen((current) => ({ ...current, [group.key]: value }))}
+              actions={
+                group.regions.length > 1 && (
+                  <button
+                    className="icon"
+                    title={allVisible ? "Don't light any of these" : "Light all of these"}
+                    aria-label={allVisible ? "Hide group" : "Light group"}
+                    onClick={() => group.regions.forEach((region) => onPatch(region.id, { visible: !allVisible }))}
+                  >
+                    {allVisible ? "◉" : "○"}
+                  </button>
+                )
+              }
+            >
+              <ul>{group.regions.map(row)}</ul>
+            </Section>
+          );
+        })
       ) : (
         <p className="muted small">None yet. Add a line below and click along the roofline to draw it.</p>
       )}
