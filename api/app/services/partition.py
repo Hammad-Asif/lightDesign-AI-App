@@ -84,6 +84,11 @@ VP_FOCALS = 14
 VP_TRUST_SHARE = 0.10
 PRIOR_DEG = 4.0
 PRIOR_LAMBDA = 3.0
+# TARGET_HOUSE_ONLY: a vanishing point refit to the house's own segments replaces the whole-photo
+# one only when it moves the vanishing direction on the house by more than this. A smaller shift
+# is inside the tolerance the pipeline already allows between an edge and the vanishing direction
+# it is refit to (PRIOR_DEG), and is treated as estimation noise.
+VP_SAME_DEG = PRIOR_DEG
 # Fallback when no VP has enough support: the fitted edges' own 2-D directions are clustered
 # (stiffness-weighted, greedy, 3 degrees on doubled angles) and each cluster mean is the prior
 # at a lower weight. Off whenever a VP is usable: measured negative under perspective.
@@ -845,6 +850,135 @@ def vanishing_points(segments: np.ndarray, shape: tuple[int, int]) -> Scene:
     return scene
 
 
+def _toward(mids: np.ndarray, dirs: np.ndarray, vp: np.ndarray) -> np.ndarray:
+    """Per segment: |cos| of the angle between it and the direction from its middle to the VP."""
+    if abs(vp[2]) < 1e-9:
+        toward = np.tile(_unit(vp[:2]), (len(mids), 1))
+    else:
+        toward = vp[:2] / vp[2] - mids
+        toward = toward / np.maximum(np.linalg.norm(toward, axis=1, keepdims=True), 1e-9)
+    return np.abs(np.einsum("ij,ij->i", toward, dirs))
+
+
+def _agreement_within(mids: np.ndarray, dirs: np.ndarray, vp: np.ndarray, degrees: float) -> np.ndarray:
+    """_agreement with its own tolerance: does each segment point at the VP within `degrees`?"""
+    return _toward(mids, dirs, vp) >= np.cos(np.radians(degrees))
+
+
+def house_vanishing_points(scene: Scene, counts: np.ndarray, probes: list[np.ndarray],
+                           edges: list[tuple[np.ndarray, np.ndarray]] = ()) -> Scene:
+    """The photo's vanishing points, each checked against the target house's own segments.
+
+    `counts` marks the segments on the house; `probes` are points on it and `edges` its roof
+    outline edges (_house_probes, _house_edges). Each vanishing point the whole photo gives is
+    refit to the house segments pointing at it, within twice PRIOR_DEG first, so a point a
+    neighbour pulled aside comes back to the house's own lines, then narrowing to VP_AGREE_DEG.
+    A segment only counts toward the vanishing point it points at most closely, so the refit of
+    one never takes in the lines of another a few degrees away. Then, one at a time:
+
+      - the house barely supports it (under half of VP_TRUST_SHARE of the house's evidence): it
+        was the neighbours' vanishing point, and it is dropped. Unless one of the house's own
+        roof edges runs toward it and toward no other horizontal one: that edge is an eave or a
+        ridge only through it, so it stays where it was;
+      - the refit moves it more than VP_SAME_DEG on the house, and the house alone would have
+        found it there (VP_TRUST_SHARE): a neighbour pulled it aside, and the refit stands;
+      - otherwise it stays exactly where the whole photo put it. The difference is estimation
+        noise, or too little of the house's own evidence to overrule the rest.
+
+    No new vanishing point is searched for: on part of the photo's evidence the search lets weak
+    directions through, such as a gable's rakes passing for a horizontal. So a neighbour can
+    neither add a vanishing point the house does not have nor hold one where the house's own
+    lines clearly disagree, and a house whose neighbours agree with it keeps its geometry.
+    """
+    segments = scene.segments
+    candidates = [vp for vp in (scene.vertical, *scene.horizontal) if vp is not None]
+    if not len(segments) or not counts.any() or not candidates:
+        return scene
+    p1 = np.hstack([(segments[:, :2] - scene.centre) / scene.scale, np.ones((len(segments), 1))])
+    p2 = np.hstack([(segments[:, 2:] - scene.centre) / scene.scale, np.ones((len(segments), 1))])
+    lines = np.cross(p1, p2)
+    lines = lines / np.maximum(np.linalg.norm(lines[:, :2], axis=1, keepdims=True), 1e-9)
+    mids = (p1[:, :2] + p2[:, :2]) / 2
+    dirs = p2[:, :2] - p1[:, :2]
+    lengths = np.linalg.norm(dirs, axis=1)
+    dirs = dirs / np.maximum(lengths[:, None], 1e-9)
+    lengths = np.where(counts, lengths, 0.0)
+    total = float(lengths.sum())
+    nearest = np.argmax(np.stack([_toward(mids, dirs, vp) for vp in candidates]), axis=0)
+
+    def support(vp: np.ndarray) -> float:
+        return float(lengths[_agreement(mids, dirs, vp)].sum())
+
+    def needed(k: int) -> bool:
+        """Is a house roof edge plan-horizontal only through horizontal VP k? Roles allow
+        PLAN_HORIZONTAL_DEG, and the priors can still turn an edge PRIOR_DEG toward the VP."""
+        reach = PLAN_HORIZONTAL_DEG + PRIOR_DEG
+
+        def runs(direction: np.ndarray, point: np.ndarray, vp: np.ndarray) -> bool:
+            return _angle_between(direction, _vp_direction(vp, point)) <= reach
+
+        others = [h for j, h in enumerate(scene.horizontal) if j != k]
+        return any(runs(d, p, scene.horizontal[k]) and not any(runs(d, p, h) for h in others) for d, p in edges)
+
+    def decide(vp: np.ndarray | None, horizontal: int | None) -> np.ndarray | None:
+        if vp is None:
+            return None
+        mine = counts & (nearest == next(i for i, c in enumerate(candidates) if c is vp))
+        fitted = vp
+        for degrees in (2 * PRIOR_DEG, PRIOR_DEG, VP_AGREE_DEG):
+            inliers = _agreement_within(mids, dirs, fitted, degrees) & mine
+            if inliers.sum() < 2:
+                fitted = None
+                break
+            fitted = _refine_vp(lines[inliers], lengths[inliers])
+        own = max(support(vp), support(fitted) if fitted is not None else 0.0)
+        if own < 0.5 * VP_TRUST_SHARE * total:
+            return vp if horizontal is not None and needed(horizontal) else None
+        if fitted is None or _close_vanishing_points(vp, fitted, probes):
+            return vp
+        return fitted if support(fitted) >= VP_TRUST_SHARE * total else vp
+
+    horizontal = [vp for vp in (decide(h, k) for k, h in enumerate(scene.horizontal)) if vp is not None]
+    return Scene(segments=segments, vertical=decide(scene.vertical, None), horizontal=horizontal,
+                 centre=scene.centre, scale=scene.scale)
+
+
+def _house_planes(masks: list[np.ndarray], region: np.ndarray) -> list[int]:
+    """The planes inside the evidence region: the target house's, which is never taken out of it."""
+    return [index for index, mask in enumerate(masks) if mask.any() and float(region[mask].mean()) >= 0.9]
+
+
+def _house_edges(polygons: list[list[Edge]], planes: list[int], centre: np.ndarray,
+                 scale: float) -> list[tuple[np.ndarray, np.ndarray]]:
+    """The house's roof outline edges as (direction, middle normalised like the scene): the
+    edges whose roles the vanishing points decide."""
+    edges = []
+    for polygon in polygons:
+        for edge in polygon:
+            if edge.line is None or edge.plane not in planes or np.allclose(edge.start, edge.end):
+                continue
+            edges.append((_unit(edge.end - edge.start), ((edge.start + edge.end) / 2 - centre) / scale))
+    return edges
+
+
+def _house_probes(masks: list[np.ndarray], planes: list[int], centre: np.ndarray, scale: float) -> list[np.ndarray]:
+    """Points on the target house, normalised like the scene: each of its planes at its left
+    end, middle and right end, along its middle row."""
+    probes = []
+    for index in planes:
+        mask = masks[index]
+        ys, xs = np.nonzero(mask)
+        row = float(ys.mean())
+        for x in (float(xs.min()), float(xs.mean()), float(xs.max())):
+            probes.append((np.array([x, row]) - centre) / scale)
+    return probes or [np.zeros(2)]
+
+
+def _close_vanishing_points(u: np.ndarray, v: np.ndarray, probes: list[np.ndarray]) -> bool:
+    """Do two vanishing points give the same direction, within VP_SAME_DEG, at every probe?"""
+    return all(_angle_between(_vp_direction(u, p), _vp_direction(v, p)) <= VP_SAME_DEG for p in probes)
+
+
 def _vp_directions(scene: Scene, point: np.ndarray, horizontal_only: bool = False) -> list[np.ndarray]:
     """Image-space directions toward the trusted VPs from a working-coordinate point."""
     normalised = (point - scene.centre) / scene.scale
@@ -1449,6 +1583,14 @@ def _resize_mask(mask: np.ndarray, size: tuple[int, int]) -> np.ndarray:
     return cv2.resize(mask.astype(np.uint8), size, interpolation=cv2.INTER_NEAREST).astype(bool)
 
 
+def _segments_within(segments: np.ndarray, region: np.ndarray) -> np.ndarray:
+    """Per segment: does its midpoint lie in `region` (working size), so it counts as evidence?"""
+    height, width = region.shape
+    xs = np.clip(np.rint((segments[:, 0] + segments[:, 2]) / 2).astype(int), 0, width - 1)
+    ys = np.clip(np.rint((segments[:, 1] + segments[:, 3]) / 2).astype(int), 0, height - 1)
+    return region[ys, xs]
+
+
 def _drop_duplicates(segments: list[Segment], L: float) -> list[Segment]:
     """Drop a segment that retraces one already kept with the same role; the longer survives.
 
@@ -1620,10 +1762,14 @@ def partition_result(
     scores: list[float] | None = None,
     junctions: bool = True,
     constrained: bool = True,
+    vp_region: np.ndarray | None = None,
 ) -> tuple[list[list[tuple]], set, dict]:
     """The lines per plane as (points, side, edge), the keys of the inferred connectors among
     them, and the pitch per plane. `image` is the photo (PIL or RGB array) for foliage,
-    vanishing points and EXIF; without it those steps are skipped."""
+    vanishing points and EXIF; without it those steps are skipped. `vp_region` (photo size) is
+    where line segments count as vanishing-point evidence; None means the whole photo. Segments
+    outside it still exist for everything else (interior creases read them), they just do not
+    vote on the vanishing points."""
     height, full_width = roof_masks[0].shape
     factor = min(1.0, WORK_LONG_EDGE / max(height, full_width))
     size = (max(1, round(full_width * factor)), max(1, round(height * factor)))
@@ -1658,6 +1804,14 @@ def partition_result(
     else:
         segments = np.zeros((0, 4))
     scene = vanishing_points(segments, (size[1], size[0]))
+    if vp_region is not None and len(segments):
+        region = _resize_mask(vp_region, size) if factor < 1 else vp_region.astype(bool)
+        counts = _segments_within(segments, region)
+        if not counts.all():
+            # The target house's own segments decide which vanishing points stand and where.
+            house = _house_planes(masks, region)
+            scene = house_vanishing_points(scene, counts, _house_probes(masks, house, scene.centre, scene.scale),
+                                           _house_edges(polygons, house, scene.centre, scene.scale))
     if scene.vertical is not None or scene.horizontal:
         apply_priors(polygons, scene)
     else:

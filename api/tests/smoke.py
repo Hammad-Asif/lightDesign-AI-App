@@ -1103,6 +1103,114 @@ check("a gap nothing stands in front of is left open", auto_eaves[1]["polyline"]
 check("a line drawn by hand is never joined or moved",
       [r["polyline"] for r in mended if r["source"] == "manual"] == [[[100, 340], [400, 340]]])
 
+# ---- target house only: roof lines on the house being quoted, a tap moves a plane ------------
+# The mock returns one gable roof; a second roof, cut off by the photo's right edge, stands in for
+# the house next door. With TARGET_HOUSE_ONLY on the neighbour's roof gets no lines, everything
+# else comes back exactly as with the flag off, and a tap on the neighbour's roof brings its lines.
+from app.providers.base import Detection  # noqa: E402
+from app.providers.mock import MockProvider  # noqa: E402
+
+settings = get_settings()
+saved_settings = (settings.target_house_only, settings.edge_extractor, settings.partition_engine)
+plain_detect = MockProvider.detect
+
+
+def with_neighbour(self, image, kinds):
+    found = plain_detect(self, image, kinds)
+    if "roof" in kinds:
+        width, height = image.size
+        mask = np.zeros((height, width), dtype=bool)
+        mask[int(0.36 * height):int(0.50 * height), int(0.93 * width):] = True
+        found.append(Detection(kind="roof", label="roof", mask=mask, score=0.5,
+                               box=(int(0.93 * width), int(0.36 * height), width, int(0.50 * height))))
+    return found
+
+
+def on_neighbour(line) -> bool:
+    return all(point[0] >= 0.92 * 900 for point in line[0])
+
+
+def house_now(photo: str):
+    """The photo's detected roof lines, comparable across detections, and its area masks."""
+    detail = client.get(f"/photos/{photo}").json()
+    roof = sorted((r["polyline"], r["edge"], r["side"], r["visible"]) for r in detail["regions"]
+                  if r["geometry"] == "line" and r["source"] != "manual")
+    masks = {}
+    for r in detail["regions"]:
+        if r["geometry"] == "area":
+            png = client.get(r["mask_url"].split("?")[0]).content
+            masks[(r["kind"], r["label"], r["role"])] = np.array(Image.open(io.BytesIO(png))) > 127
+    return detail, roof, masks
+
+
+def tap(point, session=client):
+    return session.post(f"/photos/{house}/target", json={"point": point})
+
+
+MockProvider.detect = with_neighbour
+try:
+    settings.edge_extractor, settings.partition_engine = "partition", "port"
+    house = client.post(
+        "/photos", files={"file": ("h.png", sample_photo(), "image/png")},
+        data={"prompt": "C9 warm white on the roofline at 12 inch spacing"},
+    ).json()["id"]
+    client.put(f"/photos/{house}/mode", json={"mode": "automatic"})
+
+    settings.target_house_only = False
+    check("flag off: detect responds", client.post(f"/photos/{house}/detect", json={}).status_code == 200)
+    off_detail, off_roof, off_masks = house_now(house)
+    check("flag off: the neighbour's roof gets lines, as before", any(on_neighbour(line) for line in off_roof))
+    check("flag off: no planes are stored and a tap has nothing to move",
+          not off_detail["interpreted"].get("target") and tap([450, 200]).status_code == 409)
+
+    settings.target_house_only = True
+    check("flag on: detect responds", client.post(f"/photos/{house}/detect", json={}).status_code == 200)
+    on_detail, on_roof, on_masks = house_now(house)
+    check("flag on: both roof planes stored, only the central one on the house",
+          [plane["keep"] for plane in on_detail["interpreted"]["target"]["planes"]] == [True, False])
+    check("flag on: no line on the neighbour's roof", not any(on_neighbour(line) for line in on_roof))
+    check("flag on: every line on the house comes back unchanged",
+          on_roof == [line for line in off_roof if not on_neighbour(line)] and len(on_roof) > 0)
+    check("flag on: area regions identical to flag off", off_masks.keys() == on_masks.keys()
+          and all(np.array_equal(off_masks[key], on_masks[key]) for key in off_masks))
+
+    drawn = client.post(f"/photos/{house}/regions", json={
+        "kind": "roof", "geometry": "line", "side": "front", "polyline": [[100, 560], [300, 560]]}).json()
+    confirmable = [r for r in on_detail["interpreted"]["requests"] if r["settings"]]
+    first_design = client.put(f"/photos/{house}/design", json={"requests": confirmable}).json()
+    added = tap([880, 250])
+    check("a tap on the neighbour's roof moves it into the house",
+          added.status_code == 200 and [p["keep"] for p in added.json()["interpreted"]["target"]["planes"]] == [True, True])
+    check("with every plane in, the lines are exactly the flag-off lines", house_now(house)[1] == off_roof)
+    # The tap replaced the roof lines the confirmed lighting was on: it moves to the new ones,
+    # exactly as confirming the same requests again would put it.
+    carried = client.get(f"/photos/{house}/design").json()
+    now_ids = {r["id"] for r in client.get(f"/photos/{house}").json()["regions"]}
+    fresh = client.put(f"/photos/{house}/design", json={"requests": confirmable}).json()
+    check("confirmed lighting moves to the redrawn lines, as a fresh confirmation would put it",
+          sorted(row["region_id"] for row in carried["regions"]) == sorted(row["region_id"] for row in fresh["regions"])
+          and carried["requests"][0]["region_ids"] == fresh["requests"][0]["region_ids"]
+          and all(row["region_id"] in now_ids for row in carried["regions"])
+          and len(carried["regions"]) > len(first_design["regions"]))
+    removed = tap([880, 250])
+    _, back_roof, back_masks = house_now(house)
+    check("a second tap takes it out again, back to the detected lines",
+          removed.status_code == 200 and back_roof == on_roof)
+    check("taps leave area regions alone", back_masks.keys() == on_masks.keys()
+          and all(np.array_equal(back_masks[key], on_masks[key]) for key in on_masks))
+    check("a line drawn by hand is untouched by taps", any(
+        r["id"] == drawn["id"] and r["polyline"] == [[100, 560], [300, 560]]
+        for r in client.get(f"/photos/{house}").json()["regions"]))
+    check("a tap off every roof is refused", tap([450, 20]).status_code == 404)
+    check("the house keeps at least one plane", tap([450, 200]).status_code == 400)
+    check("another user cannot tap my photo's planes", tap([880, 250], intruder).status_code == 404)
+    settings.target_house_only = False
+    check("with the flag off a tap is refused, even on a photo detected with it on",
+          tap([880, 250]).status_code == 409 and house_now(house)[1] == on_roof)
+finally:
+    MockProvider.detect = plain_detect
+    settings.target_house_only, settings.edge_extractor, settings.partition_engine = saved_settings
+
 check("logout succeeds", client.post("/auth/logout").status_code == 204)
 check("session is gone after logout",
       client.get("/auth/me").json() is None and client.get("/photos").status_code == 401)

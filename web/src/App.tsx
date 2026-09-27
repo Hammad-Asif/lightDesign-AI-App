@@ -249,6 +249,22 @@ export default function App() {
       setActiveId(region.id);
     });
 
+  // A tap with the House tool redraws the detected roof lines, so a selected line, and the undo
+  // steps of the old lines, may be gone; confirmed lighting moves to the new lines on the server.
+  // One tap at a time: each reads the house the last one left. A locked photo's lines stay put.
+  const handleHouseTap = (point: number[]) => {
+    if (!photo || photo.approved || busy) return;
+    void guard(async () => {
+      const detail = await api.tapHousePlane(photo.id, point);
+      canvasRef.current?.forget(
+        photo.regions.filter((r) => !detail.regions.some((d) => d.id === r.id)).map((r) => r.id),
+      );
+      setPhoto(detail);
+      setActiveId((current) => (current && detail.regions.some((r) => r.id === current) ? current : null));
+      if (design) setDesign(await api.getDesign(photo.id));
+    });
+  };
+
   const handlePatch = (id: string, patch: Partial<Region>) =>
     guard(async () => {
       if (!photo) return;
@@ -332,6 +348,8 @@ export default function App() {
   }, []);
 
   const active = photo?.regions.find((item) => item.id === activeId);
+  // Only a photo detected with TARGET_HOUSE_ONLY on has roof planes to tap.
+  const houseAvailable = Boolean(photo?.interpreted?.target?.planes?.length);
   const requests = photo?.interpreted?.requests ?? [];
   const attention = requests.filter((r) => r.problems.length > 0 || !r.settings).length;
 
@@ -348,6 +366,12 @@ export default function App() {
       setTool("vertex");
     if (active.geometry === "area" && (tool === "vertex" || tool === "move")) setTool("brush");
   }, [activeId]);
+
+  // The House tool's button goes when the photo has no planes to tap (another photo, or one
+  // detected again with the flag off); the tool goes with it rather than lingering unseen.
+  useEffect(() => {
+    if (tool === "house" && !houseAvailable) setTool("select");
+  }, [tool, houseAvailable]);
 
   if (checkingSession) return <div className="app" />;
 
@@ -478,6 +502,7 @@ export default function App() {
                 onSelect={setActiveId}
                 onBox={handleBox}
                 onPoint={handlePoint}
+                onHouseTap={handleHouseTap}
                 onRemoveAt={handleDelete}
                 onHistoryChange={setHistory}
                 drawingColor={drawingKind ? KIND_COLORS[drawingKind] : null}
@@ -486,7 +511,8 @@ export default function App() {
               />
               {!photo.approved && (
                 <>
-                  <ToolDock tool={tool} setTool={chooseTool} brushSize={brushSize} setBrushSize={setBrushSize} active={active} />
+                  <ToolDock tool={tool} setTool={chooseTool} brushSize={brushSize} setBrushSize={setBrushSize}
+                            active={active} houseAvailable={houseAvailable} />
                   <ViewportControls
                     zoom={zoom}
                     setZoom={setZoom}

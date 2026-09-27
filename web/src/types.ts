@@ -22,7 +22,7 @@ export type Geometry = "line" | "area";
 export type Side = "front" | "left" | "right";
 export type Edge = "eave" | "rake" | "hip" | "ridge" | "valley" | "junction" | "unknown";
 export type MaskingMode = "manual" | "automatic";
-export type Tool = "select" | "brush" | "erase" | "vertex" | "move" | "box" | "line" | "click";
+export type Tool = "select" | "brush" | "erase" | "vertex" | "move" | "box" | "line" | "click" | "house";
 
 // "blocker" is something standing in front of the house — a palm, a tree, a car. It is detected
 // so a line passing behind it can be joined up and reported, and it is never lit itself.
@@ -151,6 +151,8 @@ export interface Interpreted {
   planes?: { plane: number; polygon: number[][]; color: string }[] | null;
   // Which reader produced `requests`, and what it could not read.
   read_with?: ReadWith | null;
+  // TARGET_HOUSE_ONLY: every roof plane detection returned, and whether it is on the house being quoted.
+  target?: TargetHouse | null;
 }
 
 export interface ReadWith {
@@ -163,6 +165,12 @@ export interface ReadWith {
   dropped: string[];
   // Places it named that detection never finds, so the salesperson draws them.
   by_hand: string[];
+}
+
+export interface TargetHouse {
+  planes: { outline: number[][][]; keep: boolean; score: number }[];
+  sides: Side[];
+  edges: Edge[];
 }
 
 export interface Photo {

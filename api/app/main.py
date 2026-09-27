@@ -43,4 +43,6 @@ def health(response: Response):
         # way to tell whether an .env edit has taken effect without reading the server log.
         "edge_extractor": settings.edge_extractor,
         "partition_engine": settings.partition_engine if settings.edge_extractor == "partition" else None,
+        # TARGET_HOUSE_ONLY, for the same reason: the same photo is run with it off and on.
+        "target_house_only": settings.target_house_only,
     }

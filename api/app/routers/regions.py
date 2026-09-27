@@ -7,11 +7,11 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 
 from app.config import get_settings
 from app.models import Region as RegionRow
-from app.providers.base import get_provider
 from app.providers import roofline_v3
-from app.schemas import CreateRegionRequest, DetectRequest, RefineRequest, Region, RegionPatch
-from app.services import detect, intent, lighting, occlusion, partition, partition_reference, roofline, snap
-from app.storage import Store, get_store, region_dict
+from app.providers.base import get_provider
+from app.schemas import CreateRegionRequest, DetectRequest, PhotoDetail, RefineRequest, Region, RegionPatch, TargetTap
+from app.services import detect, intent, lighting, occlusion, partition, partition_reference, roofline, snap, target
+from app.storage import Store, get_store, photo_dict, region_dict
 
 log = logging.getLogger(__name__)
 
@@ -50,6 +50,7 @@ def roof_lines(
     constrained: bool = True,
     unrequested: list | None = None,
     reference: dict | None = None,
+    vp_region: np.ndarray | None = None,
 ) -> list[tuple]:
     """The roof lines detection returns for an instruction, as (polyline, side, edge).
 
@@ -80,7 +81,7 @@ def roof_lines(
             # Only the straight-edged objects are kept out of the fit; everything in front of
             # the house still hides a line and still joins one back up, below.
             roof_masks, width, solid if solid is not None else blockers,
-            image=image, scores=scores, junctions=junctions, constrained=constrained
+            image=image, scores=scores, junctions=junctions, constrained=constrained, vp_region=vp_region
         )
         if details is not None:
             details["inferred"], details["pitch"] = inferred, pitches
@@ -167,6 +168,90 @@ def roof_lines(
     return spans
 
 
+def compute_roof_lines(
+    roof_masks: list[np.ndarray],
+    scores: list[float],
+    blockers: np.ndarray | None,
+    solid: np.ndarray | None,
+    parsed: intent.Intent,
+    image,
+    reference: dict | None = None,
+    vp_region: np.ndarray | None = None,
+) -> tuple[list[tuple], list[tuple], dict]:
+    """roof_lines as /detect runs it under the current settings: (spans, unrequested, details).
+
+    Shared by detection and by the target-house tap, which redraws the lines from stored plane
+    masks, so both produce the same lines from the same planes.
+    """
+    settings = get_settings()
+    partitioned = settings.edge_extractor == "partition"
+    # The reference geometry is final after its relaxation; snapping on top is opt-in there.
+    snapping = settings.snap_to_edges and (not partitioned or settings.partition_snap)
+    details: dict = {}
+    unrequested: list[tuple] = []
+    spans = roof_lines(
+        roof_masks,
+        blockers,
+        parsed,
+        settings.edge_extractor == "hybrid",
+        snap.field(image) if snapping or settings.interior_hips else None,
+        solid=solid,
+        interior=settings.interior_hips,
+        partitioned=partitioned,
+        image=image,
+        scores=scores,
+        details=details,
+        junctions=settings.partition_junctions,
+        constrained=settings.partition_constrained_snap,
+        unrequested=unrequested,
+        reference=reference,
+        vp_region=vp_region,
+    )
+    return spans, unrequested, details
+
+
+def roof_rows(spans: list[tuple], unrequested: list[tuple], inferred: set) -> list[RegionRow]:
+    """The region rows for detected roof lines: lit spans first, then the unrequested ones."""
+    rows: list[RegionRow] = []
+    for index, (polyline, side, edge) in enumerate(spans):
+        rows.append(
+            RegionRow(
+                kind="roof",
+                label=f"{EDGE_LABEL[edge]} — {SIDE_LABEL[side]} {index + 1}",
+                geometry="line",
+                # A connector drawn across an occluded stretch from no pixels is kept as
+                # data, marked so the editor can show it for what it is.
+                source="inferred" if _key((polyline,)) in inferred else "auto",
+                color=detect.edge_color(edge),
+                score=0.5,
+                visible=True,
+                side=side,
+                edge=edge,
+                polyline=polyline,
+                mask_url=None,
+            )
+        )
+    for index, (polyline, side, edge) in enumerate(unrequested):
+        # Detected by the partition, not asked for by the instruction: kept, hidden, so the
+        # editor shows the same roof structure the reference method draws and one click lights it.
+        rows.append(
+            RegionRow(
+                kind="roof",
+                label=f"{EDGE_LABEL.get(edge, edge)} — {SIDE_LABEL.get(side, side)} {index + 1} (not lit)",
+                geometry="line",
+                source="auto",
+                color=detect.edge_color(edge),
+                score=0.5,
+                visible=False,
+                side=side,
+                edge=edge,
+                polyline=polyline,
+                mask_url=None,
+            )
+        )
+    return rows
+
+
 @router.post("/detect", response_model=list[Region])
 def run_detection(photo_id: str, body: DetectRequest, store: Store = Depends(get_store)):
     photo = store.photo(photo_id)
@@ -187,6 +272,9 @@ def run_detection(photo_id: str, body: DetectRequest, store: Store = Depends(get
     store.update_photo(photo, interpreted=lighting.interpretation(photo.prompt, store.products()))
 
     settings = get_settings()
+    # V3 answers the roof request on its own; the SAM/partition path below then runs only for
+    # whatever other kinds were asked for. target_house_only works on SAM roof planes, so with
+    # V3 there are none to select from and the target step simply does not apply.
     direct_roof = settings.roofline_detector == "v3_sol" and "roof" in (selected or detect.DEFAULT_KINDS)
     partitioned = settings.edge_extractor == "partition" and not direct_roof
     direct_lines: list[dict] = []
@@ -212,7 +300,7 @@ def run_detection(photo_id: str, body: DetectRequest, store: Store = Depends(get
         reference = {"working_bgr": working_bgr, "scale": scale, "focal_35mm": None}
     else:
         small, _ = detect.working_copy(
-            image, settings.partition_detect_max_edge if settings.edge_extractor == "partition" else settings.detect_max_edge
+            image, settings.partition_detect_max_edge if partitioned else settings.detect_max_edge
         )
     try:
         if direct_roof:
@@ -244,9 +332,11 @@ def run_detection(photo_id: str, body: DetectRequest, store: Store = Depends(get
     lap(f"segmentation ({len(detections)} instances, {settings.edge_extractor}"
         + (f"/{settings.partition_engine}" if partitioned else "") + ")")
 
+    # The roof planes at working size, as SAM returned them: what the target-house tap stores.
+    working_roofs = [d.mask for d in detections if d.kind == "roof"]
     if reference is not None:
         # the reference geometry runs on the masks at working size, as they came back from SAM
-        reference["working_masks"] = [d.mask for d in detections if d.kind == "roof"]
+        reference["working_masks"] = list(working_roofs)
     for detection in detections:
         detection.mask = detect.upscale_mask(detection.mask, image.size)
 
@@ -269,67 +359,34 @@ def run_detection(photo_id: str, body: DetectRequest, store: Store = Depends(get
 
     roofs = [d for d in detections if d.kind == "roof"]
     roof_masks = [d.mask for d in roofs]
+    scores = [d.score for d in roofs]
     details: dict = {}
-    unrequested: list[tuple] = []
+    target_info: dict | None = None
     if roof_masks:
-        # The reference geometry is final after its relaxation; snapping on top is opt-in there.
-        snapping = settings.snap_to_edges and (not partitioned or settings.partition_snap)
-        spans = roof_lines(
-            roof_masks,
-            blockers,
-            parsed,
-            settings.edge_extractor == "hybrid",
-            snap.field(image) if snapping or settings.interior_hips else None,
-            solid=solid,
-            interior=settings.interior_hips,
-            partitioned=partitioned,
-            image=image,
-            scores=[d.score for d in roofs],
-            details=details,
-            junctions=settings.partition_junctions,
-            constrained=settings.partition_constrained_snap,
-            unrequested=unrequested,
-            reference=reference,
+        keep, vp_region = None, None
+        if settings.target_house_only:
+            # Only the house being quoted gets lines, and only its segments vote on the vanishing
+            # points. Every plane is stored with its keep flag, so a tap in the editor can move
+            # one in or out of the house without another detection call.
+            keep = target.select(roof_masks, image)
+            vp_region = target.evidence_region(roof_masks, keep)
+            store.write_planes(photo.id, working_roofs)
+            target_info = {
+                # Scores unrounded: the partition ranks planes by them, and a tap must redraw the
+                # lines from exactly what detection used.
+                "planes": [{"outline": outline, "keep": keep_it, "score": float(score)}
+                           for outline, keep_it, score in zip(target.outlines(roof_masks), keep, scores)],
+                "sides": parsed.sides,
+                "edges": parsed.edges,
+            }
+        spans, unrequested, details = compute_roof_lines(
+            roof_masks, scores, blockers, solid, parsed, image, reference=reference, vp_region=vp_region,
         )
-        lap(f"roof lines ({len(spans)} spans, {len(unrequested)} detected but not requested)")
-        inferred = details.get("inferred", set())
-        for index, (polyline, side, edge) in enumerate(spans):
-            fresh.append(
-                RegionRow(
-                    kind="roof",
-                    label=f"{EDGE_LABEL[edge]} — {SIDE_LABEL[side]} {index + 1}",
-                    geometry="line",
-                    # A connector drawn across an occluded stretch from no pixels is kept as
-                    # data, marked so the editor can show it for what it is.
-                    source="inferred" if _key((polyline,)) in inferred else "auto",
-                    color=detect.edge_color(edge),
-                    score=0.5,
-                    visible=True,
-                    side=side,
-                    edge=edge,
-                    polyline=polyline,
-                    mask_url=None,
-                )
-            )
-
-    for index, (polyline, side, edge) in enumerate(unrequested):
-        # Detected by the partition, not asked for by the instruction: kept, hidden, so the
-        # editor shows the same roof structure the reference method draws and one click lights it.
-        fresh.append(
-            RegionRow(
-                kind="roof",
-                label=f"{EDGE_LABEL.get(edge, edge)} — {SIDE_LABEL.get(side, side)} {index + 1} (not lit)",
-                geometry="line",
-                source="auto",
-                color=detect.edge_color(edge),
-                score=0.5,
-                visible=False,
-                side=side,
-                edge=edge,
-                polyline=polyline,
-                mask_url=None,
-            )
-        )
+        if keep is not None:
+            spans, unrequested = target.on_house(spans, roof_masks, keep), target.on_house(unrequested, roof_masks, keep)
+        lap(f"roof lines ({len(spans)} spans, {len(unrequested)} detected but not requested"
+            + (f", {sum(keep)} of {len(keep)} planes on the target house" if keep is not None else "") + ")")
+        fresh += roof_rows(spans, unrequested, details.get("inferred", set()))
 
     # Anything detected that the instruction did not ask for is here as evidence of what
     # stands in front of the house, not as something to light.
@@ -362,13 +419,14 @@ def run_detection(photo_id: str, body: DetectRequest, store: Store = Depends(get
             )
         )
 
+    extra: dict = {}
     if details.get("pitch") or details.get("planes") is not None:
         # Pitch and plane polygons ride with the interpretation; there is no plane entity to hang them on.
-        store.update_photo(
-            photo,
-            interpreted={**(photo.interpreted or {}), "pitch": {str(k): v for k, v in (details.get("pitch") or {}).items()},
-                         "planes": details.get("planes")},
-        )
+        extra = {"pitch": {str(k): v for k, v in (details.get("pitch") or {}).items()}, "planes": details.get("planes")}
+    if target_info is not None:
+        extra["target"] = target_info
+    if extra:
+        store.update_photo(photo, interpreted={**(photo.interpreted or {}), **extra})
     if detection_run is not None:
         detection_run["side_review_required"] = bool(parsed.sides)
         store.update_photo(photo, interpreted={**(photo.interpreted or {}), "detection_run": detection_run})
@@ -376,6 +434,79 @@ def run_detection(photo_id: str, body: DetectRequest, store: Store = Depends(get
     result = [region_dict(region) for region in store.refresh_hidden(photo)]
     lap("store")
     return result
+
+
+@router.post("/target", response_model=PhotoDetail)
+def tap_target_plane(photo_id: str, body: TargetTap, store: Store = Depends(get_store)):
+    """Move the roof plane under a tap into or out of the house being quoted.
+
+    The roof lines are redrawn from the planes stored at detection, through the same geometry
+    and with the instruction's side and edge filter from then. No detection call is made, and
+    area regions and lines someone drew are untouched; detected roof lines are redrawn, so an
+    edit to one of them is undone by a tap. Lighting already confirmed carries over to the
+    redrawn lines.
+    """
+    settings = get_settings()
+    if not settings.target_house_only:
+        # The flag switches the whole feature off, taps included.
+        raise HTTPException(409, "TARGET_HOUSE_ONLY is off. Turn it on and detect again to pick the house's planes.")
+    photo = store.photo(photo_id)
+    info = (photo.interpreted or {}).get("target")
+    if not info or not info.get("planes"):
+        raise HTTPException(409, "This photo has no stored roof planes. Detect it with TARGET_HOUSE_ONLY on.")
+    if settings.edge_extractor == "partition" and settings.partition_engine == "reference":
+        raise HTTPException(409, "Tapping planes redraws lines with this repo's engine: set PARTITION_ENGINE=port.")
+    working = store.read_planes(photo.id, len(info["planes"]))
+    if working is None:
+        raise HTTPException(409, "This photo's stored roof planes are missing. Detect it again.")
+    masks = [detect.upscale_mask(mask, (photo.width, photo.height)) for mask in working]
+    index = target.plane_at(masks, body.point)
+    if index is None:
+        raise HTTPException(404, "No roof plane there. Tap on a roof.")
+    keep = [bool(plane["keep"]) for plane in info["planes"]]
+    moved = not keep[index]
+    for plane in target.copies_of(masks, index):
+        keep[plane] = moved
+    if not any(keep):
+        raise HTTPException(400, "The house needs at least one roof plane.")
+
+    regions = store.regions(photo)
+    blockers = store.area_union(photo, regions, occlusion.BLOCKER_KINDS)
+    solid = store.area_union(photo, regions, occlusion.SOLID_KINDS)
+    image = store.load_image(photo)
+    store.release()
+    parsed = intent.Intent(sides=list(info.get("sides") or []), edges=list(info.get("edges") or []))
+    spans, unrequested, details = compute_roof_lines(
+        masks, [float(plane.get("score", 1.0)) for plane in info["planes"]], blockers, solid, parsed, image,
+        vp_region=target.evidence_region(masks, keep),
+    )
+    spans, unrequested = target.on_house(spans, masks, keep), target.on_house(unrequested, masks, keep)
+
+    changes: dict = {"target": {**info, "planes": [{**plane, "keep": keep_it} for plane, keep_it in zip(info["planes"], keep)]}}
+    if details.get("pitch") is not None:
+        changes["pitch"] = {str(k): v for k, v in details["pitch"].items()}
+    if store.replace_roof_lines(photo, roof_rows(spans, unrequested, details.get("inferred", set())), changes, info) is None:
+        raise HTTPException(409, "This photo was detected or tapped again while its lines were redrawn. Tap again.")
+    _relight(store, photo)
+    return {**photo_dict(photo), "regions": [region_dict(region) for region in store.refresh_hidden(photo)]}
+
+
+def _relight(store: Store, photo) -> None:
+    """Carry confirmed lighting over to redrawn roof lines. The old lines' rows went with them,
+    so each confirmed request lights what it matches now, the way put_design matched it."""
+    design = store.design(photo)
+    if design is None:
+        return
+    regions = store.regions(photo)
+    rows: dict = {}
+    confirmed = []
+    for request in design.requests or []:
+        matched = [region for region in regions if lighting.matches(request, region)]
+        for region in matched:
+            # A later request naming the same region wins, as in put_design.
+            rows[region.id] = request["settings"]
+        confirmed.append({**request, "region_ids": [str(region.id) for region in matched]})
+    store.set_design(photo, confirmed, rows)
 
 
 @router.post("/regions", response_model=Region)

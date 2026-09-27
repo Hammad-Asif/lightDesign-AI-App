@@ -172,6 +172,32 @@ class Store:
             self.delete_mask(photo.id, region_id)
         return self.regions(photo)
 
+    def replace_roof_lines(
+        self, photo: Photo, regions: list[Region], interpreted: dict, expected: dict
+    ) -> list[Region] | None:
+        """Swap the detected lines for a fresh set and merge `interpreted` into the photo's, in one
+        transaction. Areas, and lines someone drew, stay. Returns None and changes nothing when
+        the photo's target house is no longer `expected`: another tab detected or tapped it
+        while these lines were drawn, so they belong to planes that are gone."""
+        self.db.execute(select(Photo.id).where(Photo.id == photo.id).with_for_update())
+        self.db.refresh(photo)
+        if (photo.interpreted or {}).get("target") != expected:
+            self.db.rollback()
+            return None
+        self.db.execute(
+            delete(Region).where(
+                Region.photo_id == photo.id,
+                Region.geometry == "line",
+                Region.source.in_(("auto", "inferred")),
+            )
+        )
+        for region in regions:
+            region.photo_id = photo.id
+        self.db.add_all(regions)
+        photo.interpreted = {**(photo.interpreted or {}), **interpreted}
+        self.db.commit()
+        return self.regions(photo)
+
     def delete_region(self, photo: Photo, region_id: str) -> Region:
         region = self.region(photo, region_id)
         self.db.delete(region)
@@ -197,10 +223,14 @@ class Store:
         return regions
 
     def _blocker_union(self, photo: Photo, regions: list[Region]) -> np.ndarray | None:
+        return self.area_union(photo, regions, occlusion.BLOCKER_KINDS)
+
+    def area_union(self, photo: Photo, regions: list[Region], kinds) -> np.ndarray | None:
+        """The stored masks of every area region of these kinds, as one blocker mask."""
         masks = [
             mask
             for r in regions
-            if r.geometry == "area" and r.kind in occlusion.BLOCKER_KINDS
+            if r.geometry == "area" and r.kind in kinds
             for mask in [self.read_mask(photo.id, r.id)]
             if mask is not None
         ]
@@ -425,6 +455,27 @@ class Store:
 
     def delete_mask(self, photo_id, region_id) -> None:
         self.mask_path(photo_id, region_id).unlink(missing_ok=True)
+
+    # -- roof planes (TARGET_HOUSE_ONLY) -----------------------------------------
+
+    def planes_dir(self, photo_id) -> Path:
+        return self.photo_dir(photo_id) / "planes"
+
+    def write_planes(self, photo_id, masks: list[np.ndarray]) -> None:
+        """Every roof plane detection returned, at the working size SAM answered at, so a tap can
+        redraw the lines later from exactly the masks detection used."""
+        directory = self.planes_dir(photo_id)
+        directory.mkdir(parents=True, exist_ok=True)
+        for stale in directory.glob("*.png"):
+            stale.unlink()
+        for index, mask in enumerate(masks):
+            Image.fromarray((mask.astype(bool) * 255).astype(np.uint8), mode="L").save(directory / f"{index}.png")
+
+    def read_planes(self, photo_id, count: int) -> list[np.ndarray] | None:
+        paths = [self.planes_dir(photo_id) / f"{index}.png" for index in range(count)]
+        if not all(path.exists() for path in paths):
+            return None
+        return [np.array(Image.open(path).convert("L")) > 127 for path in paths]
 
     def file_path(self, photo: Photo, relative: str) -> Path:
         """Resolve a file inside one photo's directory, refusing anything that escapes it."""

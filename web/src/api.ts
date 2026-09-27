@@ -101,6 +101,11 @@ export const refineRegion = (
   payload: { box?: number[]; point?: number[]; region_id?: string; kind?: RegionKind },
 ) => send<Region>(`/photos/${id}/regions/refine`, "POST", payload);
 
+// Moves the roof plane under a tap into or out of the house being quoted; the roof lines are redrawn
+// from the stored planes, with no detection call.
+export const tapHousePlane = (id: string, point: number[]) =>
+  send<PhotoDetail>(`/photos/${id}/target`, "POST", { point });
+
 // Re-reads the instruction (a new one when given) without detecting anything: reading is free.
 export const interpret = (id: string, prompt?: string) =>
   send<Photo>(`/photos/${id}/interpret`, "POST", { prompt: prompt ?? null });

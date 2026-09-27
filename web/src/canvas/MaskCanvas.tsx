@@ -28,6 +28,8 @@ const UNKNOWN_HALO = "rgba(244, 63, 94, 0.6)";
 export interface MaskCanvasHandle {
   undo: () => void;
   redo: () => void;
+  // Drops the undo steps of regions that are gone, such as the roof lines a House tap redrew.
+  forget: (regionIds: string[]) => void;
 }
 
 interface Props {
@@ -46,6 +48,8 @@ interface Props {
   onSelect: (regionId: string) => void;
   onBox: (box: number[]) => void;
   onPoint: (point: number[]) => void;
+  // The House tool: a tap on a roof plane moves it into or out of the house being quoted.
+  onHouseTap: (point: number[]) => void;
   onRemoveAt: (regionId: string) => void;
   onHistoryChange: (state: { canUndo: boolean; canRedo: boolean }) => void;
   drawingColor: string | null;
@@ -81,6 +85,7 @@ export const MaskCanvas = forwardRef<MaskCanvasHandle, Props>(function MaskCanva
     onSelect,
     onBox,
     onPoint,
+    onHouseTap,
     onRemoveAt,
     onHistoryChange,
     drawingColor,
@@ -163,6 +168,26 @@ export const MaskCanvas = forwardRef<MaskCanvasHandle, Props>(function MaskCanva
       context.globalAlpha = 0.2;
       context.fill();
       context.globalAlpha = 1;
+    }
+
+    // House tool: every roof plane detection found, green when it is on the house being quoted
+    // and red, dashed, when it was left out as a neighbour, so it is plain what a tap will do.
+    if (tool === "house") {
+      for (const plane of photoRef.current.interpreted?.target?.planes ?? []) {
+        for (const polygon of plane.outline) {
+          if (polygon.length < 3) continue;
+          context.beginPath();
+          polygon.forEach((p, i) => (i ? context.lineTo(p[0], p[1]) : context.moveTo(p[0], p[1])));
+          context.closePath();
+          context.fillStyle = plane.keep ? "rgba(57, 255, 20, 0.22)" : "rgba(255, 59, 48, 0.2)";
+          context.fill();
+          context.lineWidth = 2 / factor;
+          context.strokeStyle = plane.keep ? "#39ff14" : "rgba(255, 255, 255, 0.95)";
+          context.setLineDash(plane.keep ? [] : [8 / factor, 6 / factor]);
+          context.stroke();
+          context.setLineDash([]);
+        }
+      }
     }
 
     const junctions: number[][] = [];
@@ -454,6 +479,12 @@ export const MaskCanvas = forwardRef<MaskCanvasHandle, Props>(function MaskCanva
       reportHistory();
       void restore(snapshot);
     },
+    forget: (regionIds) => {
+      const gone = new Set(regionIds);
+      past.current = past.current.filter((snapshot) => !gone.has(snapshot.regionId));
+      future.current = future.current.filter((snapshot) => !gone.has(snapshot.regionId));
+      reportHistory();
+    },
   }));
 
   const toImage = (event: ReactPointerEvent): number[] => {
@@ -520,6 +551,11 @@ export const MaskCanvas = forwardRef<MaskCanvasHandle, Props>(function MaskCanva
     if (drawingColor) {
       drawRef.current = [...drawRef.current, [Math.round(point[0]), Math.round(point[1])]];
       requestDraw();
+      return;
+    }
+
+    if (tool === "house") {
+      onHouseTap([Math.round(point[0]), Math.round(point[1])]);
       return;
     }
 

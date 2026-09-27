@@ -77,6 +77,10 @@ class Interpreted(BaseModel):
     # Which reader produced the requests above -- the fixed rules or the language model -- and
     # anything it could not read. A silent fallback would otherwise look like a clean reading.
     read_with: dict | None = None
+    # TARGET_HOUSE_ONLY: every roof plane detection returned, as {"outline": polygons in photo
+    # pixels, "keep": on the target house, "score"}, plus the instruction's side and edge filter
+    # the lines were drawn with. The editor's House tool taps a plane in or out of the house.
+    target: dict | None = None
 
 
 class Photo(BaseModel):
@@ -110,6 +114,12 @@ class RefineRequest(BaseModel):
         if (self.box is None) == (self.point is None):
             raise ValueError("Provide exactly one of box or point")
         return self
+
+
+class TargetTap(BaseModel):
+    """A tap on a roof plane, in photo pixels: moves that plane into or out of the target house."""
+
+    point: list[int] = Field(min_length=2, max_length=2)
 
 
 class CreateRegionRequest(BaseModel):

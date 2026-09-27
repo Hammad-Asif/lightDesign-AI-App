@@ -95,6 +95,14 @@ class Settings(BaseSettings):
     # requests per roof photo instead of one. Off: an instruction returns only what it asked for.
     detect_blockers: bool = True
 
+    # On: roof lines only for the house being quoted. Detection still returns every roof plane;
+    # services/target.py picks the planes that belong to the target house, only those get
+    # lines, and only their segments decide which vanishing points stand and where. Every plane
+    # is stored, so a tap in the editor can move one into or out of the house without a new
+    # detection call. Off: every plane gets lines and the whole photo decides the vanishing
+    # points, as before, and taps are refused.
+    target_house_only: bool = False
+
     # Off: draw hips that fall inside a single mask, where two roof planes came back merged and
     # no mask boundary runs along the line between them. The candidates are real geometry (apex
     # to eave corner) but the photo does not confirm them: measured on the eval set, every

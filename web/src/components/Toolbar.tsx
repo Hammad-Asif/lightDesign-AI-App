@@ -98,6 +98,17 @@ const GROUPS: ToolSpec[][] = [
         </>,
       ),
     },
+    {
+      id: "house",
+      label: "House",
+      hint: "Tap a roof to add it to the house being quoted, or tap it again to take it out. The roof lines are redrawn.",
+      icon: svg(
+        <>
+          <path d="M4 10.5 12 4l8 6.5" />
+          <path d="M6 9.5V20h12V9.5" />
+        </>,
+      ),
+    },
   ],
 ];
 
@@ -107,16 +118,19 @@ interface DockProps {
   brushSize: number;
   setBrushSize: (size: number) => void;
   active: Region | undefined;
+  // The photo was detected with TARGET_HOUSE_ONLY on, so its roof planes can be tapped in or
+  // out. Off, or detected before the flag, there is nothing stored to tap and the tool hides.
+  houseAvailable: boolean;
 }
 
 // A floating vertical dock docked over the canvas, so the tools that act on it read as part of
 // it rather than a disconnected bar of text buttons above.
-export function ToolDock({ tool, setTool, brushSize, setBrushSize, active }: DockProps) {
+export function ToolDock({ tool, setTool, brushSize, setBrushSize, active, houseAvailable }: DockProps) {
   return (
     <div className="tool-dock" role="toolbar" aria-label="Editing tools" aria-orientation="vertical">
       {GROUPS.map((group, index) => (
         <div key={index} className="dock-group">
-          {group.map((item) => {
+          {group.filter((item) => item.id !== "house" || houseAvailable).map((item) => {
             const missing = item.needs && active?.geometry !== item.needs;
             const hint = missing
               ? `Select ${item.needs === "line" ? "a line" : "an area"} first`
