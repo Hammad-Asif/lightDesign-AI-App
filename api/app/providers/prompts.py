@@ -13,6 +13,9 @@ CLASS_QUERIES: dict[str, list[str]] = {
     # Asked alongside rooflines (detect.queried_kinds) for what stands in front of the house.
     # Palms, trees and planting block lines too, but already have classes of their own.
     "obstruction": ["car"],
+    # Never a region: only where the sky begins above the roof, for the top of V3's crop
+    # (detect.run(sky=True), services/rooflines.target_crop).
+    "sky": ["sky"],
 }
 
 # Matches the threshold the local SAM 3 roof path used.

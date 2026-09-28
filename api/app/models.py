@@ -105,6 +105,10 @@ class Region(Timestamped, Base):
     # Lines only: [start, end] pixel distances along the polyline that pass behind an object.
     # Derived from the blocking objects' masks by Store.refresh_hidden, never set directly.
     hidden: Mapped[list | None] = mapped_column(JSONB)
+    # Detected roof lines: evidence-based confidence in [0, 1] (services/fusion.py) and every
+    # source that found the line, e.g. ["v3", "partition"]. None on areas and drawn lines.
+    confidence: Mapped[float | None] = mapped_column(Float)
+    sources: Mapped[list | None] = mapped_column(JSONB)
 
 
 class Product(Timestamped, Base):

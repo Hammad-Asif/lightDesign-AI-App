@@ -170,8 +170,12 @@ def run(
     provider: SegmentationProvider,
     kinds: list[str] | None = None,
     blockers: bool = False,
+    sky: bool = False,
 ) -> list[Detection]:
+    """`sky` also asks for the sky, returned as kind "sky": context for V3's crop, never a region."""
     wanted = queried_kinds(kinds or DEFAULT_KINDS, blockers)
+    if sky:
+        wanted.append("sky")
 
     # Every kind, roof included, is one text prompt to the same model.
     detections = provider.detect(image, query_kinds(wanted))

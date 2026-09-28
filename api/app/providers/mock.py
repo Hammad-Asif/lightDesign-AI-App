@@ -10,6 +10,7 @@ BOXES: dict[str, tuple[float, float, float, float]] = {
     "topiary": (0.66, 0.68, 0.78, 0.88),
     "palm_tree": (0.72, 0.08, 0.99, 0.92),
     "tree_canopy": (0.02, 0.30, 0.26, 0.62),
+    "sky": (0.0, 0.0, 1.0, 0.10),
 }
 
 
@@ -57,6 +58,7 @@ SHAPES = {
     "topiary": _ellipse,
     "palm_tree": _palm,
     "tree_canopy": _ellipse,
+    "sky": _rect,
 }
 
 

@@ -99,6 +99,18 @@ const GROUPS: ToolSpec[][] = [
       ),
     },
     {
+      id: "find",
+      label: "Find in box",
+      hint: "Drag a box where roof lines were missed; the lines inside it are detected and added. Nothing already there changes.",
+      icon: svg(
+        <>
+          <rect x="3.5" y="3.5" width="12" height="12" rx="1.5" strokeDasharray="3 2.5" />
+          <circle cx="16" cy="16" r="3.2" />
+          <path d="m18.4 18.4 2.6 2.6" />
+        </>,
+      ),
+    },
+    {
       id: "house",
       label: "House",
       hint: "Tap a roof to add it to the house being quoted, or tap it again to take it out. The roof lines are redrawn.",

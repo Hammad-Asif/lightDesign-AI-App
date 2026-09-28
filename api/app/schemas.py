@@ -56,6 +56,10 @@ class Region(BaseModel):
     mask_url: str | None = None
     # Lines only: [start, end] pixel distances along the polyline that pass behind an object.
     hidden: list[list[float]] | None = None
+    # Detected roof lines: evidence-based confidence in [0, 1] (low ones are drawn dashed) and
+    # every source that found the line: "v3", "partition". None for areas and drawn lines.
+    confidence: float | None = None
+    sources: list[str] | None = None
 
 
 class Interpreted(BaseModel):
@@ -81,6 +85,11 @@ class Interpreted(BaseModel):
     # pixels, "keep": on the target house, "score"}, plus the instruction's side and edge filter
     # the lines were drawn with. The editor's House tool taps a plane in or out of the house.
     target: dict | None = None
+    # The unified roof-line run: sources, V3 status and fallback, the target-house crop, stage
+    # counts and the confidence levels the editor draws with. See services/fusion.py.
+    roofline: dict | None = None
+    # ROOFLINE_DEBUG only: every stage's lines and each V3 line's lifecycle, for diagnosis.
+    roofline_debug: dict | None = None
 
 
 class Photo(BaseModel):
@@ -114,6 +123,12 @@ class RefineRequest(BaseModel):
         if (self.box is None) == (self.point is None):
             raise ValueError("Provide exactly one of box or point")
         return self
+
+
+class FindLinesRequest(BaseModel):
+    """Find in Box: a box the user drew, in photo pixels (x0, y0, x1, y1), to detect roof lines in."""
+
+    box: list[int] = Field(min_length=4, max_length=4)
 
 
 class TargetTap(BaseModel):

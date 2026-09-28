@@ -38,7 +38,10 @@ def health(response: Response):
         "milestone": "M2",
         "database": database,
         "segmentation_provider": settings.segmentation_provider,
-        "roofline_detector": settings.roofline_detector,
+        # Kept for existing consumers: "v3_sol" whenever V3 is one of the line sources.
+        "roofline_detector": "v3_sol" if "v3" in settings.roofline_sources else "sam",
+        # The unified detector's line sources, in priority order. SAM always runs.
+        "roofline_sources": settings.roofline_sources,
         # Which roof-line path is live. Settings are read once at startup, so this is the only
         # way to tell whether an .env edit has taken effect without reading the server log.
         "edge_extractor": settings.edge_extractor,

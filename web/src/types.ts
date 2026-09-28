@@ -22,7 +22,8 @@ export type Geometry = "line" | "area";
 export type Side = "front" | "left" | "right";
 export type Edge = "eave" | "rake" | "hip" | "ridge" | "valley" | "junction" | "unknown";
 export type MaskingMode = "manual" | "automatic";
-export type Tool = "select" | "brush" | "erase" | "vertex" | "move" | "box" | "line" | "click" | "house";
+// "find": Find in Box — drag a box where detection missed roof lines; the server detects inside it.
+export type Tool = "select" | "brush" | "erase" | "vertex" | "move" | "box" | "line" | "click" | "house" | "find";
 
 // "blocker" is something standing in front of the house — a palm, a tree, a car. It is detected
 // so a line passing behind it can be joined up and reported, and it is never lit itself.
@@ -44,6 +45,10 @@ export interface Region {
   mask_url: string | null;
   // Lines only: [start, end] pixel distances along the polyline that pass behind an object.
   hidden?: number[][] | null;
+  // Detected roof lines: evidence-based confidence in [0, 1] and every source that found the line
+  // ("v3", "partition"). Null for areas and for lines someone drew.
+  confidence?: number | null;
+  sources?: string[] | null;
 }
 
 export type ProductCategory = "c9" | "c7" | "mini" | "icicle" | "wreath" | "garland";
@@ -153,7 +158,42 @@ export interface Interpreted {
   read_with?: ReadWith | null;
   // TARGET_HOUSE_ONLY: every roof plane detection returned, and whether it is on the house being quoted.
   target?: TargetHouse | null;
+  // The unified roof-line run: sources, V3 status and fallback, and the confidence levels to draw with.
+  roofline?: RooflineReport | null;
+  // ROOFLINE_DEBUG only: the lines at every stage of the pipeline, for development.
+  roofline_debug?: RooflineDebug | null;
 }
+
+export interface RooflineReport {
+  sources: string[];
+  v3_status?: "ok" | "empty" | "failed" | "skipped";
+  v3_error?: string | null;
+  fallback_used?: boolean;
+  crop?: number[] | null;
+  counts?: Record<string, Record<string, unknown>>;
+  confidence_levels?: { high: number; low: number };
+}
+
+export interface DebugLine {
+  id: string | null;
+  points?: number[][];
+  // A_raw_v3 only: the model's own answer, in the pixels of the crop it was asked about.
+  crop_points?: number[];
+  crop?: number[];
+  type?: string | null;
+  source?: string[];
+  confidence?: number | null;
+}
+
+export interface RooflineDebug {
+  stages: Record<string, DebugLine[]>;
+  lines: Record<string, unknown>[];
+  overlays?: string[];
+}
+
+// Below this a detected roof line is drawn dashed. Mirrors ROOFLINE_CONFIDENCE_LOW's default; the
+// photo's own roofline report carries the live value.
+export const LOW_CONFIDENCE = 0.45;
 
 export interface ReadWith {
   reader: "rules" | "llm";

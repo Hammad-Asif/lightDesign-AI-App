@@ -17,7 +17,7 @@ from app.services import occlusion, partition
 
 REGION_FIELDS = (
     "kind", "role", "label", "geometry", "source", "color", "score",
-    "visible", "side", "edge", "polyline", "mask_url", "hidden",
+    "visible", "side", "edge", "polyline", "mask_url", "hidden", "confidence", "sources",
 )
 
 
@@ -286,6 +286,9 @@ class Store:
                 left.polyline = [list(map(int, left.polyline[0])), list(map(int, right.polyline[-1]))]
             else:
                 left.polyline = [list(map(int, p)) for p in left.polyline] + [list(map(int, p)) for p in right.polyline]
+            # One edge now, found by whatever found either piece.
+            if left.sources or right.sources:
+                left.sources = list(dict.fromkeys((left.sources or []) + (right.sources or [])))
             absorbed.add(right.id)
 
         # Nothing is carried past an object here: no roof mask is stored, and a line is only

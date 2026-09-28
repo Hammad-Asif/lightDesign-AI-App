@@ -10,7 +10,7 @@ import {
 } from "react";
 
 import { fileUrl } from "../api";
-import type { Photo, Region, Tool } from "../types";
+import { LOW_CONFIDENCE, type Photo, type Region, type Tool } from "../types";
 import {
   createLayer,
   ctx2d,
@@ -24,6 +24,11 @@ import {
 const HISTORY_LIMIT = 20;
 // Halo under a roof line whose edge type could not be identified.
 const UNKNOWN_HALO = "rgba(244, 63, 94, 0.6)";
+// Debug overlay: which source a line at a pipeline stage came from.
+const DEBUG_COLOURS: Record<string, string> = {
+  v3: "#22d3ee",
+  partition: "#f59e0b",
+};
 
 export interface MaskCanvasHandle {
   undo: () => void;
@@ -55,6 +60,8 @@ interface Props {
   drawingColor: string | null;
   onDrawFinish: (polyline: number[][]) => void;
   onDrawCancel: () => void;
+  // Development: draw the roof lines as they were at one stage of the pipeline (ROOFLINE_DEBUG).
+  debugStage?: string | null;
 }
 
 type Snapshot =
@@ -91,6 +98,7 @@ export const MaskCanvas = forwardRef<MaskCanvasHandle, Props>(function MaskCanva
     drawingColor,
     onDrawFinish,
     onDrawCancel,
+    debugStage = null,
   },
   ref,
 ) {
@@ -139,6 +147,52 @@ export const MaskCanvas = forwardRef<MaskCanvasHandle, Props>(function MaskCanva
 
   const quietObstacle = (region: Region) =>
     region.role === "blocker" && !obstaclesRef.current && region.id !== activeRef.current;
+
+  const lowConfidence = () => photoRef.current.interpreted?.roofline?.confidence_levels?.low ?? LOW_CONFIDENCE;
+
+  // The lines of one pipeline stage, coloured by source, with each line's id at its middle. The raw
+  // V3 stage is in crop pixels: it is placed by the crop's corner here, independently of the server's
+  // conversion, so the two can be compared.
+  const drawDebugStage = (context: CanvasRenderingContext2D, factor: number) => {
+    const debug = photoRef.current.interpreted?.roofline_debug;
+    // Only a photo detected with ROOFLINE_DEBUG has stages; without them nothing is drawn, the
+    // crop outline included.
+    if (!debug?.stages?.[debugStage ?? ""]) return;
+    const lines = debug.stages[debugStage ?? ""];
+    const crop = photoRef.current.interpreted?.roofline?.crop;
+    if (crop) {
+      context.strokeStyle = "rgba(34, 211, 238, 0.8)";
+      context.lineWidth = 1.5 / factor;
+      context.setLineDash([6 / factor, 6 / factor]);
+      context.strokeRect(crop[0], crop[1], crop[2] - crop[0], crop[3] - crop[1]);
+      context.setLineDash([]);
+    }
+    context.font = `${12 / factor}px sans-serif`;
+    for (const line of lines) {
+      let points = line.points;
+      // A second call on a missed plane has its own crop.
+      const origin = line.crop ?? crop;
+      if (!points && line.crop_points && origin) {
+        const [x1, y1, x2, y2] = line.crop_points;
+        points = [
+          [x1 + origin[0], y1 + origin[1]],
+          [x2 + origin[0], y2 + origin[1]],
+        ];
+      }
+      if (!points || points.length < 2) continue;
+      const sources = line.source ?? ["v3"];
+      context.strokeStyle = DEBUG_COLOURS[sources[0]] ?? DEBUG_COLOURS.v3;
+      context.lineWidth = 2.5 / factor;
+      context.beginPath();
+      points.forEach((p, i) => (i ? context.lineTo(p[0], p[1]) : context.moveTo(p[0], p[1])));
+      context.stroke();
+      if (line.id) {
+        const [start, end] = [points[0], points[points.length - 1]];
+        context.fillStyle = "#ffffff";
+        context.fillText(line.id, (start[0] + end[0]) / 2, (start[1] + end[1]) / 2 - 4 / factor);
+      }
+    }
+  };
 
   const scale = () => {
     const canvas = canvasRef.current;
@@ -234,9 +288,20 @@ export const MaskCanvas = forwardRef<MaskCanvasHandle, Props>(function MaskCanva
 
       if (region.kind === "roof") {
         // a dark halo keeps a line crisp against bright sky and light shingles; an unlit edge
-        // is dashed and a little quieter, but still legible on terracotta tile
+        // is dashed and a little quieter, but still legible on terracotta tile. A detected line
+        // with little evidence behind it is dashed short, so it reads as "check this one".
+        const doubtful =
+          region.source !== "manual" && region.confidence != null && region.confidence < lowConfidence();
         context.globalAlpha = unlit ? 0.8 : 1;
-        context.setLineDash(unlit ? [8 / factor, 6 / factor] : unidentified ? [0.5 / factor, 7 / factor] : []);
+        context.setLineDash(
+          unlit
+            ? [8 / factor, 6 / factor]
+            : unidentified
+              ? [0.5 / factor, 7 / factor]
+              : doubtful
+                ? [4 / factor, 4 / factor]
+                : [],
+        );
         context.strokeStyle = "rgba(0, 0, 0, 0.6)";
         context.lineWidth = (isActive ? 8 : 6) / factor;
         trace(points);
@@ -301,9 +366,11 @@ export const MaskCanvas = forwardRef<MaskCanvasHandle, Props>(function MaskCanva
       }
     }
 
+    if (debugStage) drawDebugStage(context, factor);
+
     if (boxRef.current) {
       const [x0, y0, x1, y1] = boxRef.current;
-      context.strokeStyle = "#f472b6";
+      context.strokeStyle = tool === "find" ? "#22d3ee" : "#f472b6";
       context.lineWidth = 2 / factor;
       context.setLineDash([8 / factor, 6 / factor]);
       context.strokeRect(x0, y0, x1 - x0, y1 - y0);
@@ -341,7 +408,7 @@ export const MaskCanvas = forwardRef<MaskCanvasHandle, Props>(function MaskCanva
       context.lineWidth = 1.5 / factor;
       context.stroke();
     }
-  }, [brushSize, tool, drawingColor]);
+  }, [brushSize, tool, drawingColor, debugStage]);
 
   const requestDraw = useCallback(() => {
     if (frameRef.current) return;
@@ -574,7 +641,7 @@ export const MaskCanvas = forwardRef<MaskCanvasHandle, Props>(function MaskCanva
       return;
     }
 
-    if (tool === "box") {
+    if (tool === "box" || tool === "find") {
       dragRef.current = { mode: "box", start: point };
       boxRef.current = [point[0], point[1], point[0], point[1]];
       requestDraw();

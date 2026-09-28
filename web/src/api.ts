@@ -101,6 +101,11 @@ export const refineRegion = (
   payload: { box?: number[]; point?: number[]; region_id?: string; kind?: RegionKind },
 ) => send<Region>(`/photos/${id}/regions/refine`, "POST", payload);
 
+// Find in Box: detect roof lines inside a box the user drew. Adds new lines only; nothing existing
+// changes. Returns the lines it added, which may be none.
+export const findLinesInBox = (id: string, box: number[]) =>
+  send<Region[]>(`/photos/${id}/find-lines`, "POST", { box });
+
 // Moves the roof plane under a tap into or out of the house being quoted; the roof lines are redrawn
 // from the stored planes, with no detection call.
 export const tapHousePlane = (id: string, point: number[]) =>

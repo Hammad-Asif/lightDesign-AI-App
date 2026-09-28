@@ -43,6 +43,12 @@ function hiddenShare(region: Region): number {
 // Detected rows carry a trailing " (not lit)" that is already said by the section they sit in.
 const shortLabel = (label: string) => label.replace(/\s*\(not lit\)$/, "");
 
+const SOURCE_NAMES: Record<string, string> = { v3: "V3", partition: "partition" };
+
+// Which detectors found a roof line: " · V3 + partition", or nothing for rows without sources.
+const sourceNote = (region: Region) =>
+  region.sources?.length ? ` · ${region.sources.map((s) => SOURCE_NAMES[s] ?? s).join(" + ")}` : "";
+
 function Section({
   title,
   count,
@@ -269,7 +275,7 @@ export function RegionPanel({
 
               <span className="source">
                 {region.source === "auto"
-                  ? `found · ${Math.round(region.score * 100)}%`
+                  ? `found · ${Math.round((region.confidence ?? region.score) * 100)}%${sourceNote(region)}`
                   : region.source === "inferred"
                     ? "continued"
                     : "drawn by you"}

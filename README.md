@@ -5,12 +5,13 @@ exactly as before until one is switched on. Turn on at most one at a time.
 
 | Feature | Flag (`api/.env`, or root `.env` for Docker) | Notes |
 |---|---|---|
-| V3 roof detector | `ROOFLINE_DETECTOR=v3_sol` | Needs `OPENROUTER_API_KEY`. Setup and limits in [ROOFLINE_V3.md](ROOFLINE_V3.md). |
+| V3 roof lines | `ROOFLINE_SOURCES=v3,partition` | Needs `OPENROUTER_API_KEY`. SAM still runs for planes, blockers, the target house and every other kind; the roof lines come from V3 on the target-house crop, partition's only if V3 fails. See [ROOFLINE_V3.md](ROOFLINE_V3.md). |
 | Target house only | `TARGET_HOUSE_ONLY=true` | Works on the SAM/partition path. Described below. |
 
-`/health` reports `roofline_detector` and `target_house_only`, so you can see which mode is live
-without reading the log. They are independent settings, but target-house selects among SAM roof
-planes — with `v3_sol` there are no such planes, so it has nothing to act on.
+`/health` reports `roofline_sources` (and, for older consumers, `roofline_detector`) and
+`target_house_only`, so you can see which mode is live without reading the log. The target house
+decides the V3 crop whenever V3 is a source; `TARGET_HOUSE_ONLY` still decides whether neighbours'
+lines are dropped, and the House tool's taps never call V3 (the stored answer is reused).
 
 ---
 

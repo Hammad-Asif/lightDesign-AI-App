@@ -40,6 +40,10 @@ export default function App() {
   const [history, setHistory] = useState({ canUndo: false, canRedo: false });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // A neutral message, e.g. that Find in Box found nothing new. Not an error.
+  const [notice, setNotice] = useState<string | null>(null);
+  // Development (ROOFLINE_DEBUG): the pipeline stage whose roof lines are drawn over the photo.
+  const [debugStage, setDebugStage] = useState<string | null>(null);
   const [drawingKind, setDrawingKind] = useState<RegionKind | null>(null);
   const [products, setProducts] = useState<Product[]>([]);
   const [palette, setPalette] = useState<PaletteColour[]>([]);
@@ -227,19 +231,32 @@ export default function App() {
     [photo?.id],
   );
 
-  const handleBox = (box: number[]) =>
+  // Find in Box: detection runs inside the box and only adds lines; the new ones are selected.
+  const handleFindInBox = (box: number[]) =>
     guard(async () => {
       if (!photo) return;
-      const active = photo.regions.find((item) => item.id === activeId);
-      const region = await api.refineRegion(photo.id, {
-        box,
-        region_id: active?.geometry === "area" ? active.id : undefined,
-        kind: active?.geometry === "area" ? active.kind : "custom",
-      });
+      setNotice(null);
+      const found = await api.findLinesInBox(photo.id, box);
       setPhoto(await api.getPhoto(photo.id));
-      setActiveId(region.id);
-      setTool("brush");
+      if (found.length) setActiveId(found[0].id);
+      else setNotice("No new roof lines found in that box. Try a box closer around the missing roof edge.");
     });
+
+  const handleBox = (box: number[]) =>
+    tool === "find"
+      ? handleFindInBox(box)
+      : guard(async () => {
+          if (!photo) return;
+          const active = photo.regions.find((item) => item.id === activeId);
+          const region = await api.refineRegion(photo.id, {
+            box,
+            region_id: active?.geometry === "area" ? active.id : undefined,
+            kind: active?.geometry === "area" ? active.kind : "custom",
+          });
+          setPhoto(await api.getPhoto(photo.id));
+          setActiveId(region.id);
+          setTool("brush");
+        });
 
   const handlePoint = (point: number[]) =>
     guard(async () => {
@@ -362,10 +379,17 @@ export default function App() {
   useEffect(() => {
     // Picking a region switches to a tool that can edit it, but never interrupts selecting.
     if (!active || drawingKind || tool === "select") return;
-    if (active.geometry === "line" && tool !== "vertex" && tool !== "move" && tool !== "box")
+    if (active.geometry === "line" && tool !== "vertex" && tool !== "move" && tool !== "box" && tool !== "find")
       setTool("vertex");
     if (active.geometry === "area" && (tool === "vertex" || tool === "move")) setTool("brush");
   }, [activeId]);
+
+  // A stage picked on one photo means nothing on a photo without that debug stage (another photo,
+  // or one detected again with ROOFLINE_DEBUG off): the picker hides, so the choice goes too.
+  const debugStages = photo?.interpreted?.roofline_debug?.stages;
+  useEffect(() => {
+    if (debugStage && !debugStages?.[debugStage]) setDebugStage(null);
+  }, [debugStage, debugStages]);
 
   // The House tool's button goes when the photo has no planes to tap (another photo, or one
   // detected again with the flag off); the tool goes with it rather than lingering unseen.
@@ -395,6 +419,11 @@ export default function App() {
       {error && (
         <div className="error" onClick={() => setError(null)}>
           {error}
+        </div>
+      )}
+      {notice && !error && (
+        <div className="notice" onClick={() => setNotice(null)}>
+          {notice}
         </div>
       )}
 
@@ -508,7 +537,21 @@ export default function App() {
                 drawingColor={drawingKind ? KIND_COLORS[drawingKind] : null}
                 onDrawFinish={handleDrawFinish}
                 onDrawCancel={() => setDrawingKind(null)}
+                debugStage={debugStage}
               />
+              {photo.interpreted?.roofline_debug?.stages && (
+                <label className="debug-stage" title="Development: the roof lines at one stage of detection">
+                  <span>Stage</span>
+                  <select value={debugStage ?? ""} onChange={(event) => setDebugStage(event.target.value || null)}>
+                    <option value="">Off</option>
+                    {Object.keys(photo.interpreted.roofline_debug.stages).map((stage) => (
+                      <option key={stage} value={stage}>
+                        {stage.replace(/_/g, " ")}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              )}
               {!photo.approved && (
                 <>
                   <ToolDock tool={tool} setTool={chooseTool} brushSize={brushSize} setBrushSize={setBrushSize}

@@ -144,6 +144,32 @@ label.dropzone:focus-within {
   cursor: pointer;
 }
 
+.notice {
+  background: var(--surface);
+  color: var(--text);
+  border-bottom: 1px solid var(--line);
+  padding: 10px 16px;
+  font-size: 13.5px;
+  cursor: pointer;
+}
+
+/* Development (ROOFLINE_DEBUG): the pipeline-stage picker, top-right over the photo. */
+.debug-stage {
+  position: absolute;
+  top: 14px;
+  right: 14px;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  font-size: 12.5px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.14);
+}
+
 /* ---- Entry screens: sign in, upload, masking mode ---------------------------- */
 
 .topbar,

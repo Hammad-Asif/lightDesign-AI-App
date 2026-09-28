@@ -1,7 +1,9 @@
 """Direct typed roof lines, adapted from the supplied roofline-v3-sol-cli.
 
 The shipped V3 prompt, image encoding, schema, model and reasoning defaults
-are preserved. No contractor service, segmentation mask or coordinate scaling.
+are preserved. detect() answers in the pixel frame of the image it is given; detect_crop()
+gives it the target-house crop and caches the answer. Mapping crop coordinates back onto the
+photo is services/rooflines.crop_to_image, never done here.
 """
 
 import base64
@@ -126,6 +128,73 @@ def validate(data: dict, size: tuple[int, int]) -> list[dict]:
     return lines
 
 
+# Bump when anything that shapes the request or the parsed answer changes outside the prompt
+# file, model or reasoning (all three are in the key already): the schema, the posted size, the
+# encoding. Old entries then miss rather than hand back an answer to a different question.
+CACHE_VERSION = 1
+
+
+def _digest(image: Image.Image) -> str:
+    """Content hash of pixels and size: the same photo under another filename hits, a re-upload
+    that changed a single pixel misses."""
+    rgb = image.convert("RGB")
+    return hashlib.sha256(f"{rgb.width}x{rgb.height}:".encode() + rgb.tobytes()).hexdigest()
+
+
+def cache_key(image: Image.Image, box: tuple[int, int, int, int], crop: Image.Image, settings: Settings) -> str:
+    """Deterministic key of a V3 request: whole photo, crop box and crop pixels, model, reasoning
+    and prompt. Any change to the crop, prompt or model is a different key."""
+    template = PROMPT_PATH.read_text(encoding="utf-8")
+    parts = {
+        "version": CACHE_VERSION,
+        "image": _digest(image),
+        "crop": _digest(crop),
+        "box": [int(v) for v in box],
+        "model": settings.roofline_model,
+        "reasoning": settings.roofline_reasoning,
+        "prompt": hashlib.sha256(template.encode()).hexdigest(),
+        "schema": hashlib.sha256(json.dumps(SCHEMA, sort_keys=True).encode()).hexdigest(),
+        "upload_max_edge": UPLOAD_MAX_EDGE,
+    }
+    return hashlib.sha256(json.dumps(parts, sort_keys=True).encode()).hexdigest()
+
+
+def detect_crop(image: Image.Image, box: tuple[int, int, int, int], settings: Settings,
+                cache_dir: Path | None = None) -> tuple[list[dict], dict]:
+    """V3 on one crop of the photo: lines in the crop's own pixel frame, and the run's metadata.
+
+    `box` is (x0, y0, x1, y1) in photo pixels, x1/y1 exclusive. The answer is cached by
+    cache_key when `cache_dir` is given: a repeated detection of the same crop returns the stored
+    lines and makes no call. Only complete, validated answers are stored; a failure is never
+    cached, so it does not stick.
+    """
+    x0, y0, x1, y1 = (int(v) for v in box)
+    crop = image.crop((x0, y0, x1, y1))
+    key = cache_key(image, (x0, y0, x1, y1), crop, settings)
+    path = cache_dir / f"{key}.json" if cache_dir is not None else None
+    if path is not None and path.is_file():
+        try:
+            stored = json.loads(path.read_text(encoding="utf-8"))
+            lines = validate({"lines": stored["lines"]}, crop.size)
+            meta = {**stored["meta"], "cache": "hit", "cache_key": key, "crop_box": [x0, y0, x1, y1],
+                    # Nothing was billed for this run; the original bill stays on record.
+                    "cached_cost_usd": stored["meta"].get("cost_usd"), "cost_usd": 0.0, "elapsed_seconds": 0.0}
+            return lines, meta
+        except (OSError, ValueError, KeyError, TypeError):
+            pass  # an unreadable entry is a miss, and is overwritten below
+    lines, meta = detect(crop, settings)
+    meta = {**meta, "cache": "miss" if path is not None else "off", "cache_key": key, "crop_box": [x0, y0, x1, y1]}
+    if path is not None:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = path.with_suffix(".tmp")
+            temporary.write_text(json.dumps({"lines": lines, "meta": meta}), encoding="utf-8")
+            temporary.replace(path)
+        except OSError:
+            pass  # a cache that cannot be written costs a later call, never this detection
+    return lines, meta
+
+
 def detect(image: Image.Image, settings: Settings) -> tuple[list[dict], dict]:
     if not settings.openrouter_api_key.strip():
         raise RuntimeError("V3 roof detection requires OPENROUTER_API_KEY on the API server")
@@ -176,7 +245,7 @@ def detect(image: Image.Image, settings: Settings) -> tuple[list[dict], dict]:
                               if isinstance(p, dict) and p.get("type") == "text")
         lines = rescale(validate(json.loads(content), posted.size), factor, image.size)
     except (ValueError, KeyError, TypeError, IndexError, AttributeError):
-        raise RuntimeError("OpenRouter returned invalid or incomplete roof geometry; previous regions were kept") from None
+        raise RuntimeError("OpenRouter returned invalid or incomplete roof geometry") from None
     usage = raw.get("usage") or {}
     # Only billing fields, never response text, keys or image payloads, enter app metadata.
     return lines, {
