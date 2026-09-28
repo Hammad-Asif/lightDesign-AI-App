@@ -17,9 +17,16 @@ call, which planes are the target house's roof:
      the house's size is a second roof section a wall keeps apart from the first, like a
      garage, and stays; a smaller one mostly beside the house's width is a neighbour further
      back; a smaller one within it (a porch, a lower roof) stays.
+  4. A house is one column of the photo: neighbours stand beside it, never above or below it. A
+     plane lying mostly within the columns of the planes kept so far (and not cut by the frame)
+     is the same house, repeated until nothing changes. This keeps an upper storey or turret
+     roof behind a wall, which shares no outline with the roofs below and so never joins across
+     a seam, and which rule 3 judged only against the seed's own seams (measured: a two-storey
+     house lost its upper gables and turret, 12 correct lines, to rule 3).
 
-Measured on the client's five acceptance photos and five others: every neighbour plane is
-dropped, and no target plane is. What neither geometry nor colour tells apart is a neighbour of
+Measured on the client's five acceptance photos and five others, before rule 4: every neighbour
+plane is dropped, and no target plane is. Rule 4 has not been re-measured on those photos; a
+neighbour's roof seen above the target's, within its width, is now kept. What neither geometry nor colour tells apart is a neighbour of
 the same roofing material that shares a real outline with the target's porch or wing: it stays,
 and one tap takes it out. Rules 2 and 3 also misjudge, by design, a plane of the house's own
 roof that the photo's edge cuts off (dropped) and a large neighbour wholly in the photo that
@@ -199,6 +206,21 @@ def select(masks: list[np.ndarray], image=None) -> list[bool]:
             keep.append(True)
         else:
             keep.append(_inside_share(small[index], x0, x1) >= INSIDE_SHARE)
+
+    # Rule 4: a house is one column of the photo. Neighbours stand beside it; anything above or
+    # below the house's own roofs is the same house: an upper storey or a turret behind a wall,
+    # which shares no outline with the roofs below it and so never joined across a seam. Judged
+    # against every plane kept so far, repeated until nothing changes. A plane the frame cuts off
+    # still goes, as in rule 3.
+    changed = True
+    while changed:
+        changed = False
+        _, x0, x1 = _extent(small, [i for i in range(count) if keep[i]])
+        for index in range(count):
+            if not keep[index] and not cut[index] and small[index].any() \
+                    and _inside_share(small[index], x0, x1) >= INSIDE_SHARE:
+                keep[index] = True
+                changed = True
     return keep
 
 

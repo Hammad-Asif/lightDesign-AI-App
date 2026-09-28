@@ -1,3 +1,13 @@
+"""Partition mode, run by the reference implementation itself.
+
+The product's own port of the method (services/partition.py) can never be pixel-identical to
+the reference project it was ported from. When `partition_engine` is "reference", the roof
+lines come from the reference package (`roofline`, installed from
+/Users/samibutt/Documents/freelance/roof-detection), fed exactly what the reference app feeds it:
+a working copy made with OpenCV INTER_AREA at a long edge of 2000, the SAM 3 instances that
+came back for that copy, and the reference's own foliage and vanishing-point steps. Nothing
+runs on top afterwards except the instruction's side/edge filter in the router.
+"""
 
 from __future__ import annotations
 

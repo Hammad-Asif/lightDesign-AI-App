@@ -56,6 +56,9 @@ SNAP_ALREADY_ON = 0.9           # the line already sits on an edge this strong (
 PLANE_TOLERANCE_L = 0.01
 PLANE_EXCLUDED_SHARE = 0.6
 PLANE_KEPT_SHARE = 0.25
+# ... and only when this little of it lies within the house's columns: vertically in line with the
+# kept roofs is the same house, only a line beside them can be a neighbour's.
+PLANE_WITHIN_HOUSE_SHARE = 0.5
 # Corners: reach, the least angle two lines need to make a corner, and how much a line may shrink.
 CORNER_REACH_L = 0.012
 CORNER_MIN_ANGLE_DEG = 15.0
@@ -262,6 +265,14 @@ class Context:
         flags = self.keep if self.keep is not None else [True] * len(self.roof_masks)
         chosen = [m for m, k in zip(self.roof_masks, flags) if bool(k) == kept]
         return np.logical_or.reduce(chosen) if chosen else None
+
+    def house_columns(self) -> tuple[int, int] | None:
+        """The left-right span (first, last column) of the house's kept planes, or None."""
+        if "columns" not in self._maps:
+            kept = self.plane_masks(True)
+            columns = np.flatnonzero(kept.any(axis=0)) if kept is not None else np.zeros(0, int)
+            self._maps["columns"] = (int(columns[0]), int(columns[-1])) if columns.size else None
+        return self._maps["columns"]
 
     def kept_distance(self) -> np.ndarray | None:
         return self._distance("kept", self.plane_masks(True))
@@ -513,11 +524,14 @@ def assign_facade_by_adjacency(lines: list[RoofLine], ctx: Context) -> None:
 
 
 def plane_filter(line: RoofLine, ctx: Context) -> bool:
-    """Keep a V3 line unless it plainly lies on a plane that is not the target house's.
+    """Keep a V3 line unless it plainly lies on a neighbour's roof.
 
     Tolerant by design: V3 sees the photo, SAM's masks are approximate, and a real roof edge can
-    sit several pixels outside a mask. Only a line mostly on excluded planes and hardly on the
-    house is rejected; a line near no plane at all (a roof SAM missed) is kept.
+    sit several pixels outside a mask. A line is rejected only when it lies mostly on excluded
+    planes, hardly on the house's, AND mostly outside the house's columns (the left-right span of
+    its kept planes, within the tolerance). Neighbours stand beside the house; a line above or
+    below its roofs is the same house even when the selection left that plane out (an upper
+    storey, a turret). A line near no plane at all (a roof SAM missed) is kept.
     """
     excluded = ctx.excluded_distance()
     kept = ctx.kept_distance()
@@ -532,6 +546,12 @@ def plane_filter(line: RoofLine, ctx: Context) -> bool:
     line.evidence["plane"] = {"on_excluded": round(on_excluded, 3), "on_kept": round(on_kept, 3),
                               "distance_to_mask": round(float(np.median(to_kept)), 1) if np.isfinite(to_kept).any() else None}
     if on_excluded >= PLANE_EXCLUDED_SHARE and on_kept < PLANE_KEPT_SHARE:
+        columns = ctx.house_columns()
+        within = float(np.mean((coords[:, 0] >= columns[0] - tolerance) & (coords[:, 0] <= columns[1] + tolerance)))             if columns is not None else 0.0
+        line.evidence["plane"]["within_house_width"] = round(within, 3)
+        if within >= PLANE_WITHIN_HOUSE_SHARE:
+            line.plane_status = "kept:within_house_width"
+            return True
         line.plane_status = "rejected:excluded_plane"
         log.info("%s rejected: reason=excluded_plane distance_to_mask=%s on_excluded=%.2f",
                  line.source_id, line.evidence["plane"]["distance_to_mask"], on_excluded)
