@@ -4,6 +4,7 @@ Independent of the detection pipeline, so it can compare different detector buil
 
     from tests.score import load_targets, score, PAIRS
 """
+import os
 import re
 from pathlib import Path
 
@@ -11,7 +12,9 @@ import cv2
 import numpy as np
 from PIL import Image, ImageOps
 
-PHOTOS = Path("/imgs")
+# The annotated photos. `api/imgs` was removed when the V3 detector landed, so the set lives
+# outside the repo now; point EVAL_PHOTOS at whichever copy you are scoring against.
+PHOTOS = Path(os.environ.get("EVAL_PHOTOS", "/imgs"))
 CLEAN_DIR = PHOTOS / "truth_clean"     # cleaned annotations win when present
 MAX_EDGE, MIN_EDGE = 1280, 1000
 TOLERANCE = 8.0

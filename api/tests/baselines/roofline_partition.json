@@ -1,0 +1,99 @@
+{
+  "config": {
+    "detect_blockers": true,
+    "edge_extractor": "partition",
+    "interior_hips": false,
+    "partition_constrained_snap": true,
+    "partition_engine": "port",
+    "partition_junctions": true,
+    "partition_snap": false,
+    "snap_to_edges": true
+  },
+  "mean": {
+    "f1": 58.1,
+    "photos": 6,
+    "precision": 64.4,
+    "recall": 55.8,
+    "spans": 131
+  },
+  "photos": {
+    "Sechtor 2": {
+      "edges": {
+        "eave": 9,
+        "hip": 14,
+        "rake": 10
+      },
+      "f1": 37.8,
+      "flooded": false,
+      "points": 66,
+      "precision": 53.3,
+      "recall": 29.3,
+      "spans": 33
+    },
+    "Sechtor1.jpg": {
+      "edges": {
+        "eave": 9,
+        "hip": 16,
+        "rake": 7
+      },
+      "f1": 72.3,
+      "flooded": false,
+      "points": 64,
+      "precision": 61.4,
+      "recall": 87.9,
+      "spans": 32
+    },
+    "house01": {
+      "edges": {
+        "eave": 4,
+        "hip": 3,
+        "rake": 14
+      },
+      "f1": 61.5,
+      "flooded": false,
+      "points": 42,
+      "precision": 59.8,
+      "recall": 63.3,
+      "spans": 21
+    },
+    "house02": {
+      "edges": {
+        "eave": 6,
+        "hip": 4,
+        "rake": 14
+      },
+      "f1": 39.8,
+      "flooded": false,
+      "points": 52,
+      "precision": 56.1,
+      "recall": 30.9,
+      "spans": 24
+    },
+    "house04": {
+      "edges": {
+        "eave": 3
+      },
+      "f1": 76.7,
+      "flooded": false,
+      "points": 6,
+      "precision": 92.6,
+      "recall": 65.4,
+      "spans": 3
+    },
+    "house05": {
+      "edges": {
+        "eave": 6,
+        "hip": 9,
+        "rake": 3
+      },
+      "f1": 60.7,
+      "flooded": false,
+      "points": 36,
+      "precision": 63.2,
+      "recall": 58.3,
+      "spans": 18
+    }
+  },
+  "prompt": "i want c9 bulb on roofline",
+  "tolerance": 8.0
+}
