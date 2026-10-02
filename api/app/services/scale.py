@@ -16,10 +16,13 @@ Lines, by edge:
     lengths measured along the eave itself are unaffected.)
   - rake: on its gable wall, never the wall of the eave it meets. The gable wall is the facade
     whose level direction the line joining the two rake feet runs toward; with one rake in view,
-    the facade other than its eave's.
+    the facade other than its eave's. A "rake" no second rake meets at a peak, rising from an
+    eave's end to a ridge's or hip's end, is a hip roof's corner that detection mislabelled: it
+    is placed by rule (b), and says so. Drawing the other rake makes it a gable again.
   - ridge, hip, valley, by the first rule that applies, each stating its assumption:
-      (a) a ridge ending at a gable apex (the top of a placed rake, which is on the gable wall)
-          or at a hip top: exact. It runs level from there toward its facade's vanishing point.
+      (a) a ridge ending at a gable peak (two placed rakes meeting) or at a hip top. Anchored at
+          both ends, it runs between the two; at one, level from it toward its facade's vanishing
+          point. Exact only from gable peaks; from a hip top, as sure as the hip.
       (b) a hip rising from an eave corner: adjacent faces share one pitch, so the hip lies over
           the corner's bisector in plan; its top is the camera ray meeting that vertical plane.
       (c) otherwise: the roof face rises from the nearest placed eave at the photo's estimated
@@ -40,6 +43,10 @@ IMPLAUSIBLE_PITCH = (1.0, 24.0)  # rise per 12: a hip outside this breaks rule (
 LEVEL = {"eave", "junction", "ridge"}
 RAKE_PAIR_RATIO = 2.0           # two rakes this unequal in the photo are not one gable's two sides
 TYPED_LENGTH_RATIO = 2.0        # a typed length this far off what the photo suggests is questioned
+# A house's eaves along the measured wall span at most this, in feet. Wider, and the reference is
+# more likely wrong than the house (a window typed as 16 ft made a one-storey front 112 ft). No
+# lower bound: the eaves in view may be one short piece, which says nothing about the house.
+PLAUSIBLE_WALL_FT = 100.0
 
 EXACT, STATED, ASSUMED = "exact", "stated", "assumed"
 
@@ -79,9 +86,11 @@ class Solution:
     walls: dict = field(default_factory=dict)   # facade -> {"distance_in", "source"}
     lines: dict = field(default_factory=dict)   # line id -> Placed
     needs: str | None = None
+    warning: str | None = None                  # the measurement makes the house implausible, in words
 
     def to_dict(self) -> dict:
-        return {"walls": self.walls, "lines": {k: v.to_dict() for k, v in self.lines.items()}, "needs": self.needs}
+        return {"walls": self.walls, "lines": {k: v.to_dict() for k, v in self.lines.items()}, "needs": self.needs,
+                "warning": self.warning}
 
 
 # -- small geometry ---------------------------------------------------------------------------------
@@ -97,7 +106,10 @@ def _length(points3d: list[np.ndarray]) -> float:
 
 
 def _on_plane(camera: Camera, pixel, normal: np.ndarray, offset: float) -> np.ndarray | None:
-    return camera.on_wall(pixel, normal, offset)
+    """Where the pixel's ray meets the plane, or None when that is behind the camera: a plane the
+    ray meets only behind the lens is not what the photo shows at that pixel."""
+    point = camera.on_wall(pixel, normal, offset)
+    return point if point is not None and float(point[2]) > 0 else None
 
 
 def _closest_on_line(camera: Camera, pixel, origin: np.ndarray, direction: np.ndarray) -> np.ndarray:
@@ -147,13 +159,11 @@ def _ends_meet(a: list[float], b: list[float], reach: float) -> bool:
     return float(np.hypot(a[0] - b[0], a[1] - b[1])) <= reach
 
 
-def _gable_facade(camera: Camera, rake: Line, lines: list[Line], reach: float, tolerance: float) -> str | None:
-    """The facade of the wall a rake lies on. Two rakes meeting at an apex: the facade their feet's
-    joining line runs toward. One rake: the facade other than that of the eave at its foot."""
-    if len(camera.facades) <= 1:
-        return camera.facades[0] if camera.facades else "front"
+def _rake_pairs(rake: Line, lines: list[Line], reach: float) -> list[tuple[list[float], list[float]]]:
+    """The gable peaks a rake makes with other rakes: (its foot, the other rake's foot) for each."""
     ends = [rake.points[0], rake.points[-1]]
     span = float(np.hypot(ends[1][0] - ends[0][0], ends[1][1] - ends[0][1]))
+    pairs = []
     for other in lines:
         if other is rake or other.edge != "rake":
             continue
@@ -166,10 +176,36 @@ def _gable_facade(camera: Camera, rake: Line, lines: list[Line], reach: float, t
             for theirs, their_other in ((other.points[0], other.points[-1]), (other.points[-1], other.points[0])):
                 apex = mine[1] <= ends[1 - i][1] and theirs[1] <= their_other[1]
                 if apex and _ends_meet(mine, theirs, reach):
-                    foot, other_foot = ends[1 - i], their_other
-                    found = camera.facade_of(foot, other_foot, tolerance)
-                    if found:
-                        return found
+                    pairs.append((ends[1 - i], their_other))
+    return pairs
+
+
+def _reads_as_hip(rake: Line, lines: list[Line], reach: float) -> bool:
+    """A rake rising from an eave's end to a ridge's or hip's end, with no other rake ending at its
+    top, is a hip roof's corner. A gable's peak always has the other slope coming down from it,
+    even when detection broke that slope into pieces of any size; a hip roof's corner never does."""
+    ends = [rake.points[0], rake.points[-1]]
+    top = 0 if ends[0][1] <= ends[1][1] else 1
+
+    def meets(end, edges) -> bool:
+        return any(other is not rake and other.edge in edges and
+                   any(_ends_meet(end, tip, reach) for tip in (other.points[0], other.points[-1]))
+                   for other in lines)
+
+    return (not meets(ends[top], ("rake",)) and meets(ends[1 - top], ("eave", "junction"))
+            and meets(ends[top], ("ridge", "hip")))
+
+
+def _gable_facade(camera: Camera, rake: Line, lines: list[Line], reach: float, tolerance: float) -> str | None:
+    """The facade of the wall a rake lies on. Two rakes meeting at an apex: the facade their feet's
+    joining line runs toward. One rake: the facade other than that of the eave at its foot."""
+    if len(camera.facades) <= 1:
+        return camera.facades[0] if camera.facades else "front"
+    ends = [rake.points[0], rake.points[-1]]
+    for foot, other_foot in _rake_pairs(rake, lines, reach):
+        found = camera.facade_of(foot, other_foot, tolerance)
+        if found:
+            return found
     eave_facades = {e.side for e in lines if e.edge in ("eave", "junction") and e.side
                     and any(_ends_meet(end, tip, reach) for end in ends for tip in (e.points[0], e.points[-1]))}
     others = [f for f in camera.facades if f not in eave_facades]
@@ -237,20 +273,29 @@ def solve(camera: Camera, lines: list[Line], measurement: dict | None, interpret
             pixels = reference.points if reference else None
         else:
             pixels = measurement.get("points")
-        unit = [_on_plane(camera, p, normal, 1.0) for p in pixels] if normal is not None and pixels else None
+        # The wall stands in front of the camera: its offset takes the sign that puts the measured
+        # points there. (The wrong sign mirrors the house through the lens: lengths survive, but
+        # up and down swap, and every rule asking which end of a line is the top goes wrong.)
+        sign = 1.0
+        if normal is not None and pixels:
+            sign = 1.0 if float(normal @ camera.ray(pixels[0])) > 0 else -1.0
+        unit = [_on_plane(camera, p, normal, sign) for p in pixels] if normal is not None and pixels else None
         if unit is None or any(p is None for p in unit) or _length(unit) <= 0:
             solution.needs = "measurement_wall"
         else:
-            solution.walls[facade] = {"distance_in": float(measurement["length_in"]) / _length(unit),
+            solution.walls[facade] = {"distance_in": sign * float(measurement["length_in"]) / _length(unit),
                                       "source": "measured"}
             measured_facade = facade
 
-    # Each line's wall: its facade's for eaves and junctions, its gable's for rakes.
+    # Each line's wall: its facade's for eaves and junctions, its gable's for rakes. A rake that reads
+    # as a hip (no peak, eave end to ridge end) is placed by the hip rule instead, never on a wall.
+    as_hip = {line.id for line in lines if line.edge == "rake" and line.id != reference_id
+              and _reads_as_hip(line, lines, reach)}
     wall_of: dict[str, str] = {}
     for line in lines:
         if line.edge in ("eave", "junction") and line.side in normals:
             wall_of[line.id] = line.side
-        elif line.edge == "rake":
+        elif line.edge == "rake" and line.id not in as_hip:
             gable = _gable_facade(camera, line, lines, reach, tolerance_deg)
             if gable in normals:
                 wall_of[line.id] = gable
@@ -281,6 +326,12 @@ def solve(camera: Camera, lines: list[Line], measurement: dict | None, interpret
                                 if point is not None:
                                     candidates.setdefault(other, []).append(float(normals[other] @ point))
             for other, values in candidates.items():
+                # Every point of a wall in view lies on one side of the camera. Corners that put the
+                # wall through the camera, or on both sides of it, are corners of some other wall
+                # (a misread line), and a median of them is a plane through the lens.
+                values = [v for v in values if abs(v) > 1.0]
+                if not values or (min(values) < 0 < max(values)):
+                    continue
                 solution.walls[other] = {"distance_in": float(np.median(values)), "source": "corner"}
                 changed = True
 
@@ -314,23 +365,30 @@ def solve(camera: Camera, lines: list[Line], measurement: dict | None, interpret
     up = world_up(camera)
     rise, rise_source = pitch_hint(interpreted)
 
-    def anchored_ends() -> list[tuple[list[float], np.ndarray, str]]:
-        """Placed 3-D points a ridge or hip can hang from: (pixel, point, what it is)."""
+    def anchored_ends() -> list[tuple[list[float], np.ndarray, str, str]]:
+        """Placed 3-D points a ridge can hang from: (pixel, point, what it is, how sure). Only a
+        gable peak, two rakes meeting on their gable wall, is exact; a lone rake's top is as sure
+        as the wall it was put on, and a hip's top is as sure as the hip."""
         out = []
         for line in lines:
             done = placed.get(line.id)
-            if not done or not done.points3d:
+            if not done or not done.points3d or done.method == "override":
                 continue
-            if line.edge == "rake":
-                # The apex is the rake's top end: the higher of its two ends in the world.
-                top = max(range(len(done.points3d)), key=lambda i: float(done.points3d[i] @ up))
-                out.append((line.points[top], done.points3d[top], "apex"))
-            elif line.edge == "hip":
-                top = max(range(len(done.points3d)), key=lambda i: float(done.points3d[i] @ up))
-                out.append((line.points[top], done.points3d[top], "hip top"))
+            top = max(range(len(done.points3d)), key=lambda i: float(done.points3d[i] @ up))
+            if line.edge == "rake" and done.method in ("gable", "measured", "wall"):
+                # A peak: another rake, of any size, comes down from this top.
+                if any(other is not line and other.edge == "rake" and
+                       any(_ends_meet(line.points[top], tip, reach) for tip in (other.points[0], other.points[-1]))
+                       for other in lines):
+                    out.append((line.points[top], done.points3d[top], "gable peak",
+                                EXACT if not focal_note else STATED))
+                else:
+                    out.append((line.points[top], done.points3d[top], "rake top", STATED))
+            elif line.edge == "hip" or done.method == "hip":
+                out.append((line.points[top], done.points3d[top], "hip top", done.confidence or STATED))
         return out
 
-    # (b) hips from eave corners.
+    # (b) hips from eave corners, and rakes that read as hips.
     eave_ends = []
     for line in lines:
         done = placed.get(line.id)
@@ -338,7 +396,7 @@ def solve(camera: Camera, lines: list[Line], measurement: dict | None, interpret
             level = _unit(done.points3d[-1] - done.points3d[0])
             eave_ends += [(line.points[0], done.points3d[0], level), (line.points[-1], done.points3d[-1], level)]
     for line in lines:
-        if line.edge != "hip" or line.id in placed:
+        if (line.edge != "hip" and line.id not in as_hip) or line.id in placed:
             continue
         for i, end in enumerate((line.points[0], line.points[-1])):
             corner = next(((pix, point, level) for pix, point, level in eave_ends if _ends_meet(end, pix, reach)), None)
@@ -364,31 +422,85 @@ def solve(camera: Camera, lines: list[Line], measurement: dict | None, interpret
             implied = 12.0 * float((top - base) @ up) / run if run > 1e-9 else float("inf")
             points = [base, top] if i == 0 else [top, base]
             confidence = STATED if IMPLAUSIBLE_PITCH[0] <= implied <= IMPLAUSIBLE_PITCH[1] else ASSUMED
+            if line.id in as_hip and confidence == ASSUMED:
+                break   # no believable hip either: it stays a rake, below
             placed[line.id] = Placed(
                 line.id, points, _length(points), "over the corner bisector", "hip",
-                assumption=f"adjacent roof faces share one pitch (implies {implied:.1f}/12)"
+                assumption=("marked rake, but no second rake meets it at a peak, so it is read as a hip; "
+                            "draw the other rake if this is a gable. " if line.id in as_hip else "")
+                + f"adjacent roof faces share one pitch (implies {implied:.1f}/12)"
                 + (f"; {focal_note}" if focal_note else ""),
                 confidence=confidence)
             break
 
-    # (a) ridges from an apex or a hip top, level toward their facade's vanishing point.
-    anchors = anchored_ends()
+    # A rake read as a hip that the hip rule could not place (no placed eave at its foot) goes
+    # back to the rake rule: its gable wall.
     for line in lines:
-        if line.edge != "ridge" or line.id in placed or line.side not in normals:
+        if line.id not in as_hip or line.id in placed:
             continue
-        level = camera.direction(camera.horizontal[camera.facades.index(line.side)]) if camera.horizontal else None
-        for i, end in enumerate((line.points[0], line.points[-1])):
-            anchor = next(((pix, point, what) for pix, point, what in anchors if _ends_meet(end, pix, reach)), None)
-            if anchor is None or level is None:
+        gable = _gable_facade(camera, line, lines, reach, tolerance_deg)
+        if gable not in normals:
+            continue
+        if gable not in solution.walls:
+            # Its wall was never reached, since it was not a rake then: through its foot's corner.
+            values = []
+            for end in (line.points[0], line.points[-1]):
+                for eave, done in placed.items():
+                    if eave in by_id and done.wall in solution.walls and by_id[eave].edge in ("eave", "junction"):
+                        tips = (by_id[eave].points[0], by_id[eave].points[-1])
+                        for tip in tips:
+                            if _ends_meet(end, tip, reach):
+                                corner = [(end[0] + tip[0]) / 2, (end[1] + tip[1]) / 2]
+                                point = _on_plane(camera, corner, normals[done.wall],
+                                                  solution.walls[done.wall]["distance_in"])
+                                if point is not None and abs(float(normals[gable] @ point)) > 1.0:
+                                    values.append(float(normals[gable] @ point))
+            if not values or min(values) < 0 < max(values):
                 continue
-            _, start, what = anchor
+            solution.walls[gable] = {"distance_in": float(np.median(values)), "source": "corner"}
+        wall_of[line.id] = gable
+        placed[line.id] = on_wall(line, gable, "gable", f"{gable} gable wall")
+
+    # (a) ridges from a gable peak or a hip top. Anchored at both ends: the two anchors, so a small
+    # move of either end cannot swap which one decides. At one end: level from it toward the
+    # ridge's facade's vanishing point. Exact only from gable peaks; from a hip, as sure as the hip.
+    anchors = anchored_ends()
+    rank = {EXACT: 0, STATED: 1, ASSUMED: 2}
+
+    def anchor_at(pixel):
+        found = [a for a in anchors if _ends_meet(pixel, a[0], reach)]
+        return min(found, key=lambda a: np.hypot(a[0][0] - pixel[0], a[0][1] - pixel[1])) if found else None
+
+    for line in lines:
+        if line.edge != "ridge" or line.id in placed:
+            continue
+        ends = (anchor_at(line.points[0]), anchor_at(line.points[-1]))
+        if ends[0] is not None and ends[1] is not None and ends[0][1] is not ends[1][1]:
+            points = [ends[0][1], ends[1][1]]
+            whats = sorted({ends[0][2], ends[1][2]})
+            confidence = max(ends[0][3], ends[1][3], key=rank.get)
+            assumption = None if whats == ["gable peak"] else "from a hip, which assumes one pitch"
+            notes = [n for n in (assumption, focal_note) if n]
+            placed[line.id] = Placed(line.id, points, _length(points), f"between the {' and the '.join(whats)}s"
+                                     if len(whats) == 1 else f"between the {whats[0]} and the {whats[1]}", "ridge",
+                                     assumption="; ".join(notes) or None, confidence=confidence)
+            continue
+        if line.side not in normals or not camera.horizontal:
+            continue
+        level = camera.direction(camera.horizontal[camera.facades.index(line.side)])
+        for i in (0, 1):
+            anchor = ends[i]
+            if anchor is None:
+                continue
+            _, start, what, sure = anchor
             other = line.points[-1] if i == 0 else line.points[0]
             finish = _closest_on_line(camera, other, start, level)
             points = [start, finish] if i == 0 else [finish, start]
+            assumption = {"gable peak": None, "rake top": "a lone rake's wall, no gable peak in view"}.get(
+                what, "from a hip, which assumes one pitch")
+            notes = [n for n in (assumption, focal_note) if n]
             placed[line.id] = Placed(line.id, points, _length(points), f"level from the {what}", "ridge",
-                                     assumption=focal_note if what == "apex" else
-                                     "from a hip, which assumes one pitch" + (f"; {focal_note}" if focal_note else ""),
-                                     confidence=EXACT if what == "apex" and not focal_note else STATED)
+                                     assumption="; ".join(notes) or None, confidence=sure)
             break
 
     # (c) the rest of the ridges, hips and valleys: the face rising from the nearest eave.
@@ -442,4 +554,25 @@ def solve(camera: Camera, lines: list[Line], measurement: dict | None, interpret
             reason = "measurement" if not solution.walls else ("side" if line.side is None else "override")
             placed[line.id] = Placed(line.id, needs=reason)
     solution.lines = placed
+    if measured_facade:
+        solution.warning = _implausible_wall(camera, measured_facade, lines, placed)
     return solution
+
+
+def _implausible_wall(camera: Camera, facade: str, lines: list[Line], placed: dict) -> str | None:
+    """A sentence when the measured wall's eaves span wider than a house; None otherwise. The span
+    is along the wall, end to end over every eave on it, so a broken eave counts whole."""
+    points = [point for line in lines if line.edge in ("eave", "junction")
+              for done in [placed.get(line.id)] if done and done.wall == facade and done.points3d
+              and done.method in ("wall", "measured") for point in done.points3d]
+    if len(points) < 2 or not camera.horizontal or facade not in camera.facades:
+        return None
+    level = _unit(camera.direction(camera.horizontal[camera.facades.index(facade)]))
+    along = [float(point @ level) for point in points]
+    feet = (max(along) - min(along)) / 12.0
+    if feet <= PLAUSIBLE_WALL_FT:
+        return None
+    return (f"This measurement makes the {facade} of the house {feet:.0f} ft wide, which is "
+            f"more than a house usually is. Check the length you typed, "
+            f"or measure something of a known size instead: a single garage door is about 9 ft, "
+            f"a double 16 ft, an entry door 80 in tall.")

@@ -19,7 +19,7 @@ await page.addInitScript(() => localStorage.setItem("ld-tool-guides-seen",
 page.on("console", (m) => m.type() === "error" && errors.push(m.text()));
 page.on("pageerror", (e) => errors.push(String(e)));
 
-await page.goto("http://127.0.0.1:5173/", { waitUntil: "networkidle" });
+await page.goto(process.env.UI_URL ?? "http://127.0.0.1:5173/", { waitUntil: "networkidle" });
 
 // Every photo belongs to an account, so start by registering a fresh one.
 await page.getByRole("button", { name: "New here? Create an account" }).click();
@@ -49,7 +49,7 @@ writeFileSync(`${OUT}/house.png`, Buffer.from(png));
 await page.setInputFiles('input[type="file"]', `${OUT}/house.png`);
 await page.fill("textarea", "manual masking demo");
 await page.getByRole("button", { name: "Continue" }).click();
-await page.waitForSelector("text=Choose masking mode", { timeout: 20000 });
+await page.waitForSelector("text=Check the instruction", { timeout: 20000 });
 
 await page.getByRole("button", { name: /Manual/ }).click();
 await page.waitForSelector(".sidebar", { timeout: 20000 });
@@ -85,9 +85,13 @@ check("roofline created without any detection", (await page.locator(".region[dat
 const firstLabel = await page.locator(".region[data-geometry='line'] input").first().inputValue();
 check(`created region is a roofline ("${firstLabel}")`, firstLabel.toLowerCase().includes("roof"));
 check("it is marked manual", (await page.locator(".region[data-geometry='line']").innerText()).includes("manual"));
-// A hand-drawn roofline is not known to be an eave, rake or ridge, so it must be flagged.
-check("hand-drawn roofline is flagged as an unidentified edge",
-  (await page.locator(".region[data-geometry='line'][data-edge='unknown'] .unknown-note").count()) === 1);
+// A hand-drawn roofline gets a suggested type, shown in the picker for the salesperson to confirm.
+check("hand-drawn roofline opens the type picker", (await page.locator(".edge-picker").count()) === 1);
+check("a type is suggested for it",
+  (await page.locator(".edge-picker .chip.on").count()) === 1 &&
+  (await page.locator(".region[data-geometry='line'][data-edge='unknown']").count()) === 0);
+await page.locator(".edge-picker").getByRole("button", { name: "Done" }).click();
+check("Done closes the picker", (await page.locator(".edge-picker").count()) === 0);
 await page.screenshot({ path: `${OUT}/12-roofline-added.png` });
 
 // Paint an obstruction across the roofline: the stretch behind it must be reported as hidden.

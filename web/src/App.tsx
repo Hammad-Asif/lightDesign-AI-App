@@ -7,7 +7,8 @@ import { Auth } from "./components/Auth";
 import { ModeChooser } from "./components/ModeChooser";
 import { Products } from "./components/Products";
 import { ThemeToggle, type Theme } from "./components/ThemeToggle";
-import { needsOverride, RegionPanel } from "./components/RegionPanel";
+import { EdgePicker } from "./components/EdgePicker";
+import { EDGE_COLORS, needsOverride, RegionPanel } from "./components/RegionPanel";
 import { ToolDock, ViewportControls } from "./components/Toolbar";
 import { Upload } from "./components/Upload";
 import { Specification } from "./components/Specification";
@@ -48,6 +49,8 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   // A neutral message, e.g. that Find in Box found nothing new. Not an error.
   const [notice, setNotice] = useState<string | null>(null);
+  // A roof line just drawn, waiting for its type to be confirmed; `picked` once someone chose.
+  const [typing, setTyping] = useState<{ id: string; picked: boolean } | null>(null);
   // Development (ROOFLINE_DEBUG): the pipeline stage whose roof lines are drawn over the photo.
   const [debugStage, setDebugStage] = useState<string | null>(null);
   const [drawingKind, setDrawingKind] = useState<RegionKind | null>(null);
@@ -359,7 +362,8 @@ export default function App() {
       setNotice(
         `Scale set from ${formatLength(measurement.length_in)} on the ${side} side. ` +
           `${measured} ${measured === 1 ? "line" : "lines"} measured` +
-          (waiting ? `; ${waiting} ${waiting === 1 ? "needs" : "need"} attention (marked ? on the photo).` : "."),
+          (waiting ? `; ${waiting} ${waiting === 1 ? "needs" : "need"} attention (marked ? on the photo).` : ".") +
+          (found.warning ? ` ${found.warning}` : ""),
       );
     });
   };
@@ -391,6 +395,9 @@ export default function App() {
       // A kind change can turn an area into, or out of, something lines pass behind.
       if (patch.kind) setPhoto(await api.getPhoto(photo.id));
       else mergeRegion(saved);
+      // A line's type, side or visibility decides which confirmed requests light it.
+      if (design && ("edge" in patch || "side" in patch || "visible" in patch || "kind" in patch))
+        setDesign(await api.getDesign(photo.id));
     });
 
   const handleDelete = (id: string) =>
@@ -403,6 +410,7 @@ export default function App() {
     });
 
   const handleAdd = (kind: RegionKind) => {
+    setTyping(null);
     if (geometryOf(kind) === "line") {
       setDrawingKind((current) => (current === kind ? null : kind));
       setTool("line");
@@ -421,16 +429,15 @@ export default function App() {
   const handleDrawFinish = (polyline: number[][]) =>
     guard(async () => {
       if (!photo || !drawingKind) return;
-      const region = await api.createRegion(photo.id, {
-        kind: drawingKind,
-        geometry: "line",
-        side: "front",
-        polyline,
-      });
+      // No side sent: the server reads it from the house's vanishing points, snaps the ends onto
+      // the lines they meet, and suggests the roof line's type for the picker.
+      const region = await api.createRegion(photo.id, { kind: drawingKind, geometry: "line", polyline });
       setDrawingKind(null);
       setPhoto(await api.getPhoto(photo.id));
       setActiveId(region.id);
       setTool("vertex");
+      if (region.kind === "roof") setTyping({ id: region.id, picked: false });
+      if (design) setDesign(await api.getDesign(photo.id));
     });
 
   const chooseTool = (next: Tool) => {
@@ -471,6 +478,9 @@ export default function App() {
   const active = photo?.regions.find((item) => item.id === activeId);
   // Only a photo detected with TARGET_HOUSE_ONLY on has roof planes to tap.
   const houseAvailable = Boolean(photo?.interpreted?.target?.planes?.length);
+  // The picker belongs to the photo the line was drawn on.
+  useEffect(() => setTyping(null), [photo?.id]);
+  const typingRegion = (typing && !photo?.approved && photo?.regions.find((region) => region.id === typing.id)) || null;
   const requests = photo?.interpreted?.requests ?? [];
   const attention = requests.filter((r) => r.problems.length > 0 || !r.settings).length;
 
@@ -529,6 +539,17 @@ export default function App() {
         <div className="notice" onClick={() => setNotice(null)}>
           {notice}
         </div>
+      )}
+      {typingRegion && (
+        <EdgePicker
+          region={typingRegion}
+          suggested={!typing?.picked}
+          onPick={(edge) => {
+            setTyping({ id: typingRegion.id, picked: true });
+            void handlePatch(typingRegion.id, { edge, ...(EDGE_COLORS[edge] ? { color: EDGE_COLORS[edge] } : {}) });
+          }}
+          onDone={() => setTyping(null)}
+        />
       )}
 
       {(!(photo && photo.mode) || showProducts) && (
@@ -739,6 +760,7 @@ export default function App() {
                     placement={placement?.regions}
                     measurement={photo.scale?.measurement ?? null}
                     referenceEdited={Boolean(geometry?.reference_edited)}
+                    scaleWarning={geometry?.warning ?? null}
                     lens={geometry?.camera.focal_source ?? photo.interpreted?.camera?.focal_source ?? null}
                     onMeasure={photo.approved ? undefined : () => chooseTool("measure")}
                     onOverride={photo.approved ? undefined : handleOverride}

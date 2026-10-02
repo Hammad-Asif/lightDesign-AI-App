@@ -70,7 +70,7 @@ def _shrink(masks: list[np.ndarray]) -> list[np.ndarray]:
     return [cv2.resize(m.astype(np.uint8), size, interpolation=cv2.INTER_NEAREST).astype(bool) for m in masks]
 
 
-def _cut_by_frame(mask: np.ndarray) -> bool:
+def cut_by_frame(mask: np.ndarray) -> bool:
     band = max(1, round(FRAME_FRACTION * mask.shape[1]))
     return bool(mask[:, :band].any() or mask[:, -band:].any())
 
@@ -175,7 +175,7 @@ def select(masks: list[np.ndarray], image=None) -> list[bool]:
     small = _shrink(masks)
     if not any(m.any() for m in small):
         return [True] * count
-    cut = [_cut_by_frame(m) for m in small]
+    cut = [cut_by_frame(m) for m in small]
     seed = _seed(small, cut)
     seams, copies = _links(small)
     colours = _roof_colours(small, image)

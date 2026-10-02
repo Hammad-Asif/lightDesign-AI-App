@@ -11,8 +11,10 @@ from app.providers.base import get_provider
 from app.schemas import (
     CreateRegionRequest, DetectRequest, FindLinesRequest, PhotoDetail, RefineRequest, Region, RegionPatch, TargetTap,
 )
+from app.routers import photos as photos_router
 from app.services import (
-    camera, detect, fusion, intent, lighting, occlusion, partition, partition_reference, roofline, rooflines, snap, target,
+    camera, detect, drawn, fusion, intent, lighting, occlusion, partition, partition_reference, roofline, rooflines,
+    snap, target,
 )
 from app.storage import Store, get_store, photo_dict, region_dict
 
@@ -650,20 +652,37 @@ def create_region(photo_id: str, body: CreateRegionRequest, store: Store = Depen
     if body.geometry == "line" and not body.polyline:
         raise HTTPException(400, "A line region needs a polyline")
 
+    polyline, side = body.polyline, body.side
+    # Eave, rake and ridge only mean something on a roof; a driveway or fence line carries no edge.
+    edge = None
+    if body.geometry == "line" and body.kind == "roof":
+        # A hand-drawn roofline joins the lines already there and gets a suggested type and side,
+        # shown with the type picker (services/drawn.py). Without a camera there is no level test.
+        roofs = [r for r in store.regions(photo) if r.geometry == "line" and r.kind == "roof" and r.polyline]
+        size = (photo.width, photo.height)
+        polyline = [[round(v) for v in point]
+                    for point in drawn.snap(body.polyline, [r.polyline for r in roofs], size)]
+        try:
+            found = photos_router._camera(store, photo)
+        except Exception:  # noqa: BLE001 - a suggestion never blocks drawing a line
+            log.exception("no camera for a drawn line on %s", photo.id)
+            found = None
+        edge, suggested_side = drawn.suggest(polyline, [(r.polyline, r.edge, r.side) for r in roofs], found, size)
+        side = body.side or suggested_side
+
     region = RegionRow(
         id=uuid.uuid4(),
         kind=body.kind,
         label=body.label or detect.LABELS.get(body.kind, "Region"),
         geometry=body.geometry,
         source="manual",
-        color=body.color or detect.COLORS.get(body.kind, detect.COLORS["custom"]),
+        color=body.color or (detect.EDGE_COLORS.get(edge) if edge else None)
+        or detect.COLORS.get(body.kind, detect.COLORS["custom"]),
         score=1.0,
         visible=True,
-        side=body.side,
-        # Eave, rake and ridge only mean something on a roof. A hand-drawn roofline is not known
-        # to be any of them, so say so; a driveway or fence line carries no edge type at all.
-        edge="unknown" if body.geometry == "line" and body.kind == "roof" else None,
-        polyline=body.polyline,
+        side=side,
+        edge=edge,
+        polyline=polyline,
         mask_url=None,
     )
     if body.geometry == "area":
@@ -673,6 +692,9 @@ def create_region(photo_id: str, body: CreateRegionRequest, store: Store = Depen
     region = store.add_region(photo, region)
     if region.geometry == "line" or _blocks(region.kind):
         store.refresh_hidden(photo)
+    if region.geometry == "line" and region.kind == "roof":
+        # Confirmed lighting reaches the new line the way it reached the detected ones.
+        _relight(store, photo)
     return region_dict(region)
 
 
@@ -692,6 +714,9 @@ def patch_region(
         setattr(region, name, value)
 
     store.save()
+    if region.geometry == "line" and updates.keys() & {"edge", "side", "kind", "visible"}:
+        # A line given its type (or side) now matches the confirmed requests that name it.
+        _relight(store, photo)
     if "kind" in updates and _blocks(updates["kind"]) and region.geometry == "area":
         # Something just became an object in front of the house: mend the lines behind it.
         store.rejoin_behind_blockers(photo)

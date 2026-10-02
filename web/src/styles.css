@@ -144,6 +144,19 @@ label.dropzone:focus-within {
   cursor: pointer;
 }
 
+.edge-picker {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  background: var(--surface);
+  color: var(--text);
+  border-bottom: 1px solid var(--line);
+  padding: 8px 16px;
+  font-size: 13.5px;
+}
+.edge-picker .spacer { flex: 1; }
+
 .notice {
   background: var(--surface);
   color: var(--text);

@@ -239,3 +239,117 @@ def test_a_typed_length_far_from_what_the_photo_suggests_is_questioned():
     assert slip.length_in == 24 and slip.warning.startswith("2 ft seems short") and "30 ft" in slip.warning
     right = scale.solve(cam, [eave, odd], measurement, overrides={"odd": {"length_in": 31 * 12}}).lines["odd"]
     assert right.warning is None
+
+
+def _front_hip_roof(shot, front, *, corners_as="rake"):
+    """A 40 x 30 ft hip roof seen nearly front-on: one front eave, both corners, the ridge."""
+    return [shot.line("eave", (0, 10, 0), (40, 10, 0), "eave", front),
+            shot.line("left", (0, 10, 0), (15, 17.5, 15), corners_as, None),
+            shot.line("right", (40, 10, 0), (25, 17.5, 15), corners_as, None),
+            shot.line("ridge", (15, 17.5, 15), (25, 17.5, 15), "ridge", front)]
+
+
+@pytest.mark.parametrize("yaw, x", [(-8.0, 20.0), (-12.0, 30.0)])
+def test_hip_corners_marked_as_rakes_are_placed_as_hips_and_their_ridge_is_not_exact(yaw, x):
+    """Regression (client test, hip roof): the corners came from detection as rakes. With no second
+    rake at a peak they were put on a side wall (10 ft 5 in for a ~22 ft hip), and the ridge they
+    met was called exact."""
+    shot = Shot(yaw_deg=yaw, centre=(x, 14.0, -70.0))
+    cam, front, _ = facade_names(shot)
+    lines = _front_hip_roof(shot, front)
+    reference = {"facade": front, "points": [shot.pixel((12, 4, 0)), shot.pixel((28, 4, 0))], "length_in": 16 * FT}
+    got = scale.solve(cam, lines, reference).lines
+    for name, (a, b) in {"left": ((0, 10, 0), (15, 17.5, 15)), "right": ((40, 10, 0), (25, 17.5, 15))}.items():
+        assert got[name].method == "hip" and got[name].confidence == "stated"
+        assert got[name].assumption.startswith("marked rake, but no second rake meets it at a peak")
+        assert got[name].length_in == pytest.approx(true_length(a, b), rel=0.01)
+    assert got["ridge"].plane == "between the hip tops" and got["ridge"].confidence == "stated"
+    assert got["ridge"].length_in == pytest.approx(10 * FT, rel=0.01)
+
+
+def test_a_small_move_of_a_ridge_end_does_not_swing_its_length():
+    shot = Shot(yaw_deg=-8.0, centre=(20.0, 14.0, -70.0))
+    cam, front, _ = facade_names(shot)
+    lines = _front_hip_roof(shot, front)
+    reference = {"facade": front, "points": [shot.pixel((12, 4, 0)), shot.pixel((28, 4, 0))], "length_in": 16 * FT}
+    before = scale.solve(cam, lines, reference).lines["ridge"]
+    reach = scale.CORNER_REACH_FRACTION * max(W, H)
+    ridge = lines[3]
+    span = ridge.points[1][0] - ridge.points[0][0]
+
+    def moved(dx):
+        line = Line("ridge", [[ridge.points[0][0] + dx, ridge.points[0][1]], ridge.points[1]], "ridge", front)
+        return scale.solve(cam, lines[:3] + [line], reference).lines["ridge"]
+
+    # Within reach of the hip top the end still hangs from it: nothing changes.
+    for dx in (-0.5 * reach, 0.5 * reach):
+        after = moved(dx)
+        assert after.confidence == before.confidence == "stated"
+        assert after.length_in == pytest.approx(before.length_in, rel=1e-6)
+    # Past it, the length follows the move, by as much as the move is, and no more.
+    after = moved(1.5 * reach)
+    assert after.confidence == "stated"
+    assert after.length_in == pytest.approx(before.length_in * (span - 1.5 * reach) / span, rel=0.05)
+
+
+def test_a_gable_peak_still_makes_its_ridge_exact_and_a_lone_rake_top_does_not():
+    shot = Shot()
+    cam, front, side = facade_names(shot)
+    eave = shot.line("eave", (0, 10, 0), (40, 10, 0), "eave", front)
+    rake1 = shot.line("rake1", (40, 10, 0), (40, 17.5, 15), "rake", None)
+    rake2 = shot.line("rake2", (40, 17.5, 15), (40, 10, 30), "rake", None)
+    ridge = shot.line("ridge", (0, 17.5, 15), (40, 17.5, 15), "ridge", front)
+    measurement = {"facade": front, "points": eave.points, "length_in": 40 * FT}
+    peak = scale.solve(cam, [eave, rake1, rake2, ridge], measurement).lines
+    assert peak["rake1"].method == "gable" and peak["ridge"].confidence == "exact"
+    # The far rake hidden: no peak in view, so the ridge is not exact any more. The near rake runs
+    # straight back along the side wall, which as a hip would imply an impossible pitch: it stays
+    # a rake on that wall, and still measures right.
+    lone = scale.solve(cam, [eave, rake1, ridge], measurement).lines
+    assert lone["rake1"].method == "gable" and lone["rake1"].wall == side
+    assert lone["rake1"].length_in == pytest.approx(true_length((40, 10, 0), (40, 17.5, 15)), rel=0.01)
+    assert lone["ridge"].confidence != "exact"
+
+
+def test_a_wall_whose_normal_faces_away_still_puts_the_house_in_front_of_the_camera():
+    """Regression (photos 14851699, 38623ee6): with the measured wall's normal pointing away from
+    the camera, every point came out behind it. Lengths survived the mirror; which end of a line
+    is its top did not, so ridges hung from rake feet."""
+    shot = Shot()
+    cam, front, _ = facade_names(shot)
+    flipped = camera_module.Camera.from_dict(cam.to_dict())
+    flipped.horizontal = [-np.asarray(v, float) if i == 0 else v for i, v in enumerate(flipped.horizontal)]
+    assert float(flipped.wall_normal(front) @ cam.wall_normal(front)) < 0
+    eave = shot.line("eave", (0, 10, 0), (40, 10, 0), "eave", front)
+    for camera in (cam, flipped):
+        got = scale.solve(camera, [eave], {"facade": front, "points": eave.points, "length_in": 40 * FT})
+        points = got.lines["eave"].points3d
+        assert all(p[2] > 0 for p in points)
+        assert got.lines["eave"].length_in == pytest.approx(40 * FT, rel=1e-6)
+
+
+def test_a_wall_is_not_inherited_from_corners_that_put_it_through_the_camera():
+    shot = Shot()
+    cam, front, side = facade_names(shot)
+    eave = shot.line("eave", (0, 10, 0), (40, 10, 0), "eave", front)
+    # Two lines claimed for the side wall, meeting the front eave at both of its ends: only one of
+    # those corners can be on the side wall, and the two readings straddle the camera.
+    a = Line("a", [eave.points[0], [eave.points[0][0] - 40, eave.points[0][1] - 60]], "junction", side)
+    b = Line("b", [eave.points[1], [eave.points[1][0] + 40, eave.points[1][1] - 60]], "junction", side)
+    solved = scale.solve(cam, [eave, a, b], {"facade": front, "points": eave.points, "length_in": 40 * FT})
+    wall = solved.walls.get(side)
+    assert wall is None or abs(wall["distance_in"]) > 1.0
+
+
+def test_a_reference_that_makes_the_house_implausibly_wide_is_flagged():
+    """Client test: a window about 6 ft wide typed as 16 ft made the one-storey front 112 ft."""
+    shot = Shot(yaw_deg=-8.0, centre=(20.0, 14.0, -70.0))
+    cam, front, _ = facade_names(shot)
+    lines = _front_hip_roof(shot, front, corners_as="hip")
+    window = [shot.pixel((17, 6, 0)), shot.pixel((23, 6, 0))]       # 6 ft wide
+    right = scale.solve(cam, lines, {"facade": front, "points": window, "length_in": 6 * FT})
+    assert right.warning is None and right.to_dict()["warning"] is None
+    wrong = scale.solve(cam, lines, {"facade": front, "points": window, "length_in": 16 * FT})
+    assert wrong.warning.startswith("This measurement makes the front of the house 107 ft wide")
+    # Too small is not flagged: the eaves in view may be one short piece of the house.
+    assert scale.solve(cam, lines, {"facade": front, "points": window, "length_in": 12}).warning is None

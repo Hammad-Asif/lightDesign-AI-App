@@ -195,6 +195,8 @@ export interface PhotoGeometry {
   walls: Partial<Record<Side, { distance_in: number; source: "measured" | "corner" }>>;
   lines: Record<string, LineGeometry>;
   needs: string | null;
+  // The measurement makes the house wider than a house is, in words: the reference is likely wrong.
+  warning?: string | null;
   camera: { focal_source: "vp" | "exif" | "assumed"; focal_35mm: number; facades: Side[] };
 }
 

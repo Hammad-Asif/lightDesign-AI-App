@@ -281,6 +281,15 @@ class Context:
     def excluded_distance(self) -> np.ndarray | None:
         return self._distance("excluded", self.plane_masks(False))
 
+    def cut_excluded_distance(self) -> np.ndarray | None:
+        """Distance to the excluded planes the photo's left or right edge cuts off: neighbours, by
+        target.select's own rule, wherever they stand, never an upper storey of the house."""
+        if "cut_excluded" not in self._maps:
+            flags = self.keep if self.keep is not None else [True] * len(self.roof_masks)
+            chosen = [m for m, k in zip(self.roof_masks, flags) if not k and m.any() and target.cut_by_frame(m)]
+            return self._distance("cut_excluded", np.logical_or.reduce(chosen) if chosen else None)
+        return self._maps["cut_excluded"]
+
     def boundary_distance(self) -> np.ndarray | None:
         """Distance to the outline of any house plane: where roof edges, hips and ridges lie."""
         if "boundary" not in self._maps:
@@ -550,6 +559,15 @@ def plane_filter(line: RoofLine, ctx: Context) -> bool:
         columns = ctx.house_columns()
         within = float(np.mean((coords[:, 0] >= columns[0] - tolerance) & (coords[:, 0] <= columns[1] + tolerance)))             if columns is not None else 0.0
         line.evidence["plane"]["within_house_width"] = round(within, 3)
+        # A neighbour the frame cuts off often stands behind the house's far corner, inside its
+        # columns. Its planes never join the house (target.select), so neither do its lines.
+        cut = ctx.cut_excluded_distance()
+        on_cut = float(np.mean(ctx.lookup(cut, coords) <= tolerance)) if cut is not None else 0.0
+        line.evidence["plane"]["on_cut_neighbour"] = round(on_cut, 3)
+        if on_cut >= PLANE_EXCLUDED_SHARE:
+            line.plane_status = "rejected:cut_neighbour_plane"
+            log.info("%s rejected: reason=cut_neighbour_plane on_cut=%.2f", line.source_id, on_cut)
+            return False
         if within >= PLANE_WITHIN_HOUSE_SHARE:
             line.plane_status = "kept:within_house_width"
             return True

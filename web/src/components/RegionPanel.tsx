@@ -27,6 +27,8 @@ interface Props {
   // The photo's scale: the saved measurement, where the lens came from, and opening Measure.
   measurement?: Measurement | null;
   referenceEdited?: boolean;
+  // The measurement makes the house implausibly wide (GET /geometry's warning).
+  scaleWarning?: string | null;
   lens?: "vp" | "exif" | "assumed" | null;
   onMeasure?: () => void;
 }
@@ -38,10 +40,11 @@ const LENS: Record<string, string> = {
 };
 
 // What the photo's scale is, and whether every roof line has a real length yet.
-function ScaleSummary({ roofLines, geometry, measurement, lens, onMeasure, onSelect, activeId, edited }: {
+function ScaleSummary({ roofLines, geometry, measurement, lens, onMeasure, onSelect, activeId, edited, warning }: {
   roofLines: Region[];
   activeId: string | null;
   edited?: boolean;
+  warning?: string | null;
   geometry?: Record<string, LineGeometry>;
   measurement?: Measurement | null;
   lens?: string | null;
@@ -74,6 +77,7 @@ function ScaleSummary({ roofLines, geometry, measurement, lens, onMeasure, onSel
       {edited && (
         <p className="warn-text">The line you measured has been edited since, and the scale moved with it. Check its length.</p>
       )}
+      {warning && <p className="warn-text">{warning}</p>}
       <p className="muted">
         {measured} {measured === 1 ? "line" : "lines"} measured
         {waiting.length > 0 && (
@@ -339,6 +343,7 @@ export function RegionPanel({
   lens,
   onMeasure,
   referenceEdited,
+  scaleWarning,
 }: Props) {
   const targets = regions.filter((region) => region.role !== "blocker");
   // A line is lit when it is visible: detected-but-unrequested edges (ridges, roof meeting wall)
@@ -560,6 +565,7 @@ export function RegionPanel({
         onSelect={onSelect}
         activeId={activeId}
         edited={referenceEdited}
+        warning={scaleWarning}
       />
       <h2>
         Lines to light <span className="count">{lit.length}</span>
