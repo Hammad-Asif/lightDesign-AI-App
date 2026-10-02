@@ -26,6 +26,9 @@ if (health.segmentation_provider !== "mock") {
 
 const browser = await chromium.launch();
 const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
+// Tool guides (components/ToolGuide.tsx) open on a tool's first use; these checks are about the tools.
+await page.addInitScript(() => localStorage.setItem("ld-tool-guides-seen",
+  JSON.stringify(["select", "brush", "erase", "vertex", "move", "box", "click", "find", "measure", "wreath", "house"])));
 page.on("console", (m) => m.type() === "error" && errors.push(m.text()));
 page.on("pageerror", (e) => errors.push(String(e)));
 
@@ -46,6 +49,19 @@ const png = await page.evaluate(async () => {
   const ctx = canvas.getContext("2d");
   ctx.fillStyle = "#7fa6cc";
   ctx.fillRect(0, 0, 1200, 800);
+  // Sides come only from vanishing points, so the house needs perspective: siding that runs
+  // toward a far vanishing point on the right, as a front-on facade's level lines do.
+  ctx.fillStyle = "#e1d7be";
+  ctx.fillRect(170, 340, 860, 300);
+  ctx.strokeStyle = "#786955";
+  ctx.lineWidth = 2;
+  const [vx, vy] = [30000, 240];
+  for (let y = 352; y < 636; y += 14) {
+    ctx.beginPath();
+    ctx.moveTo(170, y);
+    ctx.lineTo(1030, y + (860 * (vy - y)) / (vx - 170));
+    ctx.stroke();
+  }
   ctx.fillStyle = "#8a6a52";
   ctx.beginPath();
   ctx.moveTo(120, 340);

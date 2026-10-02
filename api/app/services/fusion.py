@@ -25,6 +25,7 @@ Rules this module keeps:
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -908,6 +909,7 @@ class Result:
     details: dict                    # partition's details (pitch, planes)
     report: dict                     # photo.interpreted.roofline
     debug: dict | None               # photo.interpreted.roofline_debug (ROOFLINE_DEBUG only)
+    scene: partition.Scene | None = None  # the target house's vanishing points (services/camera.py)
 
 
 PartitionLines = Callable[[object], tuple[list[tuple], list[tuple], dict]]
@@ -1048,12 +1050,21 @@ def unify(
         spans: list[tuple] = []
         unrequested: list[tuple] = []
         if partition_lines is not None:
-            spans, unrequested, details = partition_lines(parsed)
+            # The side filter is applied below, once sides come from the vanishing points; the
+            # partition's own sides are plane-slope labels.
+            spans, unrequested, details = partition_lines(dataclasses.replace(parsed, sides=[]))
         inferred_keys = set(details.get("inferred", set()) or set())
         final = [normalize_partition_line(s, i, inferred_keys) for i, s in enumerate(spans + unrequested, 1)]
-        requested = [i < len(spans) for i in range(len(final))]
         for line in final:
             assign_vanishing_point(line, ctx)
+        # Sides come from the vanishing points, as V3's do (refine_v3), never from the partition's
+        # own plane-slope label: a line with no facade has no side, and is kept for review.
+        assign_facade_by_adjacency(final, ctx)
+        for line in final:
+            line.side = line.facade
+        requested = [i < len(spans) and _wanted(line, parsed) for i, line in enumerate(final)]
+        order = sorted(range(len(final)), key=lambda i: (not requested[i],))
+        final, requested = [final[i] for i in order], [requested[i] for i in order]
         recorder.counts["partition"] = {"lines": len(final)}
         recorder.stage("P_partition", final)
 
@@ -1080,7 +1091,7 @@ def unify(
     report["confidence_levels"] = {"high": settings.roofline_confidence_high, "low": settings.roofline_confidence_low}
     log.info("roof lines from %s: %s", report["roof_lines_from"], _count_line(recorder.counts))
     final_inferred = {tuple(map(tuple, line.int_points())) for line in final if line.inferred}
-    return Result(final, requested, final_inferred, details, report, recorder.export())
+    return Result(final, requested, final_inferred, details, report, recorder.export(), ctx.scene)
 
 
 def _count_line(counts: dict) -> str:

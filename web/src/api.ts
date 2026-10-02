@@ -2,7 +2,10 @@ import type {
   Design,
   DesignRequest,
   Edge,
+  PhotoGeometry,
+  Placement,
   MaskingMode,
+  Measurement,
   PaletteColour,
   Photo,
   PhotoDetail,
@@ -10,6 +13,7 @@ import type {
   ProductDraft,
   Region,
   RegionKind,
+  ScaleOverride,
   Side,
   User,
 } from "./types";
@@ -110,6 +114,24 @@ export const findLinesInBox = (id: string, box: number[]) =>
 // from the stored planes, with no detection call.
 export const tapHousePlane = (id: string, point: number[]) =>
   send<PhotoDetail>(`/photos/${id}/target`, "POST", { point });
+
+// The one known length that gives the photo real scale; null clears it.
+export const putScale = (id: string, measurement: Measurement | null) =>
+  send<Photo>(`/photos/${id}/scale`, "PUT", { measurement });
+
+// Every roof line's real length and how it was placed; computed on request, never billed.
+export const getGeometry = (id: string) => send<PhotoGeometry>(`/photos/${id}/geometry`, "GET");
+
+// Every bulb of the confirmed lighting, placed by the camera; computed on request, never billed.
+export const getPlacement = (id: string) => send<Placement>(`/photos/${id}/placement`, "GET");
+
+// A wreath where the salesperson tapped, drawn at its real size.
+export const addWreath = (id: string, point: number[], size_in = 36) =>
+  send<PhotoDetail>(`/photos/${id}/wreaths`, "POST", { point, size_in });
+
+// A line's hand-placed middle and length; null clears it.
+export const putOverride = (id: string, regionId: string, override: ScaleOverride | null) =>
+  send<Photo>(`/photos/${id}/scale/overrides/${regionId}`, "PUT", override);
 
 // Re-reads the instruction (a new one when given) without detecting anything: reading is free.
 export const interpret = (id: string, prompt?: string) =>

@@ -23,7 +23,7 @@ export type Side = "front" | "left" | "right";
 export type Edge = "eave" | "rake" | "hip" | "ridge" | "valley" | "junction" | "unknown";
 export type MaskingMode = "manual" | "automatic";
 // "find": Find in Box — drag a box where detection missed roof lines; the server detects inside it.
-export type Tool = "select" | "brush" | "erase" | "vertex" | "move" | "box" | "line" | "click" | "house" | "find";
+export type Tool = "select" | "brush" | "erase" | "vertex" | "move" | "box" | "line" | "click" | "house" | "find" | "measure" | "wreath";
 
 // "blocker" is something standing in front of the house — a palm, a tree, a car. It is detected
 // so a line passing behind it can be joined up and reported, and it is never lit itself.
@@ -70,6 +70,8 @@ export interface Product {
   bulb_count: number | null;
   // Icicle drop lengths, repeating along the strand.
   drops_in: number[];
+  // Mini lights on an area: bulbs per 10 sq ft at the "medium" preset.
+  density_per_10sqft?: number | null;
   colours: string[];
   twinkle: boolean;
   // A picture of the product, or null. Uploaded separately, not part of the JSON body.
@@ -162,6 +164,88 @@ export interface Interpreted {
   roofline?: RooflineReport | null;
   // ROOFLINE_DEBUG only: the lines at every stage of the pipeline, for development.
   roofline_debug?: RooflineDebug | null;
+  // The pinhole camera the photo's vanishing points give; what scale and placement use.
+  camera?: CameraInfo | null;
+}
+
+export interface CameraInfo {
+  focal_px: number;
+  focal_35mm: number;
+  // vp: read from the photo's perspective; exif: the photo's own data; assumed: a typical phone lens.
+  focal_source: "vp" | "exif" | "assumed";
+  facades: Side[];
+}
+
+// One roof line in real units, from GET /photos/{id}/geometry. `method` says how it was placed and
+// `assumption` what that needed; `needs` says why a line could not be placed.
+export interface LineGeometry {
+  length_in: number | null;
+  plane: string | null;
+  method: "measured" | "wall" | "gable" | "ridge" | "hip" | "pitch" | "override" | "none";
+  // A typed length the photo disagrees with, in words.
+  warning?: string | null;
+  assumption: string | null;
+  confidence: "exact" | "stated" | "assumed" | null;
+  needs: "measurement" | "measurement_wall" | "side" | "override" | "length" | "anchor" | "edge_on" | null;
+}
+
+export interface PhotoGeometry {
+  // The line the scale was measured on has been edited since: the scale moved with it.
+  reference_edited?: boolean;
+  walls: Partial<Record<Side, { distance_in: number; source: "measured" | "corner" }>>;
+  lines: Record<string, LineGeometry>;
+  needs: string | null;
+  camera: { focal_source: "vp" | "exif" | "assumed"; focal_35mm: number; facades: Side[] };
+}
+
+// The bulbs of one lit region (GET /photos/{id}/placement): [x, y, drawn diameter px, colour, hidden].
+// Hidden bulbs are counted and never drawn. `needs` says why a region has none yet.
+export interface RegionPlacement {
+  bulbs?: [number, number, number, string, boolean][];
+  count?: number;
+  hidden?: number;
+  path?: number;
+  path_length_in?: number;
+  drops?: number[][];
+  band?: number[][];
+  needs?: string;
+  // Areas: an estimate the salesperson can replace (canopies, fronds, hedges, trunk strands).
+  estimated?: boolean;
+  estimate?: number;
+  area_sqft?: number;
+  density?: "light" | "medium" | "heavy";
+  strand_ft?: number;
+  strand_estimate_ft?: number;
+  strand_set?: boolean;
+  trunk?: { diameter_in: number; height_ft: number; turns: number };
+  scale_from?: string;
+  // Wreaths: [x, y, diameter px] of the ring, and its size.
+  ring?: number[];
+  size_in?: number;
+}
+
+export interface Placement {
+  regions: Record<string, RegionPlacement>;
+  needs: string | null;
+}
+
+// A line the geometry cannot place: its real middle dragged onto it, and its typed length.
+export interface ScaleOverride {
+  mid?: number[];
+  length_in?: number;
+  count?: number;
+  density?: "light" | "medium" | "heavy";
+  strand_ft?: number;
+  at?: number[];
+  size_in?: 24 | 36 | 48;
+}
+
+// The salesperson's one known length: two points on a feature, or a line (an eave).
+export interface Measurement {
+  points?: number[][];
+  region_id?: string;
+  length_in: number;
+  facade?: Side | null;
 }
 
 export interface RooflineReport {
@@ -222,6 +306,8 @@ export interface Photo {
   mode: MaskingMode | null;
   approved: boolean;
   interpreted: Interpreted | null;
+  focal_35mm?: number | null;
+  scale?: { measurement?: Measurement; overrides?: Record<string, ScaleOverride> } | null;
 }
 
 export interface PhotoDetail extends Photo {

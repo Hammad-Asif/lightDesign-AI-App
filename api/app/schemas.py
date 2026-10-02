@@ -90,6 +90,10 @@ class Interpreted(BaseModel):
     roofline: dict | None = None
     # ROOFLINE_DEBUG only: every stage's lines and each V3 line's lifecycle, for diagnosis.
     roofline_debug: dict | None = None
+    # The pinhole camera behind the photo, from the target house's vanishing points: focal length
+    # and where it came from (vp | exif | assumed), principal point, and each vanishing point in
+    # photo pixels with its facade. Stored at detection; services/camera.py.
+    camera: dict | None = None
 
 
 class Photo(BaseModel):
@@ -101,6 +105,10 @@ class Photo(BaseModel):
     mode: MaskingMode | None = None
     approved: bool = False
     interpreted: Interpreted | None = None
+    # The upload's EXIF focal length (35 mm equivalent), when it carried one.
+    focal_35mm: float | None = None
+    # The salesperson's known length: {"measurement": Measurement}. See PUT /photos/{id}/scale.
+    scale: dict | None = None
 
 
 class PhotoDetail(Photo):
@@ -129,6 +137,57 @@ class FindLinesRequest(BaseModel):
     """Find in Box: a box the user drew, in photo pixels (x0, y0, x1, y1), to detect roof lines in."""
 
     box: list[int] = Field(min_length=4, max_length=4)
+
+
+class Measurement(BaseModel):
+    """One known length that gives the photo real scale: two tapped points on a feature, or a
+    detected or drawn line (an eave), and its real length. `facade` is the wall it lies on; left
+    out, it is read from the vanishing point the two points run toward, or the line's side."""
+
+    points: list[list[int]] | None = Field(default=None, min_length=2, max_length=2)
+    region_id: str | None = None
+    length_in: float = Field(gt=0, le=12000)
+    facade: Side | None = None
+
+    @model_validator(mode="after")
+    def one_reference(self):
+        if (self.points is None) == (self.region_id is None):
+            raise ValueError("Give either two points or a line, not both")
+        if self.points is not None and any(len(p) != 2 for p in self.points):
+            raise ValueError("Each point is [x, y]")
+        if self.points is not None and self.points[0] == self.points[1]:
+            raise ValueError("The two points must be different")
+        return self
+
+
+class ScaleOverride(BaseModel):
+    """The salesperson's corrections to one region's placement; any may be left out.
+
+    Lines: `mid`, the real midpoint dragged onto the drawn line, and `length_in`, for a line no
+    vanishing point or plane places. Areas lit with mini lights: `count` replaces the estimate
+    and `density` picks the product's preset. Palm trunks: `strand_ft` replaces the estimated
+    strand length. Wreaths: `at` (where it was tapped) and `size_in`."""
+
+    mid: list[int] | None = Field(default=None, min_length=2, max_length=2)
+    length_in: float | None = Field(default=None, gt=0, le=12000)
+    count: int | None = Field(default=None, ge=0, le=100_000)
+    density: Literal["light", "medium", "heavy"] | None = None
+    strand_ft: float | None = Field(default=None, gt=0, le=1000)
+    at: list[int] | None = Field(default=None, min_length=2, max_length=2)
+    size_in: Literal[24, 36, 48] | None = None
+
+
+class WreathRequest(BaseModel):
+    """A wreath where the salesperson tapped, in photo pixels (Lukas: no automatic placement)."""
+
+    point: list[int] = Field(min_length=2, max_length=2)
+    size_in: Literal[24, 36, 48] = 36
+
+
+class ScalePut(BaseModel):
+    """Replace the photo's measurement; null clears it."""
+
+    measurement: Measurement | None
 
 
 class TargetTap(BaseModel):
@@ -201,6 +260,8 @@ class ProductBase(BaseModel):
     drops_in: list[Inches] = Field(default=[], max_length=24)
     colours: list[str] = Field(default=[], max_length=12)
     twinkle: bool = False
+    # Mini lights on an area: bulbs per 10 sq ft at the "medium" preset.
+    density_per_10sqft: float | None = Field(default=None, gt=0, le=10_000)
 
 
 class ProductCreate(ProductBase):
@@ -224,6 +285,7 @@ class ProductPatch(BaseModel):
     drops_in: list[Inches] | None = Field(default=None, max_length=24)
     colours: list[str] | None = Field(default=None, max_length=12)
     twinkle: bool | None = None
+    density_per_10sqft: float | None = Field(default=None, gt=0, le=10_000)
 
 
 class Product(ProductBase):

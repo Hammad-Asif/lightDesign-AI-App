@@ -10,7 +10,8 @@ import {
 } from "react";
 
 import { fileUrl } from "../api";
-import { LOW_CONFIDENCE, type Photo, type Region, type Tool } from "../types";
+import { formatLength } from "../components/MeasurePanel";
+import { LOW_CONFIDENCE, type LineGeometry, type Photo, type Region, type RegionPlacement, type Tool } from "../types";
 import {
   createLayer,
   ctx2d,
@@ -62,6 +63,21 @@ interface Props {
   onDrawCancel: () => void;
   // Development: draw the roof lines as they were at one stage of the pipeline (ROOFLINE_DEBUG).
   debugStage?: string | null;
+  // Measure tool: two tapped points on a feature, or (mode "line") a tap that picks a line.
+  measureMode?: "points" | "line";
+  measurePoints?: number[][];
+  onMeasureTap?: (point: number[]) => void;
+  // A line the geometry cannot place: a handle at its real middle, dragged along it. `mid` is the
+  // saved one, or null for the drawn middle.
+  overrideLine?: { regionId: string; mid: number[] | null } | null;
+  onOverrideMid?: (regionId: string, mid: number[]) => void;
+  // The confirmed lighting's bulbs, by region id, drawn over the lines they light.
+  bulbs?: Record<string, RegionPlacement> | null;
+  // Wreath tool: a tap places a wreath there.
+  onWreathTap?: (point: number[]) => void;
+  // Each roof line's real length (GET /photos/{id}/geometry), drawn on the line when showLengths.
+  geometry?: Record<string, LineGeometry> | null;
+  showLengths?: boolean;
 }
 
 type Snapshot =
@@ -76,6 +92,8 @@ type Drag =
   // line keeps its angle. `limit` stops the end being dragged back past its neighbour.
   | { mode: "endpoint"; regionId: string; index: number; origin: number[][]; axis: number[]; limit: number }
   | { mode: "box"; start: number[] }
+  // The midpoint handle of an overridden line, slid along that line.
+  | { mode: "mid"; regionId: string }
   | null;
 
 export const MaskCanvas = forwardRef<MaskCanvasHandle, Props>(function MaskCanvas(
@@ -99,6 +117,15 @@ export const MaskCanvas = forwardRef<MaskCanvasHandle, Props>(function MaskCanva
     onDrawFinish,
     onDrawCancel,
     debugStage = null,
+    measureMode = "points",
+    measurePoints = [],
+    onMeasureTap,
+    overrideLine = null,
+    onOverrideMid,
+    bulbs = null,
+    onWreathTap,
+    geometry = null,
+    showLengths = false,
   },
   ref,
 ) {
@@ -121,6 +148,37 @@ export const MaskCanvas = forwardRef<MaskCanvasHandle, Props>(function MaskCanva
 
   const photoRef = useRef(photo);
   const obstaclesRef = useRef(showObstacles);
+  const measureRef = useRef(measurePoints);
+  measureRef.current = measurePoints;
+  const bulbsRef = useRef(bulbs);
+  bulbsRef.current = bulbs;
+  const lengthsRef = useRef(showLengths ? geometry : null);
+  lengthsRef.current = showLengths ? geometry : null;
+  const overrideRef = useRef(overrideLine);
+  overrideRef.current = overrideLine;
+  const midDraftRef = useRef<number[] | null>(null);
+
+  // Where the midpoint handle sits: being dragged, saved, or the drawn line's own middle.
+  const handleAt = (): number[] | null => {
+    const target = overrideRef.current;
+    const line = target && regionsRef.current.find((r) => r.id === target.regionId)?.polyline;
+    if (!target || !line || line.length < 2) return null;
+    if (midDraftRef.current) return midDraftRef.current;
+    if (target.mid) return target.mid;
+    const [a, b] = [line[0], line[line.length - 1]];
+    return [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
+  };
+
+  // A point slid onto the line's chord, kept just inside its ends.
+  const ontoLine = (point: number[]): number[] | null => {
+    const target = overrideRef.current;
+    const line = target && regionsRef.current.find((r) => r.id === target.regionId)?.polyline;
+    if (!line || line.length < 2) return null;
+    const [a, b] = [line[0], line[line.length - 1]];
+    const [dx, dy] = [b[0] - a[0], b[1] - a[1]];
+    const t = Math.min(0.95, Math.max(0.05, ((point[0] - a[0]) * dx + (point[1] - a[1]) * dy) / (dx * dx + dy * dy || 1)));
+    return [a[0] + t * dx, a[1] + t * dy];
+  };
   regionsRef.current = regions;
   activeRef.current = activeId;
   photoRef.current = photo;
@@ -192,6 +250,103 @@ export const MaskCanvas = forwardRef<MaskCanvasHandle, Props>(function MaskCanva
         context.fillText(line.id, (start[0] + end[0]) / 2, (start[1] + end[1]) / 2 - 4 / factor);
       }
     }
+  };
+
+  // Each measured roof line's real length in a small pill at its middle, set off the line toward
+  // the sky so it covers neither the line nor its bulbs. Approximate lengths read "≈", a line that
+  // cannot be measured yet shows an amber "?". Pills never overlap: one that would is tried on
+  // the other side of its line, then left out (the sidebar still lists it). The selected line's
+  // pill is drawn last, always.
+  const drawLengths = (context: CanvasRenderingContext2D, factor: number) => {
+    const lines = lengthsRef.current;
+    if (!lines) return;
+    const size = 12 / factor;
+    const pad = 4 / factor;
+    const height = size + 2 * pad;
+    const gap = 7 / factor;
+    context.font = `600 ${size}px system-ui, -apple-system, sans-serif`;
+    context.textAlign = "center";
+    context.textBaseline = "middle";
+    const taken: number[][] = [];
+    const overlaps = (box: number[]) =>
+      taken.some((t) => box[0] < t[2] && box[2] > t[0] && box[1] < t[3] && box[3] > t[1]);
+    const pill = (box: number[], text: string, fill: string, ink: string, rim: string | null) => {
+      context.beginPath();
+      context.roundRect(box[0], box[1], box[2] - box[0], box[3] - box[1], height / 2);
+      context.fillStyle = fill;
+      context.fill();
+      if (rim) {
+        context.strokeStyle = rim;
+        context.lineWidth = 1.5 / factor;
+        context.stroke();
+      }
+      context.fillStyle = ink;
+      context.fillText(text, (box[0] + box[2]) / 2, (box[1] + box[3]) / 2 + 0.5 / factor);
+    };
+    // The salesperson's reference: amber, like its ruler, and placed first so nothing covers it.
+    const reference = photoRef.current.scale?.measurement;
+    if (reference?.points && reference.points.length >= 2) {
+      const [a, b] = [reference.points[0], reference.points[reference.points.length - 1]];
+      const text = `${formatLength(reference.length_in)} reference`;
+      const width = context.measureText(text).width + 2 * pad;
+      const cx = (a[0] + b[0]) / 2;
+      const cy = (a[1] + b[1]) / 2 - gap - height / 2;
+      const box = [cx - width / 2, cy - height / 2, cx + width / 2, cy + height / 2];
+      taken.push(box);
+      pill(box, text, "#f59e0b", "#1f2937", null);
+    }
+    const NEEDS: Record<string, string> = { side: "? side", override: "? length", length: "? length", measurement: "? measure",
+                                             measurement_wall: "? measure", anchor: "? length", edge_on: "? length" };
+    const dragging = draftRef.current?.regionId;
+    const order = regionsRef.current
+      .filter((r) => r.geometry === "line" && r.kind === "roof" && (r.polyline?.length ?? 0) >= 2 && lines[r.id])
+      .filter((r) => r.id !== dragging)
+      .sort((a, b) => Number(a.id === activeRef.current) - Number(b.id === activeRef.current));
+    for (const region of order) {
+      const line = lines[region.id];
+      const exact = line.confidence === "exact";
+      const isReference = reference?.region_id === region.id || line.method === "measured";
+      const doubtful = Boolean(line.warning);
+      const text = line.length_in != null
+        ? `${exact || isReference ? "" : "≈ "}${formatLength(line.length_in)}${isReference ? " reference" : ""}`
+        : line.needs ? NEEDS[line.needs] ?? "?" : null;
+      const shown = doubtful && text ? `${text} ?` : text;
+      if (!text) continue;
+      const points = region.polyline!;
+      // The middle by length along the line, and the line's direction there.
+      const spans = points.slice(1).map((p, i) => Math.hypot(p[0] - points[i][0], p[1] - points[i][1]));
+      let rest = spans.reduce((a, b) => a + b, 0) / 2;
+      let index = 0;
+      while (index < spans.length - 1 && rest > spans[index]) rest -= spans[index++];
+      const [a, b] = [points[index], points[index + 1]];
+      const t = spans[index] ? rest / spans[index] : 0;
+      const mid = [a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])];
+      const length = Math.hypot(b[0] - a[0], b[1] - a[1]) || 1;
+      let normal = [-(b[1] - a[1]) / length, (b[0] - a[0]) / length];
+      if (normal[1] > 0) normal = [-normal[0], -normal[1]];
+      const width = context.measureText(shown!).width + 2 * pad;
+      const active = region.id === activeRef.current;
+      const at = (side: number) => {
+        const cx = mid[0] + normal[0] * side * (gap + height / 2);
+        const cy = mid[1] + normal[1] * side * (gap + height / 2);
+        return [cx - width / 2, cy - height / 2, cx + width / 2, cy + height / 2];
+      };
+      // The sky side, else the other side; the selected line's pill is drawn even if it collides.
+      const box = [at(1), at(-1)].find((candidate) => !overlaps(candidate)) ?? (active ? at(1) : null);
+      if (!box) continue;
+      taken.push(box);
+      const needs = line.length_in == null;
+      context.globalAlpha = region.visible || active ? 1 : 0.6;
+      // A line still needing input is pale yellow with a dark amber rim: a warning, and plainly not
+      // the amber reference.
+      if (isReference) pill(box, shown!, "#f59e0b", "#1f2937", active ? "#ffffff" : null);
+      else if (needs || doubtful) pill(box, shown!, "#fde68a", "#78350f", "#b45309");
+      else pill(box, shown!, exact ? "rgba(17, 24, 39, 0.88)" : "rgba(55, 65, 81, 0.78)", exact ? "#ffffff" : "#e5e7eb",
+                active ? "#ffffff" : null);
+      context.globalAlpha = 1;
+    }
+    context.textAlign = "start";
+    context.textBaseline = "alphabetic";
   };
 
   const scale = () => {
@@ -368,6 +523,86 @@ export const MaskCanvas = forwardRef<MaskCanvasHandle, Props>(function MaskCanva
 
     if (debugStage) drawDebugStage(context, factor);
 
+    // The saved measurement, and the points of one being tapped. Amber, so it never reads as a
+    // roof line; the length sits beside it.
+    const ruler = (points: number[][], label: string | null) => {
+      context.strokeStyle = "#f59e0b";
+      context.lineWidth = 3 / factor;
+      context.beginPath();
+      points.forEach((p, i) => (i ? context.lineTo(p[0], p[1]) : context.moveTo(p[0], p[1])));
+      context.stroke();
+      for (const point of [points[0], points[points.length - 1]]) {
+        context.beginPath();
+        context.arc(point[0], point[1], 6 / factor, 0, Math.PI * 2);
+        context.fillStyle = "#ffffff";
+        context.fill();
+        context.stroke();
+      }
+      if (label) {
+        const [a, b] = [points[0], points[points.length - 1]];
+        context.font = `bold ${14 / factor}px sans-serif`;
+        context.lineWidth = 4 / factor;
+        context.strokeStyle = "rgba(0, 0, 0, 0.75)";
+        context.strokeText(label, (a[0] + b[0]) / 2 + 8 / factor, (a[1] + b[1]) / 2 - 8 / factor);
+        context.fillStyle = "#fbbf24";
+        context.fillText(label, (a[0] + b[0]) / 2 + 8 / factor, (a[1] + b[1]) / 2 - 8 / factor);
+      }
+    };
+    const saved = photoRef.current.scale?.measurement;
+    if (saved) {
+      const along = saved.region_id ? regionsRef.current.find((r) => r.id === saved.region_id)?.polyline : saved.points;
+      // With lengths shown, the reference's own pill carries its length (drawLengths).
+      if (along && along.length >= 2) ruler(along, lengthsRef.current ? null : formatLength(saved.length_in));
+    }
+    if (tool === "measure" && measureRef.current.length) {
+      const pending = measureRef.current.length === 1 && pointerRef.current
+        ? [measureRef.current[0], pointerRef.current]
+        : measureRef.current;
+      if (pending.length >= 2) ruler(pending, null);
+      else ruler([pending[0], pending[0]], null);
+    }
+
+    // The bulbs: garland bands under their lights, icicle drops as thin wires, then each bulb at
+    // its placed size and colour. Hidden ones (behind an object) are counted, never drawn.
+    for (const placed of Object.values(bulbsRef.current ?? {})) {
+      if (placed.ring) {
+        const [x, y, diameter] = placed.ring;
+        context.strokeStyle = "rgba(34, 92, 44, 0.9)";
+        context.lineWidth = diameter * 0.16;
+        context.beginPath();
+        context.arc(x, y, diameter * 0.42, 0, Math.PI * 2);
+        context.stroke();
+      }
+      if (placed.band && placed.band.length > 1) {
+        context.strokeStyle = "rgba(34, 92, 44, 0.55)";
+        context.lineCap = "round";
+        context.lineWidth = placed.band.reduce((sum, b) => sum + b[2], 0) / placed.band.length;
+        context.beginPath();
+        placed.band.forEach((b, i) => (i ? context.lineTo(b[0], b[1]) : context.moveTo(b[0], b[1])));
+        context.stroke();
+      }
+      context.strokeStyle = "rgba(255, 255, 255, 0.55)";
+      context.lineWidth = 1 / factor;
+      for (const [x0, y0, x1, y1] of placed.drops ?? []) {
+        context.beginPath();
+        context.moveTo(x0, y0);
+        context.lineTo(x1, y1);
+        context.stroke();
+      }
+      for (const [x, y, diameter, colour, hidden] of placed.bulbs ?? []) {
+        if (hidden) continue;
+        context.beginPath();
+        context.arc(x, y, Math.max(1.2 / factor, diameter / 2), 0, Math.PI * 2);
+        context.fillStyle = colour;
+        context.fill();
+        context.strokeStyle = "rgba(0, 0, 0, 0.55)";
+        context.lineWidth = 0.8 / factor;
+        context.stroke();
+      }
+    }
+
+    drawLengths(context, factor);
+
     if (boxRef.current) {
       const [x0, y0, x1, y1] = boxRef.current;
       context.strokeStyle = tool === "find" ? "#22d3ee" : "#f472b6";
@@ -399,6 +634,22 @@ export const MaskCanvas = forwardRef<MaskCanvasHandle, Props>(function MaskCanva
         context.lineWidth = 2 / factor;
         context.stroke();
       }
+    }
+
+    const mid = handleAt();
+    if (mid) {
+      const size = 8 / factor;
+      context.beginPath();
+      context.moveTo(mid[0], mid[1] - size);
+      context.lineTo(mid[0] + size, mid[1]);
+      context.lineTo(mid[0], mid[1] + size);
+      context.lineTo(mid[0] - size, mid[1]);
+      context.closePath();
+      context.fillStyle = "#ffffff";
+      context.fill();
+      context.strokeStyle = "#f59e0b";
+      context.lineWidth = 2.5 / factor;
+      context.stroke();
     }
 
     if (pointerRef.current && (tool === "brush" || tool === "erase")) {
@@ -458,7 +709,7 @@ export const MaskCanvas = forwardRef<MaskCanvasHandle, Props>(function MaskCanva
     };
   }, [regions, photo.width, photo.height, requestDraw]);
 
-  useEffect(requestDraw, [activeId, zoom, fitWidth, showObstacles, requestDraw]);
+  useEffect(requestDraw, [activeId, zoom, fitWidth, showObstacles, measurePoints, photo.scale, overrideLine, bulbs, geometry, showLengths, requestDraw]);
 
   useEffect(() => {
     if (!drawingColor) {
@@ -621,8 +872,26 @@ export const MaskCanvas = forwardRef<MaskCanvasHandle, Props>(function MaskCanva
       return;
     }
 
+    const mid = handleAt();
+    if (mid && overrideRef.current && Math.hypot(point[0] - mid[0], point[1] - mid[1]) <= 12 / scale()) {
+      dragRef.current = { mode: "mid", regionId: overrideRef.current.regionId };
+      midDraftRef.current = mid;
+      return;
+    }
+
     if (tool === "house") {
       onHouseTap([Math.round(point[0]), Math.round(point[1])]);
+      return;
+    }
+
+    if (tool === "wreath") {
+      onWreathTap?.([Math.round(point[0]), Math.round(point[1])]);
+      return;
+    }
+
+    if (tool === "measure") {
+      if (measureMode === "line") selectUnder(point);
+      else onMeasureTap?.([Math.round(point[0]), Math.round(point[1])]);
       return;
     }
 
@@ -761,6 +1030,8 @@ export const MaskCanvas = forwardRef<MaskCanvasHandle, Props>(function MaskCanva
         Math.round(anchor[1] + drag.axis[1] * travel),
       ];
       draftRef.current.polyline = moved;
+    } else if (drag?.mode === "mid") {
+      midDraftRef.current = ontoLine(point);
     } else if (drag?.mode === "box") {
       boxRef.current = [
         Math.min(drag.start[0], point[0]),
@@ -784,6 +1055,9 @@ export const MaskCanvas = forwardRef<MaskCanvasHandle, Props>(function MaskCanva
     ) {
       onPolylineCommit(drag.regionId, draftRef.current.polyline);
       draftRef.current = null;
+    } else if (drag?.mode === "mid" && midDraftRef.current) {
+      onOverrideMid?.(drag.regionId, midDraftRef.current.map(Math.round));
+      midDraftRef.current = null;
     } else if (drag?.mode === "box" && boxRef.current) {
       const [x0, y0, x1, y1] = boxRef.current.map(Math.round);
       boxRef.current = null;

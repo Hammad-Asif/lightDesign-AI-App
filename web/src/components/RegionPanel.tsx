@@ -2,7 +2,8 @@ import { useEffect, useRef, useState, type ReactNode } from "react";
 
 import { polylineLength } from "../canvas/layers";
 import { AREA_KINDS, KIND_COLORS, KIND_GROUPS, KIND_LABELS, LINE_KINDS } from "../types";
-import type { Edge, Region, RegionKind, Side } from "../types";
+import type { Edge, LineGeometry, Measurement, Region, RegionKind, RegionPlacement, ScaleOverride, Side } from "../types";
+import { formatLength } from "./MeasurePanel";
 
 interface Props {
   regions: Region[];
@@ -17,6 +18,99 @@ interface Props {
   ) => void;
   onDelete: (id: string) => void;
   onAdd: (kind: RegionKind) => void;
+  // Each roof line's real length and how it was placed (GET /photos/{id}/geometry), by region id.
+  geometry?: Record<string, LineGeometry>;
+  // A line the geometry cannot place: its hand-typed length (its middle is dragged on the photo).
+  onOverride?: (id: string, override: ScaleOverride | null) => void;
+  // The confirmed lighting's bulbs and counts, by region id (GET /photos/{id}/placement).
+  placement?: Record<string, RegionPlacement>;
+  // The photo's scale: the saved measurement, where the lens came from, and opening Measure.
+  measurement?: Measurement | null;
+  referenceEdited?: boolean;
+  lens?: "vp" | "exif" | "assumed" | null;
+  onMeasure?: () => void;
+}
+
+const LENS: Record<string, string> = {
+  vp: "lens read from the perspective",
+  exif: "lens from the photo's data",
+  assumed: "lens assumed, so other walls are estimates",
+};
+
+// What the photo's scale is, and whether every roof line has a real length yet.
+function ScaleSummary({ roofLines, geometry, measurement, lens, onMeasure, onSelect, activeId, edited }: {
+  roofLines: Region[];
+  activeId: string | null;
+  edited?: boolean;
+  geometry?: Record<string, LineGeometry>;
+  measurement?: Measurement | null;
+  lens?: string | null;
+  onMeasure?: () => void;
+  onSelect: (id: string) => void;
+}) {
+  if (!roofLines.length) return null;
+  if (!measurement) {
+    return (
+      <div className="scale-summary prompt">
+        <p>Measure one known length to see every line's real length and place the lights.</p>
+        {onMeasure && <button onClick={onMeasure}>Measure</button>}
+      </div>
+    );
+  }
+  const waiting = roofLines.filter((line) => geometry?.[line.id] && (geometry[line.id].length_in == null || geometry[line.id].warning));
+  const measured = roofLines.filter((line) => geometry?.[line.id]?.length_in != null).length;
+  return (
+    <div className="scale-summary">
+      <p>
+        Scale: {formatLength(measurement.length_in)}, {measurement.facade ?? "front"} side
+        {lens ? ` · ${LENS[lens]}` : ""}
+        {onMeasure && (
+          <>
+            {" "}
+            <button className="link" onClick={onMeasure}>Change</button>
+          </>
+        )}
+      </p>
+      {edited && (
+        <p className="warn-text">The line you measured has been edited since, and the scale moved with it. Check its length.</p>
+      )}
+      <p className="muted">
+        {measured} {measured === 1 ? "line" : "lines"} measured
+        {waiting.length > 0 && (
+          <>
+            {" · "}
+            <span className="warn-text">{waiting.length} {waiting.length === 1 ? "needs" : "need"} attention</span>{" "}
+            <button
+              className="link"
+              title="Select the next line that has no length yet"
+              onClick={() => {
+                const current = waiting.findIndex((line) => line.id === activeId);
+                onSelect(waiting[(current + 1) % waiting.length].id);
+              }}
+            >
+              Show
+            </button>
+          </>
+        )}
+      </p>
+    </div>
+  );
+}
+
+// Why a line has no real length yet, and what the salesperson can do about it.
+const NEEDS: Record<string, string> = {
+  measurement: "Needs a measurement on this side of the house. Use the Measure tool.",
+  measurement_wall: "The measurement's wall is not in this photo's perspective. Measure again.",
+  side: "No side of the house could be read for this line. Choose one, or set its middle and length by hand.",
+  override: "Its depth cannot be read from the photo. Drag its middle on the photo and type its length.",
+  length: "Type its real length.",
+  anchor: "Needs an eave near it to be measured from.",
+  edge_on: "Seen edge-on, so it cannot be measured.",
+};
+
+// A line whose middle and length the salesperson sets by hand.
+export function needsOverride(line: LineGeometry | undefined): boolean {
+  return Boolean(line && (line.method === "override" || (line.needs && !line.needs.startsWith("measurement"))));
 }
 
 const SIDES: Side[] = ["front", "left", "right"];
@@ -31,6 +125,128 @@ export const EDGE_COLORS: Partial<Record<Edge, string>> = {
 const LIT_EDGES: { edge: Edge; name: string }[] = [
   { edge: "eave", name: "Eave" }, { edge: "rake", name: "Rake" }, { edge: "hip", name: "Hip" },
 ];
+
+const DENSITIES = ["light", "medium", "heavy"] as const;
+
+// What the lighting puts on a region: counts, and the estimates the salesperson can correct.
+function Lights({ region, lights, onOverride }: {
+  region: Region;
+  lights: RegionPlacement;
+  onOverride?: (override: ScaleOverride | null) => void;
+}) {
+  const [count, setCount] = useState(lights.estimated ? "" : String(lights.count ?? ""));
+  const [strand, setStrand] = useState(lights.strand_set ? String(lights.strand_ft ?? "") : "");
+  if (lights.needs) {
+    return <p className="small unknown-note">{lights.needs === "measurement" ? "Needs a measurement before its lights can be placed." : `No lights yet: ${lights.needs}.`}</p>;
+  }
+  const stop = (event: { stopPropagation: () => void }) => event.stopPropagation();
+  const hidden = lights.hidden ? ` · ${lights.hidden} behind ${region.kind === "palm_trunk" || region.kind === "palm_collar" ? "the trunk" : "objects"}, counted` : "";
+
+  if (region.kind === "wreath") {
+    return (
+      <div className="lights" onClick={stop}>
+        <p className="muted small">1 wreath · {lights.count} bulbs</p>
+        {onOverride && (
+          <label className="small">
+            Size{" "}
+            <select value={lights.size_in ?? 36} onChange={(event) => onOverride({ size_in: Number(event.target.value) as 24 | 36 | 48 })}>
+              {[24, 36, 48].map((size) => (
+                <option key={size} value={size}>
+                  {size} in
+                </option>
+              ))}
+            </select>
+          </label>
+        )}
+      </div>
+    );
+  }
+  if (lights.strand_ft != null) {
+    return (
+      <div className="lights" onClick={stop}>
+        <p className="muted small">
+          {lights.strand_set ? "" : "≈ "}
+          {lights.strand_ft} ft of strand, {lights.count} bulbs{hidden}
+          {lights.trunk ? ` · trunk about ${lights.trunk.diameter_in} in across, ${lights.trunk.height_ft} ft tall` : ""}
+          {lights.strand_set ? " · length set by you" : ` · estimated from ${lights.scale_from}`}
+        </p>
+        {onOverride && (
+          <div className="override-length">
+            <label>
+              Strand <input type="number" min="0" step="0.5" value={strand} placeholder={String(lights.strand_estimate_ft ?? "")}
+                            onChange={(event) => setStrand(event.target.value)} /> ft
+            </label>
+            <button disabled={!(Number(strand) > 0)} onClick={() => onOverride({ strand_ft: Number(strand) })}>
+              Set
+            </button>
+          </div>
+        )}
+      </div>
+    );
+  }
+  if (lights.area_sqft != null) {
+    return (
+      <div className="lights" onClick={stop}>
+        <p className="muted small">
+          {lights.estimated ? `≈ ${lights.count} bulbs, estimated` : `${lights.count} bulbs, set by you (estimate ${lights.estimate})`} ·
+          about {lights.area_sqft} sq ft as seen, {lights.density} density, scaled from {lights.scale_from}
+        </p>
+        {onOverride && (
+          <div className="override-length">
+            <select aria-label="Density" value={lights.density} onChange={(event) => onOverride({ density: event.target.value as (typeof DENSITIES)[number] })}>
+              {DENSITIES.map((d) => (
+                <option key={d} value={d}>
+                  {d}
+                </option>
+              ))}
+            </select>
+            <label>
+              Bulbs <input type="number" min="0" value={count} placeholder={String(lights.estimate ?? "")}
+                           onChange={(event) => setCount(event.target.value)} />
+            </label>
+            <button disabled={count === "" || Number(count) < 0} onClick={() => onOverride({ count: Math.round(Number(count)) })}>
+              Set
+            </button>
+          </div>
+        )}
+      </div>
+    );
+  }
+  return <p className="muted small">{lights.count} bulbs{hidden}</p>;
+}
+
+function LengthNote({ line }: { line: LineGeometry }) {
+  if (line.length_in == null) return <p className="small unknown-note">{NEEDS[line.needs ?? ""] ?? "Not measured yet."}</p>;
+  return (
+    <>
+      <p className="muted small length-note">
+        {formatLength(line.length_in)}
+        {line.plane ? ` · ${line.plane}` : ""}
+        {line.assumption ? ` · ${line.assumption}` : ""}
+      </p>
+      {line.warning && <p className="small unknown-note">Check this: {line.warning}.</p>}
+    </>
+  );
+}
+
+function OverrideLength({ current, onSave, onClear }: { current: number | null; onSave: (inches: number) => void; onClear?: () => void }) {
+  const [feet, setFeet] = useState(current ? String(Math.round((current / 12) * 10) / 10) : "");
+  return (
+    <div className="override-length" onClick={(event) => event.stopPropagation()}>
+      <label>
+        Real length <input type="number" min="0" step="0.5" value={feet} onChange={(event) => setFeet(event.target.value)} /> ft
+      </label>
+      <button disabled={!(Number(feet) > 0)} onClick={() => onSave(Number(feet) * 12)}>
+        Set
+      </button>
+      {onClear && (
+        <button className="link" onClick={onClear}>
+          Clear
+        </button>
+      )}
+    </div>
+  );
+}
 
 // Share of a line that passes behind objects, as a whole percentage.
 function hiddenShare(region: Region): number {
@@ -116,6 +332,13 @@ export function RegionPanel({
   onPatch,
   onDelete,
   onAdd,
+  geometry,
+  onOverride,
+  placement,
+  measurement,
+  lens,
+  onMeasure,
+  referenceEdited,
 }: Props) {
   const targets = regions.filter((region) => region.role !== "blocker");
   // A line is lit when it is visible: detected-but-unrequested edges (ridges, roof meeting wall)
@@ -154,6 +377,8 @@ export function RegionPanel({
   const row = (region: Region) => {
     const isActive = region.id === activeId;
     const hidden = region.geometry === "line" ? hiddenShare(region) : 0;
+    const measured = region.geometry === "line" ? geometry?.[region.id] : undefined;
+    const lights = placement?.[region.id];
     return (
       <li
         key={region.id}
@@ -180,6 +405,17 @@ export function RegionPanel({
           {hidden > 0 && !isActive && (
             <span className="region-flag" title={`${hidden}% passes behind objects — no lights there`}>
               {hidden}% hidden
+            </span>
+          )}
+          {lights?.count != null && !isActive && (
+            <span className="region-flag" title={lights.estimated ? "Estimated" : "Bulbs placed"}>
+              {lights.estimated ? "≈ " : ""}
+              {lights.count} {lights.count === 1 ? "bulb" : "bulbs"}
+            </span>
+          )}
+          {measured?.length_in != null && !isActive && (
+            <span className="region-flag" title={measured.assumption ?? "Measured"}>
+              {formatLength(measured.length_in)}
             </span>
           )}
           {region.kind === "roof" && region.edge === "unknown" && !isActive && (
@@ -231,10 +467,11 @@ export function RegionPanel({
                 <>
                   <select
                     aria-label="Side"
-                    value={region.side ?? "front"}
+                    value={region.side ?? ""}
                     onClick={(event) => event.stopPropagation()}
-                    onChange={(event) => onPatch(region.id, { side: event.target.value as Side })}
+                    onChange={(event) => onPatch(region.id, { side: (event.target.value || null) as Side | null })}
                   >
+                    {region.side == null && <option value="">no side</option>}
                     {SIDES.map((side) => (
                       <option key={side} value={side}>
                         {side}
@@ -288,6 +525,22 @@ export function RegionPanel({
             {region.kind === "roof" && region.edge === "unknown" && (
               <p className="small unknown-note">Edge type not identified. Choose eave, rake, hip or ridge.</p>
             )}
+            {measured && <LengthNote line={measured} />}
+            {lights && (
+              <Lights
+                region={region}
+                lights={lights}
+                onOverride={onOverride ? (override) => onOverride(region.id, override) : undefined}
+              />
+            )}
+            {measured && needsOverride(measured) && onOverride && (
+              <OverrideLength
+                key={region.id}
+                current={measured.length_in}
+                onSave={(length_in) => onOverride(region.id, { length_in })}
+                onClear={measured.method === "override" ? () => onOverride(region.id, null) : undefined}
+              />
+            )}
           </>
         )}
       </li>
@@ -298,6 +551,16 @@ export function RegionPanel({
 
   return (
     <div className="region-panel">
+      <ScaleSummary
+        roofLines={targets.filter((region) => region.geometry === "line" && region.kind === "roof")}
+        geometry={geometry}
+        measurement={measurement}
+        lens={lens}
+        onMeasure={onMeasure}
+        onSelect={onSelect}
+        activeId={activeId}
+        edited={referenceEdited}
+      />
       <h2>
         Lines to light <span className="count">{lit.length}</span>
       </h2>

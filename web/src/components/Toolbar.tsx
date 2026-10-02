@@ -111,6 +111,28 @@ const GROUPS: ToolSpec[][] = [
       ),
     },
     {
+      id: "measure",
+      label: "Measure",
+      hint: "Give the photo real scale: tap both ends of a feature you know the size of, or pick an eave, and type its length.",
+      icon: svg(
+        <>
+          <path d="m3.5 16.5 13-13 4 4-13 13z" />
+          <path d="m7 13 1.5 1.5M9.5 10.5 11 12M12 8l1.5 1.5M14.5 5.5 16 7" />
+        </>,
+      ),
+    },
+    {
+      id: "wreath",
+      label: "Wreath",
+      hint: "Tap where a wreath goes. It is drawn at its real size (36 in; change it in the list). Needs a measurement first.",
+      icon: svg(
+        <>
+          <circle cx="12" cy="12" r="7" />
+          <circle cx="12" cy="12" r="3.5" />
+        </>,
+      ),
+    },
+    {
       id: "house",
       label: "House",
       hint: "Tap a roof to add it to the house being quoted, or tap it again to take it out. The roof lines are redrawn.",
@@ -133,11 +155,13 @@ interface DockProps {
   // The photo was detected with TARGET_HOUSE_ONLY on, so its roof planes can be tapped in or
   // out. Off, or detected before the flag, there is nothing stored to tap and the tool hides.
   houseAvailable: boolean;
+  // Opens the current tool's how-to card.
+  onHelp?: () => void;
 }
 
 // A floating vertical dock docked over the canvas, so the tools that act on it read as part of
 // it rather than a disconnected bar of text buttons above.
-export function ToolDock({ tool, setTool, brushSize, setBrushSize, active, houseAvailable }: DockProps) {
+export function ToolDock({ tool, setTool, brushSize, setBrushSize, active, houseAvailable, onHelp }: DockProps) {
   return (
     <div className="tool-dock" role="toolbar" aria-label="Editing tools" aria-orientation="vertical">
       {GROUPS.map((group, index) => (
@@ -166,6 +190,12 @@ export function ToolDock({ tool, setTool, brushSize, setBrushSize, active, house
         </div>
       ))}
 
+      {onHelp && (
+        <button className="dock-help" title="How this tool works" aria-label="How this tool works" onClick={onHelp}>
+          ?
+        </button>
+      )}
+
       {(tool === "brush" || tool === "erase") && (
         <label className="slider dock-slider" title="Brush size ([ and ])">
           <span>Size</span>
@@ -191,11 +221,13 @@ interface ViewportProps {
   history: { canUndo: boolean; canRedo: boolean };
   onUndo: () => void;
   onRedo: () => void;
+  // Real lengths on the photo's lines; offered once the photo has a measurement.
+  lengths?: { on: boolean; set: (on: boolean) => void } | null;
 }
 
 // Zoom and history sit in their own floating strip, bottom-left over the canvas, so the tool
 // dock above stays about the drawing tools only.
-export function ViewportControls({ zoom, setZoom, history, onUndo, onRedo }: ViewportProps) {
+export function ViewportControls({ zoom, setZoom, history, onUndo, onRedo, lengths }: ViewportProps) {
   const zoomIn = ZOOM_STEPS.find((step) => step > zoom + 1e-6);
   const zoomOut = [...ZOOM_STEPS].reverse().find((step) => step < zoom - 1e-6);
 
@@ -212,6 +244,18 @@ export function ViewportControls({ zoom, setZoom, history, onUndo, onRedo }: Vie
           +
         </button>
       </div>
+      {lengths && (
+        <div className="tool-group">
+          <button
+            title={lengths.on ? "Hide the real lengths on the lines" : "Show each line's real length on the photo"}
+            aria-pressed={lengths.on}
+            className={lengths.on ? "active" : ""}
+            onClick={() => lengths.set(!lengths.on)}
+          >
+            Lengths
+          </button>
+        </div>
+      )}
       <div className="tool-group">
         <button title="Undo (Ctrl/Cmd+Z)" disabled={!history.canUndo} onClick={onUndo}>
           Undo

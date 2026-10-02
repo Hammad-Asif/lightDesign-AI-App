@@ -13,6 +13,9 @@ function check(label, ok) {
 
 const browser = await chromium.launch();
 const page = await browser.newPage({ viewport: { width: 1500, height: 980 } });
+// Tool guides (components/ToolGuide.tsx) open on a tool's first use; these checks are about the tools.
+await page.addInitScript(() => localStorage.setItem("ld-tool-guides-seen",
+  JSON.stringify(["select", "brush", "erase", "vertex", "move", "box", "click", "find", "measure", "wreath", "house"])));
 page.on("console", (m) => m.type() === "error" && errors.push(m.text()));
 page.on("pageerror", (e) => errors.push(String(e)));
 

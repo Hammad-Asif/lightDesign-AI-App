@@ -12,7 +12,7 @@ from app.schemas import (
     CreateRegionRequest, DetectRequest, FindLinesRequest, PhotoDetail, RefineRequest, Region, RegionPatch, TargetTap,
 )
 from app.services import (
-    detect, fusion, intent, lighting, occlusion, partition, partition_reference, roofline, rooflines, snap, target,
+    camera, detect, fusion, intent, lighting, occlusion, partition, partition_reference, roofline, rooflines, snap, target,
 )
 from app.storage import Store, get_store, photo_dict, region_dict
 
@@ -261,13 +261,15 @@ def roof_rows(result: fusion.Result, parsed: intent.Intent, found_in_box: bool =
 
 
 def _roofline_extra(result: fusion.Result, image, store: Store, photo) -> dict:
-    """What a unified run leaves on the photo: its report, and with ROOFLINE_DEBUG its stages
-    (plus overlay images in the photo's debug/ folder, served like any other photo file)."""
+    """What a unified run leaves on the photo: its report, the camera its vanishing points give
+    (services/camera.py, what scale and placement are computed from), and with ROOFLINE_DEBUG
+    its stages (plus overlay images in the photo's debug/ folder, served like any other file)."""
     debug = result.debug
     if debug is not None:
         debug["overlays"] = [f"/files/photos/{photo.id}/debug/{name}"
                              for name in fusion.write_overlays(image, debug, store.photo_dir(photo.id) / "debug")]
-    return {"roofline": result.report, "roofline_debug": debug}
+    return {"roofline": result.report, "roofline_debug": debug,
+            "camera": camera.build(result.scene, image.size, photo.focal_35mm).to_dict()}
 
 
 @router.post("/detect", response_model=list[Region])

@@ -946,3 +946,38 @@ button.small { font-size: 12px; padding: 4px 9px; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
 }
+
+/* Measure tool: the one known length that gives the photo real scale. */
+.measure-panel { display: flex; flex-direction: column; gap: 10px; margin-bottom: 16px; }
+.measure-panel h3 { margin: 0; }
+.measure-panel p { margin: 0; }
+.measure-length { display: flex; gap: 12px; }
+.measure-length input { width: 72px; }
+.measure-side { display: flex; flex-direction: column; gap: 4px; font-size: 13px; }
+.measure-actions { display: flex; gap: 8px; }
+.length-note { margin: 4px 0 0; }
+.override-length { display: flex; align-items: center; gap: 8px; margin-top: 6px; font-size: 13px; }
+.override-length input { width: 64px; }
+.lights { margin-top: 6px; display: flex; flex-direction: column; gap: 6px; }
+.lights p { margin: 0; }
+
+/* The photo's scale, above the lines: a prompt before a measurement, a summary after. */
+.scale-summary { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; margin-bottom: 14px; font-size: 13px; display: flex; flex-direction: column; gap: 4px; }
+.scale-summary p { margin: 0; }
+.scale-summary.prompt { background: var(--accent-soft); border-color: var(--accent); flex-direction: row; align-items: center; justify-content: space-between; gap: 10px; }
+.scale-summary .warn-text { color: #b45309; }
+.viewport-controls button.active { background: var(--accent-soft); border-color: var(--accent); }
+
+/* A tool's how-to card: the gesture on a plain house outline, then the steps. */
+.guide-backdrop { position: fixed; inset: 0; z-index: 50; display: grid; place-items: center; padding: 16px;
+  background: rgba(15, 18, 24, 0.55); backdrop-filter: blur(3px); }
+.guide-card { width: min(440px, 100%); background: var(--surface); color: var(--text); border: 1px solid var(--line);
+  border-radius: 14px; padding: 22px; display: flex; flex-direction: column; gap: 12px; box-shadow: 0 18px 50px rgba(0, 0, 0, 0.3); }
+.guide-card h2 { margin: 0; text-align: center; font-size: 20px; }
+.guide-card > p { margin: 0; text-align: center; }
+.guide-stage { background: var(--canvas-bed); border: 1px solid var(--line-soft); border-radius: 10px; padding: 8px; }
+.guide-scene { display: block; width: 100%; height: auto; }
+.guide-steps { margin: 0; padding: 12px 14px 12px 34px; border: 1px solid var(--line-soft); border-radius: 10px;
+  display: flex; flex-direction: column; gap: 8px; font-size: 14px; }
+.guide-card .primary { width: 100%; padding: 10px; font-size: 15px; }
+.dock-help { width: 100%; margin-top: 6px; font-weight: 600; color: var(--muted); }

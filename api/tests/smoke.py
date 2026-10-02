@@ -8,7 +8,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 from fastapi.testclient import TestClient
-from PIL import Image
+from PIL import Image, ImageDraw
 
 API = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(API))
@@ -44,7 +44,22 @@ client = TestClient(app)
 
 
 def sample_photo() -> bytes:
-    image = Image.new("RGB", (900, 600), (140, 170, 200))
+    """A front-facing house under the mock provider's gable roof. Sides come only from vanishing
+    points, so the photo needs perspective: its siding runs toward a far vanishing point on the
+    right, as a front-on facade's level lines do in a real photo."""
+    width, height = 900, 600
+    image = Image.new("RGB", (width, height), (140, 170, 200))
+    draw = ImageDraw.Draw(image)
+    x0, x1 = 0.14 * width, 0.86 * width
+    draw.rectangle([x0, 0.42 * height, x1, 0.80 * height], fill=(225, 215, 190))
+    vanishing = (25 * width, 0.30 * height)
+    for y in range(int(0.44 * height), int(0.79 * height), 12):
+        end = y + (x1 - x0) * (vanishing[1] - y) / (vanishing[0] - x0)
+        draw.line([(x0, y), (x1, end)], fill=(120, 105, 85), width=2)
+    left, top, right, bottom = 0.10 * width, 0.18 * height, 0.90 * width, 0.42 * height
+    ridge = top + (bottom - top) * 0.25
+    draw.polygon([(left, bottom), ((left + right) / 2, ridge), (right, bottom)], fill=(90, 60, 50))
+    draw.rectangle([0, 0.80 * height, width, height], fill=(80, 140, 70))
     buffer = io.BytesIO()
     image.save(buffer, format="PNG")
     return buffer.getvalue()

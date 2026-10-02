@@ -77,6 +77,12 @@ class Photo(Timestamped, Base):
     mode: Mapped[str | None] = mapped_column(String(16))
     approved: Mapped[bool] = mapped_column(default=False, server_default=text("false"))
     interpreted: Mapped[dict | None] = mapped_column(JSONB)
+    # The lens's 35 mm-equivalent focal length from the upload's EXIF, or None: the stored copy is
+    # a PNG and keeps no EXIF, and phone browsers often strip it before upload. services/camera.py.
+    focal_35mm: Mapped[float | None] = mapped_column(Float)
+    # The salesperson's known length that gives the photo real scale (PUT /photos/{id}/scale):
+    # {"measurement": {"facade", "points" or "region_id", "length_in"}}. None until they enter one.
+    scale: Mapped[dict | None] = mapped_column(JSONB)
 
 
 class Region(Timestamped, Base):
@@ -140,6 +146,9 @@ class Product(Timestamped, Base):
     # whose bulbs are chosen per design.
     colours: Mapped[list] = mapped_column(JSONB, default=list, server_default=text("'[]'::jsonb"))
     twinkle: Mapped[bool] = mapped_column(default=False, server_default=text("false"))
+    # Mini lights on an area (a canopy, fronds, a hedge): bulbs per 10 sq ft at the "medium"
+    # preset; "light" is half, "heavy" double (Lukas, M3). None: services/placement.py's default.
+    density_per_10sqft: Mapped[float | None] = mapped_column(Float)
     # Retired rather than deleted: design_regions.settings holds this id inside JSONB, where no
     # foreign key can protect it. An archived product leaves the library and the parser, and
     # still resolves for the designs that already chose it.

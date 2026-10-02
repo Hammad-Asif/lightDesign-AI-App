@@ -105,7 +105,8 @@ class MemoryStore:
         self.image = ImageOps.exif_transpose(Image.open(io.BytesIO(data))).convert("RGB")
         self.image.thumbnail((max_edge, max_edge))
         self.row = SimpleNamespace(id=uuid.uuid4(), prompt=prompt, width=self.image.width,
-                                  height=self.image.height, mode=None, approved=False, interpreted=None)
+                                  height=self.image.height, mode=None, approved=False, interpreted=None,
+                                  focal_35mm=None, scale=None)
         return self.row
 
     def photo(self, _): return self.row

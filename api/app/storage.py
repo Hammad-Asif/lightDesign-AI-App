@@ -28,6 +28,19 @@ def _uuid(value: str, missing: str) -> uuid.UUID:
         raise HTTPException(404, missing)
 
 
+EXIF_IFD = 0x8769
+FOCAL_35MM_TAG = 41989  # FocalLengthIn35mmFilm
+
+
+def exif_focal_35mm(image: Image.Image) -> float | None:
+    """The lens's 35 mm-equivalent focal length from an upload's EXIF, or None without one."""
+    try:
+        value = image.getexif().get_ifd(EXIF_IFD).get(FOCAL_35MM_TAG)
+        return float(value) if value and float(value) > 0 else None
+    except (AttributeError, TypeError, ValueError, OSError):
+        return None
+
+
 def photo_dict(photo: Photo) -> dict:
     return {
         "id": str(photo.id),
@@ -38,6 +51,8 @@ def photo_dict(photo: Photo) -> dict:
         "mode": photo.mode,
         "approved": photo.approved,
         "interpreted": photo.interpreted,
+        "focal_35mm": photo.focal_35mm,
+        "scale": photo.scale,
     }
 
 
@@ -47,7 +62,7 @@ def region_dict(region: Region) -> dict:
 
 PRODUCT_FIELDS = (
     "category", "name", "bulb_diameter_in", "spacing_in", "spacing_options_in", "strand_length_ft",
-    "diameter_in", "bulb_count", "drops_in", "colours", "twinkle",
+    "diameter_in", "bulb_count", "drops_in", "colours", "twinkle", "density_per_10sqft",
 )
 
 
@@ -103,7 +118,10 @@ class Store:
     # -- photos ----------------------------------------------------------------
 
     def create_photo(self, data: bytes, prompt: str, max_edge: int) -> Photo:
-        image = ImageOps.exif_transpose(Image.open(io.BytesIO(data))).convert("RGB")
+        upload = Image.open(io.BytesIO(data))
+        # Read before the orientation fix and the PNG save, both of which drop EXIF.
+        focal_35mm = exif_focal_35mm(upload)
+        image = ImageOps.exif_transpose(upload).convert("RGB")
         if max(image.size) > max_edge:
             image.thumbnail((max_edge, max_edge), Image.LANCZOS)
 
@@ -113,6 +131,7 @@ class Store:
             prompt=prompt,
             width=image.width,
             height=image.height,
+            focal_35mm=focal_35mm,
         )
         directory = self.photo_dir(photo.id)
         (directory / "masks").mkdir(parents=True, exist_ok=True)

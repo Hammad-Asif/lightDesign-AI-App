@@ -7,20 +7,26 @@ import { Auth } from "./components/Auth";
 import { ModeChooser } from "./components/ModeChooser";
 import { Products } from "./components/Products";
 import { ThemeToggle, type Theme } from "./components/ThemeToggle";
-import { RegionPanel } from "./components/RegionPanel";
+import { needsOverride, RegionPanel } from "./components/RegionPanel";
 import { ToolDock, ViewportControls } from "./components/Toolbar";
 import { Upload } from "./components/Upload";
 import { Specification } from "./components/Specification";
+import { formatLength, MeasurePanel, type MeasureMode } from "./components/MeasurePanel";
+import { guideSeen, hasGuide, markGuideSeen, ToolGuide } from "./components/ToolGuide";
 import { BLOCKER_KINDS, geometryOf, KIND_COLORS } from "./types";
 import type {
   Design,
   DesignRequest,
   MaskingMode,
+  PhotoGeometry,
+  Placement,
+  Measurement,
   PaletteColour,
   PhotoDetail,
   Product,
   Region,
   RegionKind,
+  ScaleOverride,
   Tool,
   User,
 } from "./types";
@@ -53,6 +59,54 @@ export default function App() {
   const [sidebarTab, setSidebarTab] = useState<"regions" | "lighting">("regions");
   const [showProducts, setShowProducts] = useState(false);
   const [showObstacles, setShowObstacles] = useState(false);
+  // Measure tool: two points tapped on a feature, or a line picked on the photo.
+  const [measureMode, setMeasureMode] = useState<MeasureMode>("points");
+  const [measurePoints, setMeasurePoints] = useState<number[][]>([]);
+  // Every roof line's real length and how it was placed; recomputed on the server after any change.
+  const [geometry, setGeometry] = useState<PhotoGeometry | null>(null);
+  // Real lengths drawn on the photo's lines, once it has a measurement.
+  const [showLengths, setShowLengths] = useState(true);
+  // A tool's how-to card: shown the first time the tool is picked, and from the dock's "?".
+  const [guide, setGuide] = useState<Tool | null>(null);
+  const closeGuide = useCallback(() => {
+    setGuide((open) => {
+      if (open) markGuideSeen(open);
+      return null;
+    });
+  }, []);
+  // The confirmed lighting's bulbs, placed on the server from the camera and the measurement.
+  const [placement, setPlacement] = useState<Placement | null>(null);
+
+  useEffect(() => {
+    // Wreaths are placed before any lighting is confirmed, so this runs for every photo.
+    if (!photo) {
+      setPlacement(null);
+      return;
+    }
+    let current = true;
+    api.getPlacement(photo.id).then(
+      (found) => current && setPlacement(found),
+      () => current && setPlacement(null),
+    );
+    return () => {
+      current = false;
+    };
+  }, [photo, design]);
+
+  useEffect(() => {
+    if (!photo) {
+      setGeometry(null);
+      return;
+    }
+    let current = true;
+    api.getGeometry(photo.id).then(
+      (found) => current && setGeometry(found),
+      () => current && setGeometry(null),
+    );
+    return () => {
+      current = false;
+    };
+  }, [photo]);
 
   const canvasRef = useRef<MaskCanvasHandle>(null);
 
@@ -282,6 +336,53 @@ export default function App() {
     });
   };
 
+  // A third tap starts a new pair: the first two were not the ones wanted.
+  const handleMeasureTap = (point: number[]) =>
+    setMeasurePoints((points) => (points.length >= 2 ? [point] : [...points, point]));
+
+  const handleMeasureSave = (measurement: Measurement | null) => {
+    if (!photo) return;
+    void guard(async () => {
+      const saved = await api.putScale(photo.id, measurement);
+      setPhoto({ ...photo, ...saved, regions: photo.regions });
+      setMeasurePoints([]);
+      if (!measurement) return;
+      // Back to the house, now labelled with real lengths, and say what the measurement gave.
+      chooseTool("select");
+      setShowLengths(true);
+      const found = await api.getGeometry(photo.id);
+      setGeometry(found);
+      const lines = Object.values(found.lines);
+      const measured = lines.filter((line) => line.length_in != null).length;
+      const waiting = lines.length - measured;
+      const side = saved.scale?.measurement?.facade ?? "front";
+      setNotice(
+        `Scale set from ${formatLength(measurement.length_in)} on the ${side} side. ` +
+          `${measured} ${measured === 1 ? "line" : "lines"} measured` +
+          (waiting ? `; ${waiting} ${waiting === 1 ? "needs" : "need"} attention (marked ? on the photo).` : "."),
+      );
+    });
+  };
+
+  const handleOverride = (regionId: string, override: ScaleOverride | null) => {
+    if (!photo) return;
+    void guard(async () => {
+      const kept = photo.scale?.overrides?.[regionId];
+      // A new middle keeps a typed length and the other way round; null clears both.
+      const saved = await api.putOverride(photo.id, regionId, override && { ...kept, ...override });
+      setPhoto({ ...photo, ...saved, regions: photo.regions });
+    });
+  };
+
+  const handleWreathTap = (point: number[]) => {
+    if (!photo || photo.approved || busy) return;
+    void guard(async () => {
+      const detail = await api.addWreath(photo.id, point);
+      setPhoto(detail);
+      setActiveId(detail.regions[detail.regions.length - 1]?.id ?? null);
+    });
+  };
+
   const handlePatch = (id: string, patch: Partial<Region>) =>
     guard(async () => {
       if (!photo) return;
@@ -334,6 +435,9 @@ export default function App() {
 
   const chooseTool = (next: Tool) => {
     setDrawingKind(null);
+    // Half-tapped measure points belong to the tool being left.
+    if (next !== "measure") setMeasurePoints([]);
+    if (next !== tool && hasGuide(next) && !guideSeen(next)) setGuide(next);
     setTool(next);
   };
 
@@ -538,6 +642,19 @@ export default function App() {
                 onDrawFinish={handleDrawFinish}
                 onDrawCancel={() => setDrawingKind(null)}
                 debugStage={debugStage}
+                measureMode={measureMode}
+                measurePoints={measurePoints}
+                onMeasureTap={handleMeasureTap}
+                overrideLine={
+                  active?.geometry === "line" && !photo.approved && needsOverride(geometry?.lines[active.id])
+                    ? { regionId: active.id, mid: photo.scale?.overrides?.[active.id]?.mid ?? null }
+                    : null
+                }
+                onOverrideMid={(regionId, mid) => handleOverride(regionId, { mid })}
+                bulbs={placement?.regions}
+                onWreathTap={handleWreathTap}
+                geometry={geometry?.lines}
+                showLengths={showLengths && Boolean(photo.scale?.measurement)}
               />
               {photo.interpreted?.roofline_debug?.stages && (
                 <label className="debug-stage" title="Development: the roof lines at one stage of detection">
@@ -555,13 +672,15 @@ export default function App() {
               {!photo.approved && (
                 <>
                   <ToolDock tool={tool} setTool={chooseTool} brushSize={brushSize} setBrushSize={setBrushSize}
-                            active={active} houseAvailable={houseAvailable} />
+                            active={active} houseAvailable={houseAvailable}
+                            onHelp={hasGuide(tool) ? () => setGuide(tool) : undefined} />
                   <ViewportControls
                     zoom={zoom}
                     setZoom={setZoom}
                     history={history}
                     onUndo={() => canvasRef.current?.undo()}
                     onRedo={() => canvasRef.current?.redo()}
+                    lengths={photo.scale?.measurement ? { on: showLengths, set: setShowLengths } : null}
                   />
                 </>
               )}
@@ -587,6 +706,22 @@ export default function App() {
                 </button>
               </div>
               <div className="sidebar-body">
+                {tool === "measure" && !photo.approved && (
+                  <MeasurePanel
+                    photo={photo}
+                    mode={measureMode}
+                    setMode={(mode) => {
+                      setMeasureMode(mode);
+                      setMeasurePoints([]);
+                    }}
+                    points={measurePoints}
+                    onResetPoints={() => setMeasurePoints([])}
+                    line={active?.geometry === "line" ? active : null}
+                    busy={busy}
+                    onSave={handleMeasureSave}
+                    onClear={() => handleMeasureSave(null)}
+                  />
+                )}
                 {sidebarTab === "regions" ? (
                   <RegionPanel
                     regions={photo.regions}
@@ -600,6 +735,13 @@ export default function App() {
                     onAdd={(kind) => {
                       handleAdd(kind);
                     }}
+                    geometry={geometry?.lines}
+                    placement={placement?.regions}
+                    measurement={photo.scale?.measurement ?? null}
+                    referenceEdited={Boolean(geometry?.reference_edited)}
+                    lens={geometry?.camera.focal_source ?? photo.interpreted?.camera?.focal_source ?? null}
+                    onMeasure={photo.approved ? undefined : () => chooseTool("measure")}
+                    onOverride={photo.approved ? undefined : handleOverride}
                   />
                 ) : requests.length > 0 ? (
                   <Specification
@@ -643,6 +785,7 @@ export default function App() {
           </div>
         </div>
       )}
+      {guide && <ToolGuide tool={guide} onClose={closeGuide} />}
     </div>
   );
 }
