@@ -3,6 +3,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import * as api from "./api";
 import { MaskCanvas, type MaskCanvasHandle } from "./canvas/MaskCanvas";
 import { AccountMenu } from "./components/AccountMenu";
+import { Activity } from "./components/Activity";
 import { Auth } from "./components/Auth";
 import { ModeChooser } from "./components/ModeChooser";
 import { Products } from "./components/Products";
@@ -12,7 +13,8 @@ import { EDGE_COLORS, needsOverride, RegionPanel } from "./components/RegionPane
 import { ToolDock, ViewportControls } from "./components/Toolbar";
 import { Upload } from "./components/Upload";
 import { Specification } from "./components/Specification";
-import { formatLength, MeasurePanel, type MeasureMode } from "./components/MeasurePanel";
+import { formatLength, MeasurePanel, remeasured, type MeasureMode } from "./components/MeasurePanel";
+import { ScaleDebugPanel, stepFile } from "./components/ScaleDebugPanel";
 import { guideSeen, hasGuide, markGuideSeen, ToolGuide } from "./components/ToolGuide";
 import { BLOCKER_KINDS, geometryOf, KIND_COLORS } from "./types";
 import type {
@@ -27,6 +29,7 @@ import type {
   Product,
   Region,
   RegionKind,
+  ScaleCheckInput,
   ScaleOverride,
   Tool,
   User,
@@ -67,6 +70,8 @@ export default function App() {
   const [measurePoints, setMeasurePoints] = useState<number[][]>([]);
   // Every roof line's real length and how it was placed; recomputed on the server after any change.
   const [geometry, setGeometry] = useState<PhotoGeometry | null>(null);
+  // Development (SCALE_DEBUG): the scale solve's step whose overlay is drawn over the photo.
+  const [scaleStep, setScaleStep] = useState<string | null>(null);
   // Real lengths drawn on the photo's lines, once it has a measurement.
   const [showLengths, setShowLengths] = useState(true);
   // A tool's how-to card: shown the first time the tool is picked, and from the dock's "?".
@@ -358,13 +363,36 @@ export default function App() {
       const lines = Object.values(found.lines);
       const measured = lines.filter((line) => line.length_in != null).length;
       const waiting = lines.length - measured;
-      const side = saved.scale?.measurement?.facade ?? "front";
+      const side = found.reference?.facade ?? saved.scale?.measurement?.facade ?? "front";
       setNotice(
         `Scale set from ${formatLength(measurement.length_in)} on the ${side} side. ` +
           `${measured} ${measured === 1 ? "line" : "lines"} measured` +
           (waiting ? `; ${waiting} ${waiting === 1 ? "needs" : "need"} attention (marked ? on the photo).` : ".") +
           (found.warning ? ` ${found.warning}` : ""),
       );
+    });
+  };
+
+  // Measure again with the last saved values: the same points or line, length and side (a side
+  // read from the photo is read again, with the current rules).
+  const handleRemeasure = (saved: Measurement) => {
+    if (saved.region_id) {
+      setMeasureMode("line");
+      setActiveId(saved.region_id);
+    } else {
+      setMeasureMode("points");
+      setMeasurePoints(saved.points ?? []);
+    }
+    handleMeasureSave(remeasured(saved));
+  };
+
+  // A second known length: saved with the photo, and the geometry (refetched with it) reports how
+  // far the photo's length for that line is from it.
+  const handleCheck = (check: ScaleCheckInput | null) => {
+    if (!photo) return;
+    void guard(async () => {
+      const saved = await api.putScaleCheck(photo.id, check);
+      setPhoto({ ...photo, ...saved, regions: photo.regions });
     });
   };
 
@@ -505,6 +533,12 @@ export default function App() {
     if (debugStage && !debugStages?.[debugStage]) setDebugStage(null);
   }, [debugStage, debugStages]);
 
+  // Likewise a scale step, when the server stops returning debug data (SCALE_DEBUG off, another photo).
+  const scaleDebug = geometry?.debug ?? null;
+  useEffect(() => {
+    if (scaleStep && !scaleDebug?.steps?.[scaleStep]) setScaleStep(null);
+  }, [scaleStep, scaleDebug]);
+
   // The House tool's button goes when the photo has no planes to tap (another photo, or one
   // detected again with the flag off); the tool goes with it rather than lingering unseen.
   useEffect(() => {
@@ -524,12 +558,14 @@ export default function App() {
         <main className="entry">
           <Auth onSignedIn={setUser} />
         </main>
+        <Activity />
       </div>
     );
   }
 
   return (
     <div className="app">
+      <Activity />
       {error && (
         <div className="error" onClick={() => setError(null)}>
           {error}
@@ -676,6 +712,7 @@ export default function App() {
                 onWreathTap={handleWreathTap}
                 geometry={geometry?.lines}
                 showLengths={showLengths && Boolean(photo.scale?.measurement)}
+                backdrop={scaleDebug && scaleStep ? stepFile(scaleDebug, scaleStep) : null}
               />
               {photo.interpreted?.roofline_debug?.stages && (
                 <label className="debug-stage" title="Development: the roof lines at one stage of detection">
@@ -727,6 +764,15 @@ export default function App() {
                 </button>
               </div>
               <div className="sidebar-body">
+                {scaleDebug && (
+                  <ScaleDebugPanel
+                    debug={scaleDebug}
+                    step={scaleStep}
+                    onStep={setScaleStep}
+                    activeId={activeId}
+                    onSelect={setActiveId}
+                  />
+                )}
                 {tool === "measure" && !photo.approved && (
                   <MeasurePanel
                     photo={photo}
@@ -741,6 +787,9 @@ export default function App() {
                     busy={busy}
                     onSave={handleMeasureSave}
                     onClear={() => handleMeasureSave(null)}
+                    onRemeasure={handleRemeasure}
+                    onCheck={handleCheck}
+                    checkResult={geometry?.reference_check ?? null}
                   />
                 )}
                 {sidebarTab === "regions" ? (
@@ -761,8 +810,15 @@ export default function App() {
                     measurement={photo.scale?.measurement ?? null}
                     referenceEdited={Boolean(geometry?.reference_edited)}
                     scaleWarning={geometry?.warning ?? null}
+                    scaleChecks={geometry?.checks ?? []}
+                    referenceSide={geometry?.reference?.facade ?? null}
                     lens={geometry?.camera.focal_source ?? photo.interpreted?.camera?.focal_source ?? null}
                     onMeasure={photo.approved ? undefined : () => chooseTool("measure")}
+                    onRemeasure={
+                      photo.approved || !photo.scale?.measurement
+                        ? undefined
+                        : () => handleRemeasure(photo.scale!.measurement!)
+                    }
                     onOverride={photo.approved ? undefined : handleOverride}
                   />
                 ) : requests.length > 0 ? (

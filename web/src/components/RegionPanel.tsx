@@ -2,8 +2,8 @@ import { useEffect, useRef, useState, type ReactNode } from "react";
 
 import { polylineLength } from "../canvas/layers";
 import { AREA_KINDS, KIND_COLORS, KIND_GROUPS, KIND_LABELS, LINE_KINDS } from "../types";
-import type { Edge, LineGeometry, Measurement, Region, RegionKind, RegionPlacement, ScaleOverride, Side } from "../types";
-import { formatLength } from "./MeasurePanel";
+import type { Edge, LineGeometry, Measurement, Region, RegionKind, RegionPlacement, ScaleCheck, ScaleOverride, Side } from "../types";
+import { formatLength, spreadText } from "./MeasurePanel";
 
 interface Props {
   regions: Region[];
@@ -29,8 +29,13 @@ interface Props {
   referenceEdited?: boolean;
   // The measurement makes the house implausibly wide (GET /geometry's warning).
   scaleWarning?: string | null;
+  // Every independent check that failed (GET /geometry's checks), and the side the measurement went on.
+  scaleChecks?: ScaleCheck[];
+  referenceSide?: Side | null;
   lens?: "vp" | "exif" | "assumed" | null;
   onMeasure?: () => void;
+  // Measure again with the last saved values.
+  onRemeasure?: () => void;
 }
 
 const LENS: Record<string, string> = {
@@ -40,15 +45,19 @@ const LENS: Record<string, string> = {
 };
 
 // What the photo's scale is, and whether every roof line has a real length yet.
-function ScaleSummary({ roofLines, geometry, measurement, lens, onMeasure, onSelect, activeId, edited, warning }: {
+function ScaleSummary({ roofLines, geometry, measurement, lens, onMeasure, onRemeasure, onSelect, activeId, edited,
+                        warning, checks, side }: {
   roofLines: Region[];
   activeId: string | null;
   edited?: boolean;
   warning?: string | null;
+  checks?: ScaleCheck[];
+  side?: Side | null;
   geometry?: Record<string, LineGeometry>;
   measurement?: Measurement | null;
   lens?: string | null;
   onMeasure?: () => void;
+  onRemeasure?: () => void;
   onSelect: (id: string) => void;
 }) {
   if (!roofLines.length) return null;
@@ -65,7 +74,7 @@ function ScaleSummary({ roofLines, geometry, measurement, lens, onMeasure, onSel
   return (
     <div className="scale-summary">
       <p>
-        Scale: {formatLength(measurement.length_in)}, {measurement.facade ?? "front"} side
+        Scale: {formatLength(measurement.length_in)}, {side ?? measurement.facade ?? "front"} side
         {lens ? ` · ${LENS[lens]}` : ""}
         {onMeasure && (
           <>
@@ -73,11 +82,31 @@ function ScaleSummary({ roofLines, geometry, measurement, lens, onMeasure, onSel
             <button className="link" onClick={onMeasure}>Change</button>
           </>
         )}
+        {onRemeasure && (
+          <>
+            {" "}
+            <button className="link" title="Measure again with the last values" onClick={onRemeasure}>
+              Re-measure
+            </button>
+          </>
+        )}
       </p>
       {edited && (
         <p className="warn-text">The line you measured has been edited since, and the scale moved with it. Check its length.</p>
       )}
       {warning && <p className="warn-text">{warning}</p>}
+      {(checks ?? [])
+        .filter((check) => check.message !== warning)
+        .map((check, index) => (
+          <p key={index} className="warn-text small">
+            {check.message}{" "}
+            {check.lines.length > 0 && (
+              <button className="link" title="Select the line this is about" onClick={() => onSelect(check.lines[0])}>
+                {check.labels?.[0] ?? "Show"}
+              </button>
+            )}
+          </p>
+        ))}
       <p className="muted">
         {measured} {measured === 1 ? "line" : "lines"} measured
         {waiting.length > 0 && (
@@ -109,12 +138,16 @@ const NEEDS: Record<string, string> = {
   override: "Its depth cannot be read from the photo. Drag its middle on the photo and type its length.",
   length: "Type its real length.",
   anchor: "Needs an eave near it to be measured from.",
-  edge_on: "Seen edge-on, so it cannot be measured.",
+  edge_on: "Seen edge-on, so it cannot be measured. Type its real length.",
+  unreliable:
+    "Its length moves too much with the photo's own small errors to be trusted (a wall or roof seen nearly along the line of sight). Type its real length.",
 };
 
-// A line whose middle and length the salesperson sets by hand.
+// A line whose middle and length the salesperson sets by hand: one set already, one the geometry
+// could not place, and one only estimated from the lines around it.
 export function needsOverride(line: LineGeometry | undefined): boolean {
-  return Boolean(line && (line.method === "override" || (line.needs && !line.needs.startsWith("measurement"))));
+  return Boolean(line && (line.method === "override" || line.method === "estimate"
+    || (line.needs && !line.needs.startsWith("measurement"))));
 }
 
 const SIDES: Side[] = ["front", "left", "right"];
@@ -225,6 +258,7 @@ function LengthNote({ line }: { line: LineGeometry }) {
     <>
       <p className="muted small length-note">
         {formatLength(line.length_in)}
+        {spreadText(line.spread)}
         {line.plane ? ` · ${line.plane}` : ""}
         {line.assumption ? ` · ${line.assumption}` : ""}
       </p>
@@ -344,6 +378,9 @@ export function RegionPanel({
   onMeasure,
   referenceEdited,
   scaleWarning,
+  scaleChecks,
+  referenceSide,
+  onRemeasure,
 }: Props) {
   const targets = regions.filter((region) => region.role !== "blocker");
   // A line is lit when it is visible: detected-but-unrequested edges (ridges, roof meeting wall)
@@ -562,10 +599,13 @@ export function RegionPanel({
         measurement={measurement}
         lens={lens}
         onMeasure={onMeasure}
+        onRemeasure={onRemeasure}
         onSelect={onSelect}
         activeId={activeId}
         edited={referenceEdited}
         warning={scaleWarning}
+        checks={scaleChecks}
+        side={referenceSide}
       />
       <h2>
         Lines to light <span className="count">{lit.length}</span>

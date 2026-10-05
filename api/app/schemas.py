@@ -190,6 +190,20 @@ class ScalePut(BaseModel):
     measurement: Measurement | None
 
 
+class ScaleCheck(BaseModel):
+    """A second known length, on a line, that checks the measurement without changing it: the
+    solve reports how far the photo's length for that line is from this one."""
+
+    region_id: str
+    length_in: float = Field(gt=0, le=12000)
+
+
+class ScaleCheckPut(BaseModel):
+    """Replace the photo's second length; null clears it."""
+
+    check: ScaleCheck | None
+
+
 class TargetTap(BaseModel):
     """A tap on a roof plane, in photo pixels: moves that plane into or out of the target house."""
 

@@ -728,6 +728,7 @@ class Scene:
     horizontal: list              # trusted horizontal VPs, homogeneous normalised
     centre: np.ndarray
     scale: float
+    on_house: np.ndarray | None = None   # per segment: on the target house (fusion), else unknown
 
 
 def lsd_segments(gray: np.ndarray, foliage: np.ndarray | None) -> np.ndarray:

@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from app.schemas import LightingSettings
 from app.services import placement, scale
-from test_scale import FT, Shot, facade_names
+from test_scale import FT, Shot, facade_names, flush_eaves  # noqa: F401  (fixture)
 
 MINI = SimpleNamespace(id=uuid.uuid4(), category="mini", bulb_diameter_in=0.2, spacing_in=4.0, spacing_options_in=[],
                        colours=["warm_white"], twinkle=False, drops_in=[], diameter_in=None, bulb_count=70,
@@ -80,7 +80,7 @@ def test_a_wreath_is_a_ring_of_its_bulbs_at_its_real_size():
     assert radii == pytest.approx([placement.WREATH_RING * 96.0] * 150, abs=0.1)
 
 
-def test_local_scale_comes_from_the_wall_behind_the_spot_not_the_nearest_plane():
+def test_local_scale_comes_from_the_wall_behind_the_spot_not_the_nearest_plane(flush_eaves):
     shot = Shot()
     cam, front, side = facade_names(shot)
     lines = [shot.line("front", (0, 10, 0), (40, 10, 0), "eave", front),

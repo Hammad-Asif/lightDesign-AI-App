@@ -13,6 +13,7 @@ import type {
   ProductDraft,
   Region,
   RegionKind,
+  ScaleCheckInput,
   ScaleOverride,
   Side,
   User,
@@ -42,9 +43,67 @@ async function json<T>(response: Response): Promise<T> {
   return response.json() as Promise<T>;
 }
 
+// What the app is waiting on, in a word or two, so the screen never looks stuck: every call
+// registers while it runs (background fetches included), and the Activity pill shows the newest.
+const ACTIVITY: [RegExp, string, string?][] = [
+  [/^\/photos$/, "Uploading", "POST"],
+  [/\/detect$/, "Detecting"],
+  [/\/find-lines$/, "Finding lines"],
+  [/\/regions\/refine$/, "Refining"],
+  [/\/target$/, "Picking house"],
+  [/\/interpret$/, "Reading prompt"],
+  [/\/scale\/overrides\//, "Saving length"],
+  [/\/scale\/check$/, "Checking"],
+  [/\/scale$/, "Saving scale"],
+  [/\/geometry$/, "Measuring"],
+  [/\/placement$/, "Placing lights"],
+  [/\/wreaths$/, "Adding wreath"],
+  [/\/design$/, "Saving design", "PUT"],
+  [/\/design$/, "Loading design"],
+  [/\/approve$/, "Approving"],
+  [/\/reopen$/, "Reopening"],
+  [/\/mask$/, "Saving mask"],
+  [/\/regions/, "Saving lines", "POST"],
+  [/\/regions/, "Saving lines", "PATCH"],
+  [/\/regions/, "Deleting", "DELETE"],
+  [/^\/photos\/[^/]+$/, "Loading photo", "GET"],
+  [/^\/products/, "Products"],
+  [/^\/auth/, "Signing in"],
+];
+
+function activityOf(path: string, method: string): string {
+  const bare = path.split("?")[0];
+  const found = ACTIVITY.find(([pattern, , only]) => pattern.test(bare) && (!only || only === method));
+  return found ? found[1] : "Working";
+}
+
+let nextCall = 0;
+const running = new Map<number, string>();
+const listeners = new Set<(labels: string[]) => void>();
+
+function announce() {
+  const labels = [...running.values()];
+  listeners.forEach((listener) => listener(labels));
+}
+
+// Subscribes to the labels of the calls in flight, newest last; returns the unsubscribe.
+export function onActivity(listener: (labels: string[]) => void): () => void {
+  listeners.add(listener);
+  listener([...running.values()]);
+  return () => {
+    listeners.delete(listener);
+  };
+}
+
 // The session is an HttpOnly cookie; "include" sends it even when the API is on another origin.
 function request(path: string, init: RequestInit = {}): Promise<Response> {
-  return fetch(`${API_URL}${path}`, { credentials: "include", ...init });
+  const id = nextCall++;
+  running.set(id, activityOf(path, (init.method ?? "GET").toUpperCase()));
+  announce();
+  return fetch(`${API_URL}${path}`, { credentials: "include", ...init }).finally(() => {
+    running.delete(id);
+    announce();
+  });
 }
 
 function send<T>(path: string, method: string, body?: unknown): Promise<T> {
@@ -118,6 +177,10 @@ export const tapHousePlane = (id: string, point: number[]) =>
 // The one known length that gives the photo real scale; null clears it.
 export const putScale = (id: string, measurement: Measurement | null) =>
   send<Photo>(`/photos/${id}/scale`, "PUT", { measurement });
+
+// A second known length on a line, checking the measurement; null clears it.
+export const putScaleCheck = (id: string, check: ScaleCheckInput | null) =>
+  send<Photo>(`/photos/${id}/scale/check`, "PUT", { check });
 
 // Every roof line's real length and how it was placed; computed on request, never billed.
 export const getGeometry = (id: string) => send<PhotoGeometry>(`/photos/${id}/geometry`, "GET");

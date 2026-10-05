@@ -10,7 +10,7 @@ import {
 } from "react";
 
 import { fileUrl } from "../api";
-import { formatLength } from "../components/MeasurePanel";
+import { formatLength, spreadText } from "../components/MeasurePanel";
 import { LOW_CONFIDENCE, type LineGeometry, type Photo, type Region, type RegionPlacement, type Tool } from "../types";
 import {
   createLayer,
@@ -78,6 +78,9 @@ interface Props {
   // Each roof line's real length (GET /photos/{id}/geometry), drawn on the line when showLengths.
   geometry?: Record<string, LineGeometry> | null;
   showLengths?: boolean;
+  // Development (SCALE_DEBUG): one step's overlay, drawn instead of the photo and its regions;
+  // only the selected line is drawn over it, so a click still picks a line to inspect.
+  backdrop?: string | null;
 }
 
 type Snapshot =
@@ -126,11 +129,13 @@ export const MaskCanvas = forwardRef<MaskCanvasHandle, Props>(function MaskCanva
     onWreathTap,
     geometry = null,
     showLengths = false,
+    backdrop = null,
   },
   ref,
 ) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const imageRef = useRef<HTMLImageElement | null>(null);
+  const backdropRef = useRef<HTMLImageElement | null>(null);
   const layers = useRef(new Map<string, HTMLCanvasElement>());
   const loadedKeys = useRef(new Map<string, string>());
 
@@ -296,7 +301,8 @@ export const MaskCanvas = forwardRef<MaskCanvasHandle, Props>(function MaskCanva
       pill(box, text, "#f59e0b", "#1f2937", null);
     }
     const NEEDS: Record<string, string> = { side: "? side", override: "? length", length: "? length", measurement: "? measure",
-                                             measurement_wall: "? measure", anchor: "? length", edge_on: "? length" };
+                                             measurement_wall: "? measure", anchor: "? length", edge_on: "? length",
+                                             unreliable: "? unsure" };
     const dragging = draftRef.current?.regionId;
     const order = regionsRef.current
       .filter((r) => r.geometry === "line" && r.kind === "roof" && (r.polyline?.length ?? 0) >= 2 && lines[r.id])
@@ -308,7 +314,7 @@ export const MaskCanvas = forwardRef<MaskCanvasHandle, Props>(function MaskCanva
       const isReference = reference?.region_id === region.id || line.method === "measured";
       const doubtful = Boolean(line.warning);
       const text = line.length_in != null
-        ? `${exact || isReference ? "" : "≈ "}${formatLength(line.length_in)}${isReference ? " reference" : ""}`
+        ? `${exact || isReference ? "" : "≈ "}${formatLength(line.length_in)}${isReference ? " reference" : spreadText(line.spread)}`
         : line.needs ? NEEDS[line.needs] ?? "?" : null;
       const shown = doubtful && text ? `${text} ?` : text;
       if (!text) continue;
@@ -364,6 +370,20 @@ export const MaskCanvas = forwardRef<MaskCanvasHandle, Props>(function MaskCanva
     const context = ctx2d(canvas);
     const factor = scale();
     context.clearRect(0, 0, canvas.width, canvas.height);
+    if (backdrop && backdropRef.current) {
+      context.drawImage(backdropRef.current, 0, 0, canvas.width, canvas.height);
+      const selected = regionsRef.current.find((r) => r.id === activeRef.current);
+      if (selected?.polyline && selected.polyline.length >= 2) {
+        context.strokeStyle = "#ffffff";
+        context.lineWidth = 5 / factor;
+        context.setLineDash([10 / factor, 6 / factor]);
+        context.beginPath();
+        selected.polyline.forEach((p, i) => (i ? context.lineTo(p[0], p[1]) : context.moveTo(p[0], p[1])));
+        context.stroke();
+        context.setLineDash([]);
+      }
+      return;
+    }
     context.drawImage(image, 0, 0, canvas.width, canvas.height);
 
     // Roof planes from the partition, filled under the lines the way the reference app draws
@@ -659,7 +679,7 @@ export const MaskCanvas = forwardRef<MaskCanvasHandle, Props>(function MaskCanva
       context.lineWidth = 1.5 / factor;
       context.stroke();
     }
-  }, [brushSize, tool, drawingColor, debugStage]);
+  }, [brushSize, tool, drawingColor, debugStage, backdrop]);
 
   const requestDraw = useCallback(() => {
     if (frameRef.current) return;
@@ -668,6 +688,23 @@ export const MaskCanvas = forwardRef<MaskCanvasHandle, Props>(function MaskCanva
       draw();
     });
   }, [draw]);
+
+  useEffect(() => {
+    backdropRef.current = null;
+    if (!backdrop) {
+      requestDraw();
+      return;
+    }
+    let cancelled = false;
+    loadImage(fileUrl(backdrop)).then((image) => {
+      if (cancelled) return;
+      backdropRef.current = image;
+      requestDraw();
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [backdrop, requestDraw]);
 
   useEffect(() => {
     let cancelled = false;

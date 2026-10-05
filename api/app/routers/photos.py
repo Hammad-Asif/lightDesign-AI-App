@@ -7,8 +7,9 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from app.config import get_settings
 from app.models import Photo as PhotoRow
 from app.models import Region as RegionRow
-from app.schemas import DesignOut, DesignPut, InterpretRequest, ModeRequest, Photo, PhotoDetail, ScaleOverride, ScalePut, WreathRequest
-from app.services import camera, detect, fusion, lighting, patterns, placement, scale
+from app.schemas import (DesignOut, DesignPut, InterpretRequest, ModeRequest, Photo, PhotoDetail, ScaleCheckPut,
+                         ScaleOverride, ScalePut, WreathRequest)
+from app.services import camera, detect, fusion, lighting, patterns, placement, scale, scale_debug
 from app.storage import Store, get_store, photo_dict, region_dict
 
 router = APIRouter(prefix="/photos", tags=["photos"])
@@ -137,7 +138,8 @@ def _camera(store: Store, photo: PhotoRow) -> camera.Camera:
     gets one from its whole-photo vanishing points: read from the image, no billed call."""
     stored = (photo.interpreted or {}).get("camera")
     if stored:
-        return camera.Camera.from_dict(stored)
+        # Under today's focal rules: a camera stored before a rule changed is tested again.
+        return camera.rechecked(camera.Camera.from_dict(stored))
     image = store.load_image(photo)
     found = camera.build(fusion.Context(image, get_settings(), [], None, None).scene, image.size, photo.focal_35mm)
     store.update_photo(photo, interpreted={**(photo.interpreted or {}), "camera": found.to_dict()})
@@ -155,7 +157,15 @@ def put_scale(photo_id: str, body: ScalePut, store: Store = Depends(get_store)):
         return photo_dict(store.update_photo(photo, scale=rest or None))
     measurement = body.measurement
     found = _camera(store, photo)
+    # A side the salesperson chose stands. Otherwise the solve decides it from the photo's
+    # structure (services/walls.py), every time: what is stored here is only a hint.
+    given = measurement.facade is not None
     facade = measurement.facade
+    # The sides of the cameras the solve may use instead (when the gables' rakes reject this one).
+    sides = list(dict.fromkeys([*found.facades, *(f for _, other in scale.alternatives(found) for f in other.facades)]))
+    if given and sides and facade not in sides:
+        raise HTTPException(400, f"No {facade} wall was found in this photo's perspective. Measure on the "
+                                 + " or ".join(sides) + " side.")
     if measurement.region_id is not None:
         region = store.region(photo, measurement.region_id)
         if region.geometry != "line" or not region.polyline or len(region.polyline) < 2:
@@ -165,16 +175,25 @@ def put_scale(photo_id: str, body: ScalePut, store: Store = Depends(get_store)):
         if any(not (0 <= x < photo.width and 0 <= y < photo.height) for x, y in measurement.points):
             raise HTTPException(400, "Both points must be on the photo")
         facade = facade or found.facade_of(*measurement.points, get_settings().roofline_vp_deg)
-    if facade is None:
-        raise HTTPException(400, "Say which side of the house this measurement is on")
-    if found.facades and facade not in found.facades:
-        raise HTTPException(400, f"No {facade} wall was found in this photo's perspective. Measure on the "
-                                 + " or ".join(found.facades) + " side.")
-    record = {**measurement.model_dump(exclude_none=True), "facade": facade}
+    record = {**measurement.model_dump(exclude_none=True), "facade": facade, "facade_given": given}
     if measurement.region_id is not None:
         # The line as it was measured: the scale follows the line, so an edit to it later is said.
         record["line_points"] = region.polyline
     return photo_dict(store.update_photo(photo, scale={**(photo.scale or {}), "measurement": record}))
+
+
+@router.put("/{photo_id}/scale/check", response_model=Photo)
+def put_scale_check(photo_id: str, body: ScaleCheckPut, store: Store = Depends(get_store)):
+    """A second known length on a line: it changes nothing, and the solve says how far the photo's
+    length for that line is from it (GET /geometry: reference_check). Null clears it."""
+    photo = store.photo(photo_id)
+    rest = {k: v for k, v in (photo.scale or {}).items() if k != "check"}
+    if body.check is None:
+        return photo_dict(store.update_photo(photo, scale=rest or None))
+    region = store.region(photo, body.check.region_id)
+    if region.geometry != "line" or not region.polyline or len(region.polyline) < 2:
+        raise HTTPException(400, "Check against a line, such as an eave")
+    return photo_dict(store.update_photo(photo, scale={**rest, "check": body.check.model_dump()}))
 
 
 @router.put("/{photo_id}/scale/overrides/{region_id}", response_model=Photo)
@@ -247,17 +266,103 @@ def add_wreath(photo_id: str, body: WreathRequest, store: Store = Depends(get_st
     return _detail(store, photo)
 
 
-def roof_lines(regions) -> list[scale.Line]:
+def roof_lines(regions, topology: dict | None = None) -> list[scale.Line]:
     """The photo's roof lines as the scale solver reads them."""
-    return [scale.Line(str(r.id), [list(map(float, p)) for p in r.polyline], r.edge, r.side)
+    return [scale.Line(str(r.id), [list(map(float, p)) for p in r.polyline], r.edge, r.side,
+                       (topology or {}).get(str(r.id)))
             for r in regions if r.geometry == "line" and r.kind == "roof" and r.polyline and len(r.polyline) >= 2]
 
 
-def _solve(store: Store, photo: PhotoRow, regions) -> tuple[camera.Camera, scale.Solution]:
+TOPOLOGY_OFFSET = 0.012     # of the long edge: how far to each side of a line the roof is looked for
+_house_roofs: dict = {}     # (photo id, keep flags, planes' mtime) -> the target house's roof, at working size
+
+
+def _house_roof(store: Store, photo: PhotoRow) -> np.ndarray | None:
+    """The union of the target house's roof planes as detection stored them, or None."""
+    planes = ((photo.interpreted or {}).get("target") or {}).get("planes") or []
+    directory = store.planes_dir(photo.id)
+    if not planes or not directory.exists():
+        return None
+    key = (str(photo.id), tuple(bool(p.get("keep")) for p in planes), directory.stat().st_mtime)
+    if key not in _house_roofs:
+        masks = store.read_planes(photo.id, len(planes))
+        kept = [m for m, p in zip(masks or [], planes) if p.get("keep")]
+        if len(_house_roofs) > 8:
+            _house_roofs.clear()
+        _house_roofs[key] = np.logical_or.reduce(kept) if kept else None
+    return _house_roofs[key]
+
+
+def _topology(store: Store, photo: PhotoRow, regions) -> dict:
+    """Per roof line: "shared" when the house's roof lies on both its sides (a hip, a valley, a
+    ridge), "free" when on one (an eave, a rake), else unknown. The roof planes' adjacency, which
+    tells a hip from a rake better than an edge label does."""
+    roof = _house_roof(store, photo)
+    if roof is None:
+        return {}
+    height, width = roof.shape
+    fx, fy = width / photo.width, height / photo.height
+    offset = max(4.0, TOPOLOGY_OFFSET * max(photo.width, photo.height))
+    out = {}
+    for region in regions:
+        if region.geometry != "line" or region.kind != "roof" or not region.polyline or len(region.polyline) < 2:
+            continue
+        sides: list[list[bool]] = [[], []]
+        for a, b in zip(region.polyline[:-1], region.polyline[1:]):
+            a, b = np.asarray(a, float), np.asarray(b, float)
+            length = float(np.linalg.norm(b - a))
+            if length < 1e-6:
+                continue
+            normal = np.array([-(b - a)[1], (b - a)[0]]) / length
+            for t in np.linspace(0.2, 0.8, 7):
+                middle = a + t * (b - a)
+                for index, sign in enumerate((1.0, -1.0)):
+                    x, y = middle + sign * offset * normal
+                    xi, yi = int(x * fx), int(y * fy)
+                    sides[index].append(0 <= xi < width and 0 <= yi < height and bool(roof[yi, xi]))
+        if not sides[0]:
+            continue
+        shares = sorted((float(np.mean(sides[0])), float(np.mean(sides[1]))))
+        if shares[0] >= 0.6:
+            out[str(region.id)] = "shared"
+        elif shares[1] >= 0.6 and shares[0] <= 0.25:
+            out[str(region.id)] = "free"
+    return out
+
+
+FEATURE_KINDS = ("door", "garage_door")
+
+
+def _features(store: Store, photo: PhotoRow, regions) -> list[dict]:
+    """Detected doors and garage doors as the scale checks read them: the top and bottom of each
+    in the middle, and its left and right at mid-height, in photo pixels."""
+    out = []
+    for region in regions:
+        if region.kind not in FEATURE_KINDS or region.geometry != "area" or not region.mask_url:
+            continue
+        mask = store.read_mask(photo.id, region.id)
+        if mask is None or not mask.any():
+            continue
+        ys, xs = np.nonzero(mask)
+        top, bottom = int(ys.min()), int(ys.max())
+        middle = (top + bottom) / 2
+        band = np.abs(ys - middle) <= max(2.0, 0.02 * (bottom - top))
+        centre = float(np.median(xs))
+        out.append({"id": str(region.id), "kind": region.kind, "label": region.label,
+                    "top": [centre, float(top)], "bottom": [centre, float(bottom)],
+                    "left": [float(xs[band].min()), float(middle)], "right": [float(xs[band].max()), float(middle)]})
+    return out
+
+
+def _solve(store: Store, photo: PhotoRow, regions, trace: scale.Trace | None = None) -> tuple[camera.Camera, scale.Solution]:
     found = _camera(store, photo)
-    solved = scale.solve(found, roof_lines(regions), (photo.scale or {}).get("measurement"),
-                         photo.interpreted, get_settings().roofline_vp_deg, (photo.scale or {}).get("overrides"))
-    return found, solved
+    solved = scale.solve(found, roof_lines(regions, _topology(store, photo, regions)),
+                         (photo.scale or {}).get("measurement"), photo.interpreted, get_settings().roofline_vp_deg,
+                         (photo.scale or {}).get("overrides"), trace=trace, features=_features(store, photo, regions),
+                         check=(photo.scale or {}).get("check"))
+    # The gables' rakes may have rejected the stored camera for another: everything after the
+    # solve (overlays, bulbs, wreaths) must use the one the lengths came from.
+    return solved.camera or found, solved
 
 
 @router.get("/{photo_id}/geometry")
@@ -267,12 +372,25 @@ def geometry(photo_id: str, store: Store = Depends(get_store)):
     every request: an edit changes it at once, and nothing here is billed."""
     photo = store.photo(photo_id)
     regions = store.regions(photo)
-    found, solved = _solve(store, photo, regions)
+    trace = scale.Trace() if get_settings().scale_debug else None
+    found, solved = _solve(store, photo, regions, trace)
     measurement = (photo.scale or {}).get("measurement") or {}
     reference = next((r for r in regions if str(r.id) == measurement.get("region_id")), None)
     edited = bool(reference and measurement.get("line_points") and reference.polyline != measurement["line_points"])
-    return {"reference_edited": edited, **solved.to_dict(), "camera": {"focal_source": found.focal_source,
-                                           "focal_35mm": round(found.focal_35mm, 1), "facades": found.facades}}
+    labels = {str(r.id): r.label for r in regions}
+    out = solved.to_dict()
+    for check in out["checks"]:
+        check["labels"] = [labels.get(line_id, line_id) for line_id in check.get("lines", [])]
+    if trace is not None:
+        directory = store.photo_dir(photo.id) / "debug"
+        lines = roof_lines(regions, _topology(store, photo, regions))
+        record = scale_debug.record(found, lines, photo.scale, trace, str(photo.id), labels)
+        names = scale_debug.write(store.load_image(photo), found, lines, solved, trace, record, directory)
+        stamp = record["written_at"].replace(" ", "T")
+        out["debug"] = {**record, "files": {name: f"/files/photos/{photo.id}/debug/{name}?at={stamp}" for name in names}}
+    return {"reference_edited": edited, **out, "camera": {"focal_source": found.focal_source,
+                                                         "focal_35mm": round(found.focal_35mm, 1), "facades": found.facades,
+                                                         "focal_checks": found.focal_checks}}
 
 
 

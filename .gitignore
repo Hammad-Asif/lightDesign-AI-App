@@ -18,3 +18,7 @@ out/
 docs/
 CLAUDE.md
 Masking-Editor-Handbook.pdf
+
+# graphify codebase graph (local navigation aid)
+graphify-out/
+.graphify*

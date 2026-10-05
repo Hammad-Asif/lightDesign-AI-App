@@ -98,6 +98,9 @@ class Settings(BaseSettings):
     # lifecycle records in photo.interpreted.roofline_debug, and write stage overlays to the
     # photo's debug/ folder. Off in production: it only adds data, never changes a line.
     roofline_debug: bool = False
+    # Development: every /geometry call writes the scale solve step by step (services/scale_debug.py)
+    # to the photo's debug/ folder. Off in production: it only adds files, never changes a length.
+    scale_debug: bool = False
 
     # SAM 3 on fal.ai: text, box and point prompts from one endpoint.
     fal_key: str = ""
@@ -149,6 +152,10 @@ class Settings(BaseSettings):
     # palm" from "no roof here" — in line geometry they are the same. Costs four detection
     # requests per roof photo instead of one. Off: an instruction returns only what it asked for.
     detect_blockers: bool = True
+    # Doors and garage doors are a standard size: segmented with the roof whatever the instruction
+    # lights, they give the scale an independent check (services/checks.py: a typed length that
+    # makes a garage door 5 ft wide is flagged). Costs two more detection requests per roof photo.
+    scale_doors: bool = False
 
     # On: roof lines only for the house being quoted. Detection still returns every roof plane;
     # services/target.py picks the planes that belong to the target house, only those get

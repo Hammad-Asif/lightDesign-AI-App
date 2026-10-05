@@ -20,7 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from app.config import Settings
 from app.services import camera as camera_module
 from app.services import fusion, scale
-from test_scale import FT, H, W, F, Shot
+from test_scale import FT, H, W, F, Shot, flush_eaves  # noqa: F401  (fixture)
 
 
 def render(shot: Shot) -> Image.Image:
@@ -45,7 +45,7 @@ def render(shot: Shot) -> Image.Image:
 
 
 @pytest.mark.parametrize("yaw, pitch", [(-10, 3), (-30, 6), (-40, 8)])
-def test_a_rendered_corner_house_is_measured_from_one_reference(yaw, pitch):
+def test_a_rendered_corner_house_is_measured_from_one_reference(yaw, pitch, flush_eaves):
     shot = Shot(yaw_deg=yaw, pitch_deg=pitch)
     image = render(shot)
     scene = fusion.Context(image, Settings(_env_file=None), [], None, None).scene

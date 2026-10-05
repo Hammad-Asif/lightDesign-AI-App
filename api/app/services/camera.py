@@ -11,7 +11,14 @@ The focal length, in order. EXIF is usually missing (the stored copy is a PNG, a
 browsers strip it before upload), so the vanishing points are the normal path, not a fallback:
 
   1. "vp": two vanishing points of perpendicular directions, v1 and v2, give
-     f² = −(v1 − c)·(v2 − c). Two facades' level directions, or one and the vertical.
+     f² = −(v1 − c)·(v2 − c). Two facades' level directions, or one and the vertical. A pair is
+     used only when it is well conditioned: turning either point by FOCAL_JITTER_DEG about the
+     centre, or moving it nearer or further as the photo's lines aiming at it would if each were
+     off by FOCAL_JITTER_DEG, must move f by less than FOCAL_SPREAD_MAX. A front-on facade's
+     point lies near infinity, and then f is decided by a fraction of a degree of the eaves' tilt
+     (a 114 mm lens read off a 0.18° tilt); a level camera's vertical point does too (an 80 mm
+     lens read off uprights converging by half a degree across the photo). Such a pair is noise
+     and is dropped (focal_checks.vp_rejected).
   2. "exif": the upload's 35 mm-equivalent focal, f = f35 / 36 × the long edge. Used when the
      vanishing points give none, and recorded beside theirs as a cross-check when they do.
   3. "assumed": a typical phone lens, and labelled so. Expect it on level, front-on photos,
@@ -21,6 +28,9 @@ browsers strip it before upload), so the vanishing points are the normal path, n
 
 The vanishing points themselves come from detection (services/fusion.py: the photo's, refit to
 the target house), stored with the photo, so everything here is recomputed free after any edit.
+The vertical refit and the search for a missed second facade use only the target house's own
+segments (Scene.on_house) when detection knew the house: a neighbour's roof, a fence or a
+driveway must not build a wall of this house.
 """
 
 from dataclasses import dataclass, field
@@ -44,6 +54,8 @@ AGREE_DEG = 2.0
 SECOND_SHARE = 0.25
 SECOND_MIN_SEGMENTS = 8
 FOCAL_SWEEP_35MM = np.geomspace(14.0, 120.0, 160)
+FOCAL_JITTER_DEG = 0.5            # how far a vanishing point's direction is turned to test its pair
+FOCAL_SPREAD_MAX = 0.15           # relative change in f that jitter may cause for the pair to count
 UPRIGHT_DEG = 15.0                 # segments this close to the photo's vertical are fitted for the vertical
 UPRIGHT_MIN_SEGMENTS = 3
 
@@ -70,6 +82,54 @@ def _focal_from_pair(a: list[float], b: list[float], centre: np.ndarray) -> floa
         return None
     square = -float(np.dot(np.array(a[:2]) - centre, np.array(b[:2]) - centre))
     return float(np.sqrt(square)) if square > 0 else None
+
+
+def _turned(vp: list[float], centre: np.ndarray, degrees: float) -> list[float]:
+    """A finite vanishing point turned about the photo's centre."""
+    angle = np.radians(degrees)
+    rotation = np.array([[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]])
+    x, y = rotation @ (np.array(vp[:2], float) - centre) + centre
+    return [float(x), float(y), 1.0]
+
+
+def _moved(vp: list[float], centre: np.ndarray, degrees: float) -> list[float] | None:
+    """A finite vanishing point moved nearer the centre or further out, as it would be if the
+    photo's lines aiming at it from either edge (half the long edge off its axis) were each off
+    by `degrees`. A far point moves a lot: its lines are nearly parallel, and their slight
+    convergence is all that places it. None when the lines would no longer meet on that side."""
+    offset = np.array(vp[:2], float) - centre
+    distance = float(np.linalg.norm(offset))
+    if distance < AT_INFINITY:
+        return list(vp)
+    half = float(np.max(centre))
+    angle = float(np.arctan2(half, distance)) + np.radians(degrees)
+    if angle <= 0 or angle >= np.pi / 2:
+        return None
+    x, y = centre + offset / distance * (half / np.tan(angle))
+    return [float(x), float(y), 1.0]
+
+
+def focal_spread(a: list[float], b: list[float], centre: np.ndarray) -> float:
+    """How far f moves, relative, when either vanishing point is off by FOCAL_JITTER_DEG, turned
+    about the centre or moved along its line from it: small for a well-placed pair, huge (or
+    inf) when a point is near infinity."""
+    base = _focal_from_pair(a, b, centre)
+    if base is None:
+        return float("inf")
+
+    def variants(vp):
+        return ([_turned(vp, centre, d) for d in (-FOCAL_JITTER_DEG, FOCAL_JITTER_DEG)]
+                + [_moved(vp, centre, d) for d in (-FOCAL_JITTER_DEG, FOCAL_JITTER_DEG)])
+
+    worst = 0.0
+    for moved_a in variants(a):
+        for moved_b in variants(b):
+            moved = (_focal_from_pair(moved_a, moved_b, centre)
+                     if moved_a is not None and moved_b is not None else None)
+            if moved is None:
+                return float("inf")
+            worst = max(worst, abs(moved - base) / base)
+    return worst
 
 
 def _to_35mm(focal_px: float, long_edge: float) -> float:
@@ -142,19 +202,24 @@ class Camera:
         image = self.K @ np.asarray(point, float)
         return image[:2] / image[2]
 
-    def facade_of(self, a, b, tolerance_deg: float) -> str | None:
-        """The facade whose level direction the segment a→b runs toward, within tolerance, or
-        None (a vertical feature, or no vanishing point it matches). Never the image slope."""
+    def facade_angles(self, a, b) -> list[tuple[float, str]]:
+        """Degrees between the segment a→b and the direction from its middle to each facade's
+        vanishing point, nearest first. A level line at camera height lies on the horizon, where
+        every horizontal vanishing point is: there the first two are nearly equal."""
         a, b = np.asarray(a, float), np.asarray(b, float)
         direction = _unit(b - a)
         middle = (a + b) / 2
-        best = None
+        angles = []
         for facade, vp in zip(self.facades, self.horizontal):
             toward = _unit(np.array(vp[:2]) - middle * vp[2]) if vp[2] else np.array(vp[:2])
-            angle = float(np.degrees(np.arccos(min(1.0, abs(float(direction @ toward))))))
-            if angle <= tolerance_deg and (best is None or angle < best[0]):
-                best = (angle, facade)
-        return best[1] if best else None
+            angles.append((float(np.degrees(np.arccos(min(1.0, abs(float(direction @ toward)))))), facade))
+        return sorted(angles)
+
+    def facade_of(self, a, b, tolerance_deg: float) -> str | None:
+        """The facade whose level direction the segment a→b runs toward, within tolerance, or
+        None (a vertical feature, or no vanishing point it matches). Never the image slope."""
+        angles = self.facade_angles(a, b)
+        return angles[0][1] if angles and angles[0][0] <= tolerance_deg else None
 
     def to_dict(self) -> dict:
         return {
@@ -272,21 +337,32 @@ def build(scene: partition.Scene | None, size: tuple[int, int], focal_35mm: floa
     vertical = horizontal = None
     facades: list[str] = []
     checks: dict = {}
+    segments = None
     if scene is not None:
         vertical = _pixel_vp(scene.vertical, scene) if scene.vertical is not None else None
         horizontal = [_pixel_vp(vp, scene) for vp in scene.horizontal]
         facades = fusion._facades(scene)
+        segments = np.asarray(scene.segments, float)
+        on_house = getattr(scene, "on_house", None)
+        if on_house is not None and len(on_house) == len(segments) and np.any(on_house):
+            segments = segments[np.asarray(on_house, bool)]
+            checks["segments"] = "target house only"
     if vertical is not None and _off_vertical(vertical, centre) > VERTICAL_MAX_DEG:
         # Not the vertical: fitted afresh from the photo's upright segments, else a level camera.
         checks["vertical_rejected"] = [round(v, 1) for v in vertical]
         vertical = None
-    if vertical is None and scene is not None:
-        vertical = _vertical_from_segments(np.asarray(scene.segments, float), size)
+    if vertical is None and segments is not None:
+        vertical = _vertical_from_segments(segments, size)
         if vertical is not None:
             checks["vertical"] = "fitted to upright segments"
     found_second = None
-    if scene is not None and horizontal and len(horizontal) == 1:
-        found_second = _second_facade(np.asarray(scene.segments, float), horizontal[0], vertical, size)
+    if segments is not None and horizontal and len(horizontal) == 1:
+        found_second = _second_facade(segments, horizontal[0], vertical, size)
+        if found_second is not None and focal_spread(horizontal[0], found_second[0], centre) > FOCAL_SPREAD_MAX:
+            # The first facade faces the camera: where the sweep put the other one, and the focal
+            # length it implies, are as uncertain as the pair is ill-conditioned.
+            checks["second_facade_rejected"] = "ill-conditioned with the first facade"
+            found_second = None
         if found_second is not None:
             vp, _ = found_second
             horizontal = horizontal + [vp]
@@ -297,15 +373,51 @@ def build(scene: partition.Scene | None, size: tuple[int, int], focal_35mm: floa
             facades = facades + [name if name != facades[0] else "front"]
             checks["second_facade"] = "found by its focal sweep"
 
-    estimates = []
-    for i, a in enumerate(horizontal or []):
-        for b in (horizontal or [])[i + 1:] + ([vertical] if vertical is not None else []):
-            found = _focal_from_pair(a, b, centre)
-            if found is not None and PLAUSIBLE_FOCAL_35MM[0] <= _to_35mm(found, long_edge) <= PLAUSIBLE_FOCAL_35MM[1]:
-                estimates.append(found)
+    estimates, rejected = _pair_estimates(horizontal or [], vertical, centre, long_edge)
+    if rejected:
+        checks["vp_rejected"] = rejected
 
     if found_second is not None:
         estimates.append(found_second[1])
+    focal, source = _choose_focal(estimates, focal_35mm, long_edge, checks)
+    found = Camera(width=width, height=height, focal=focal, focal_source=source, vertical=vertical,
+                   horizontal=horizontal or [], facades=facades, focal_checks=checks)
+    if len(found.horizontal) == 1 and source in ("vp", "exif"):
+        # One facade seen, and the photo gave the focal length: a house's walls meet square, so
+        # the other facade's vanishing point follows from the first and the vertical. Only with
+        # a measured focal length (the perspective's or the lens's own); an assumed one would
+        # place it wherever the guess put it (the scale solve tries that one only when the
+        # gables' rakes confirm it: services/scale.py).
+        _add_square_facade(found)
+    return found
+
+
+SQUARE_NOTE = "square to the first (assumed square corners)"
+
+
+def _pair_estimates(horizontal: list, vertical: list[float] | None, centre: np.ndarray,
+                    long_edge: float) -> tuple[list[float], list[dict]]:
+    """f from every well-conditioned perpendicular pair, and the pairs dropped as noise."""
+    estimates, rejected = [], []
+    for i, a in enumerate(horizontal):
+        for b in horizontal[i + 1:] + ([vertical] if vertical is not None else []):
+            found = _focal_from_pair(a, b, centre)
+            if found is None or not PLAUSIBLE_FOCAL_35MM[0] <= _to_35mm(found, long_edge) <= PLAUSIBLE_FOCAL_35MM[1]:
+                continue
+            spread = focal_spread(a, b, centre)
+            if spread > FOCAL_SPREAD_MAX:
+                rejected.append({"focal_35mm": round(_to_35mm(found, long_edge), 1),
+                                 "spread": round(spread, 3) if np.isfinite(spread) else None,
+                                 "with": "vertical" if b is vertical else "facade"})
+                continue
+            estimates.append(found)
+    return estimates, rejected
+
+
+def _choose_focal(estimates: list[float], focal_35mm: float | None, long_edge: float,
+                  checks: dict) -> tuple[float, str]:
+    """The vanishing points' focal, else the lens's own (EXIF), else a typical phone's."""
+    focal = source = None
     if estimates:
         focal, source = float(np.median(estimates)), "vp"
         checks["vp"] = round(_to_35mm(focal, long_edge), 1)
@@ -315,21 +427,97 @@ def build(scene: partition.Scene | None, size: tuple[int, int], focal_35mm: floa
             focal, source = _from_35mm(float(focal_35mm), long_edge), "exif"
         else:
             checks["agree"] = abs(checks["vp"] - focal_35mm) <= EXIF_AGREES * focal_35mm
-    if not estimates and not focal_35mm:
+    if focal is None:
         focal, source = _from_35mm(ASSUMED_FOCAL_35MM, long_edge), "assumed"
-    found = Camera(width=width, height=height, focal=focal, focal_source=source, vertical=vertical,
-                   horizontal=horizontal or [], facades=facades, focal_checks=checks)
-    if len(found.horizontal) == 1 and source == "vp":
-        # One facade seen, and the photo gave the focal length: a house's walls meet square, so
-        # the other facade's vanishing point follows from the first and the vertical. Only with
-        # a measured focal length; an assumed one would place it wherever the guess put it.
-        up = found.up()
-        level = found.direction(found.horizontal[0])
-        other = found.K @ np.cross(up, _unit(level - (level @ up) * up))
-        vp = [float(v) for v in (other / other[2])] if abs(other[2]) > AT_INFINITY else [*map(float, _unit(other[:2])), 0.0]
-        x = vp[0] - centre[0] if vp[2] else vp[0]
-        name = "left" if x < 0 else "right"
-        found.horizontal.append(vp)
-        found.facades.append(name if name != found.facades[0] else "front")
-        checks["second_facade"] = "square to the first (assumed square corners)"
+    return focal, source
+
+
+def _add_square_facade(found: Camera) -> None:
+    """The second facade's vanishing point, square to the only one seen, under found's focal."""
+    up = found.up()
+    level = found.direction(found.horizontal[0])
+    other = found.K @ np.cross(up, _unit(level - (level @ up) * up))
+    vp = [float(v) for v in (other / other[2])] if abs(other[2]) > AT_INFINITY else [*map(float, _unit(other[:2])), 0.0]
+    x = vp[0] - found.centre[0] if vp[2] else vp[0]
+    name = "left" if x < 0 else "right"
+    found.horizontal.append(vp)
+    found.facades.append(name if name != found.facades[0] else "front")
+    found.focal_checks["second_facade"] = SQUARE_NOTE
+
+
+def observed(cam: Camera) -> tuple[list, list[str]]:
+    """The camera's facades read from the photo, without one made square to them."""
+    if cam.focal_checks.get("second_facade") == SQUARE_NOTE and len(cam.horizontal) > 1:
+        return [list(vp) for vp in cam.horizontal[:-1]], list(cam.facades[:-1])
+    return [list(vp) for vp in cam.horizontal], list(cam.facades)
+
+
+def with_focal(cam: Camera, focal_35mm: float, source: str, square: bool = True) -> Camera:
+    """The same vanishing points under another focal length; a facade made square to the only
+    one seen is made again under it (when `square`)."""
+    horizontal, facades = observed(cam)
+    checks = {k: v for k, v in cam.focal_checks.items() if k != "second_facade"}
+    found = Camera(width=cam.width, height=cam.height, focal=_from_35mm(focal_35mm, max(cam.width, cam.height)),
+                   focal_source=source, vertical=cam.vertical, horizontal=horizontal, facades=facades,
+                   focal_checks=checks)
+    if square and len(found.horizontal) == 1:
+        _add_square_facade(found)
+    return found
+
+
+def perturbed(cam: Camera, which: str, degrees: float = 0.0, focal_scale: float = 1.0) -> Camera | None:
+    """The same camera with one vanishing point turned by `degrees` about the centre (`which`: a
+    facade's name or "vertical"), or with its focal scaled (`which`="focal"): what a solve is
+    re-run under to see how far each length moves. A facade made square to the only one seen is
+    made again, so it follows. None when there is no such vanishing point."""
+    horizontal, facades = observed(cam)
+    vertical = list(cam.vertical) if cam.vertical is not None else None
+
+    def turn(vp: list[float]) -> list[float]:
+        if vp[2] == 0.0:
+            angle = np.radians(degrees)
+            x, y = float(vp[0]), float(vp[1])
+            return [float(np.cos(angle) * x - np.sin(angle) * y), float(np.sin(angle) * x + np.cos(angle) * y), 0.0]
+        return _turned(vp, cam.centre, degrees)
+
+    if which == "vertical":
+        if vertical is None:
+            return None
+        vertical = turn(vertical)
+    elif which in facades:
+        index = facades.index(which)
+        horizontal[index] = turn(horizontal[index])
+    elif which != "focal":
+        return None
+    checks = {k: v for k, v in cam.focal_checks.items() if k != "second_facade"}
+    found = Camera(width=cam.width, height=cam.height, focal=cam.focal * focal_scale, focal_source=cam.focal_source,
+                   vertical=vertical, horizontal=horizontal, facades=facades, focal_checks=checks)
+    if cam.focal_checks.get("second_facade") == SQUARE_NOTE and len(found.horizontal) == 1:
+        _add_square_facade(found)
+        # A small turn keeps the made facade's name; should it flip sides, it is still the same wall.
+        found.facades = list(cam.facades)[:len(found.facades)]
+    return found
+
+
+def rechecked(cam: Camera) -> Camera:
+    """A stored camera under the current focal rules: its pairs of vanishing points tested again
+    for conditioning (a camera stored before a rule changed keeps whatever focal it had then).
+    The same camera when nothing changes."""
+    if cam.focal_source != "vp":
+        return cam
+    horizontal, facades = observed(cam)
+    long_edge = float(max(cam.width, cam.height))
+    checks = {k: v for k, v in cam.focal_checks.items() if k not in ("vp", "vp_rejected", "agree", "second_facade")}
+    estimates, rejected = _pair_estimates(horizontal, cam.vertical, cam.centre, long_edge)
+    if rejected:
+        checks["vp_rejected"] = rejected
+    focal, source = _choose_focal(estimates, checks.get("exif"), long_edge, checks)
+    # Stored vanishing points are rounded: the same pairs give the same focal to within that.
+    if source == "vp" and abs(focal - cam.focal) <= 0.01 * cam.focal:
+        return cam
+    checks["rechecked"] = f"stored focal {round(cam.focal_35mm, 1)} mm failed today's conditioning test"
+    found = Camera(width=cam.width, height=cam.height, focal=focal, focal_source=source, vertical=cam.vertical,
+                   horizontal=horizontal, facades=facades, focal_checks=checks)
+    if len(found.horizontal) == 1 and source in ("vp", "exif"):
+        _add_square_facade(found)
     return found

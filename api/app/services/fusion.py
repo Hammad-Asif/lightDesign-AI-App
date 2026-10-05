@@ -328,6 +328,9 @@ class Context:
             house = [i for i, keep_it in enumerate(self.keep or [True] * len(self.roof_masks)) if keep_it]
             scene = partition.house_vanishing_points(
                 scene, counts, partition._house_probes(self.roof_masks, house, scene.centre, scene.scale))
+        if self.vp_region is not None or self.crop is not None:
+            # The camera's own searches (vertical refit, a missed second facade) stay on the house.
+            scene.on_house = np.asarray(counts, bool)
         return scene
 
     def samples(self, line: RoofLine) -> np.ndarray:

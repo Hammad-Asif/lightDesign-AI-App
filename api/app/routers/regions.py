@@ -299,6 +299,9 @@ def run_detection(photo_id: str, body: DetectRequest, store: Store = Depends(get
     # the source (ROOFLINE_SOURCES) and answers; partition's lines only when it is the source or
     # V3 failed. services/fusion.py.
     roof_wanted = "roof" in (selected or detect.DEFAULT_KINDS)
+    if settings.scale_doors and roof_wanted:
+        # The scale's outside check: doors and garage doors of standard size (SCALE_DOORS).
+        selected = list(dict.fromkeys([*(selected or detect.DEFAULT_KINDS), "door", "garage_door"]))
     use_v3 = "v3" in settings.roofline_sources and roof_wanted
     partitioned = settings.edge_extractor == "partition"
     clock = time.perf_counter()

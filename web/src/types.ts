@@ -181,22 +181,59 @@ export interface CameraInfo {
 export interface LineGeometry {
   length_in: number | null;
   plane: string | null;
-  method: "measured" | "wall" | "gable" | "ridge" | "hip" | "pitch" | "override" | "none";
+  // "estimate": no rule placed it (or its own length was unsure), so it is read at the scale of the
+  // placed lines around it; always "assumed", and set by hand for a firm figure.
+  method: "measured" | "wall" | "gable" | "ridge" | "hip" | "pitch" | "valley" | "override" | "estimate" | "none";
   // A typed length the photo disagrees with, in words.
   warning?: string | null;
   assumption: string | null;
   confidence: "exact" | "stated" | "assumed" | null;
-  needs: "measurement" | "measurement_wall" | "side" | "override" | "length" | "anchor" | "edge_on" | null;
+  needs: "measurement" | "measurement_wall" | "side" | "override" | "length" | "anchor" | "edge_on" | "unreliable" | null;
+  // The wall it was placed on ("front", "front.2" for another run of that side, "front+1" for a
+  // wall set back on a roof), and the side a level line was given and how ("direction", "chain",
+  // "above", "borrowed", "chosen" by consistency, ...).
+  wall?: string | null;
+  side?: Side | null;
+  side_how?: string | null;
+  // Relative: how far the length moves under the photo's own small errors (0.06 = ±6%).
+  spread?: number | null;
+}
+
+// One independent check that failed (services/checks.py), with the lines it is about.
+export interface ScaleCheck {
+  kind: "size" | "meets" | "pitch" | "eave_height" | "plausibility" | "side" | "second_reference";
+  message: string;
+  lines: string[];
+  labels?: string[];
+}
+
+// SCALE_DEBUG only: the solve step by step (services/scale_debug.py) and one overlay per step.
+export interface ScaleDebug {
+  photo_id: string;
+  written_at: string;
+  scale: unknown;
+  // Optional: an API still running older code sends a payload without them.
+  steps?: Record<string, Record<string, unknown>>;
+  numbers?: Record<string, string>;
+  lines?: ({ id: string; n: string | null; label: string | null } & Record<string, unknown>)[];
+  files?: Record<string, string>;
 }
 
 export interface PhotoGeometry {
   // The line the scale was measured on has been edited since: the scale moved with it.
   reference_edited?: boolean;
-  walls: Partial<Record<Side, { distance_in: number; source: "measured" | "corner" }>>;
+  walls: Record<string, { distance_in: number; source: "measured" | "corner" | "roof face"; facade?: Side }>;
   lines: Record<string, LineGeometry>;
   needs: string | null;
-  // The measurement makes the house wider than a house is, in words: the reference is likely wrong.
+  // The gravest failed check, in words (the measurement makes the house implausible, a door the wrong size).
   warning?: string | null;
+  checks?: ScaleCheck[];
+  pitch?: { rise: number; source: "measured" | "estimated" | "assumed" } | null;
+  // Where the measurement went: the wall, its side, and how the side was decided.
+  reference?: { wall: string; facade: Side; how: string } | null;
+  // A second known length against the photo's length for its line; `off` is relative (0.03 = 3% long).
+  reference_check?: { region_id: string; typed_in: number; solved_in: number | null; off: number | null } | null;
+  debug?: ScaleDebug;
   camera: { focal_source: "vp" | "exif" | "assumed"; focal_35mm: number; facades: Side[] };
 }
 
@@ -248,6 +285,15 @@ export interface Measurement {
   region_id?: string;
   length_in: number;
   facade?: Side | null;
+  // Stored by the server: whether the side was chosen by hand (else it is read from the photo).
+  facade_given?: boolean;
+  line_points?: number[][];
+}
+
+// A second known length on a line: it checks the measurement and changes nothing.
+export interface ScaleCheckInput {
+  region_id: string;
+  length_in: number;
 }
 
 export interface RooflineReport {
@@ -309,7 +355,7 @@ export interface Photo {
   approved: boolean;
   interpreted: Interpreted | null;
   focal_35mm?: number | null;
-  scale?: { measurement?: Measurement; overrides?: Record<string, ScaleOverride> } | null;
+  scale?: { measurement?: Measurement; overrides?: Record<string, ScaleOverride>; check?: ScaleCheckInput } | null;
 }
 
 export interface PhotoDetail extends Photo {

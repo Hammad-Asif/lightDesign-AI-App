@@ -136,10 +136,13 @@ def test_scale_measurement_reads_its_facade_from_the_vanishing_points(scale_clie
     assert result.json()["scale"]["measurement"]["facade"] == cam.facades[0]
 
 
-def test_scale_measurement_asks_for_a_side_it_cannot_read_and_refuses_a_missing_wall(scale_client):
+def test_scale_measurement_leaves_an_unread_side_to_the_solve_and_refuses_a_missing_wall(scale_client):
     client, _, photo_id, cam = scale_client
     vertical = {"points": [[800, 500], [800, 700]], "length_in": 80}
-    assert client.put(f"/photos/{photo_id}/scale", json={"measurement": vertical}).status_code == 400
+    # No side read from a vertical: stored as a hint-less, side-not-given measurement; the solve
+    # decides its wall from the photo's structure every time.
+    unread = client.put(f"/photos/{photo_id}/scale", json={"measurement": vertical})
+    assert unread.status_code == 200 and unread.json()["scale"]["measurement"]["facade_given"] is False
     missing = ({"front", "left", "right"} - set(cam.facades)).pop()
     assert client.put(f"/photos/{photo_id}/scale",
                       json={"measurement": {**vertical, "facade": missing}}).status_code == 400

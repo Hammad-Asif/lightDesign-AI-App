@@ -273,6 +273,11 @@ def place(camera: Camera, regions: list, settings_by_region: dict, products_by_i
         elif override and override.get("length_in"):
             member = Member(region_id, pixels, None, list(region.hidden or []), override=override,
                             length_in=float(override["length_in"]))
+        elif geometry is not None and geometry.method == "estimate" and geometry.length_in:
+            # An estimated length (scale._estimate_from_neighbours): bulbs at even spacing along the
+            # drawn line, as for a typed length with no midpoint set.
+            member = Member(region_id, pixels, None, list(region.hidden or []), override={},
+                            length_in=float(geometry.length_in))
         else:
             out[region_id] = {"needs": (geometry.needs if geometry else None) or "measurement"}
             continue
@@ -327,8 +332,10 @@ def wall_scale(camera: Camera, solution: scale.Solution, lines: dict, pixel) -> 
             best = (gap, facade)
     if best is None:
         return None
-    facade = best[1]
-    point = camera.on_wall(pixel, camera.wall_normal(facade), solution.walls[facade]["distance_in"])
+    wall = solution.walls[best[1]]
+    facade = wall.get("facade", best[1])
+    normal = camera.wall_normal(facade)
+    point = camera.on_wall(pixel, normal, wall["distance_in"]) if normal is not None else None
     if point is None or point[2] <= 0:
         return None
     return camera.focal / float(point[2]), facade
