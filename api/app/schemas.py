@@ -99,6 +99,8 @@ class Interpreted(BaseModel):
 class Photo(BaseModel):
     id: str
     prompt: str
+    # The project's name (customer or address); empty for photos uploaded before names existed.
+    name: str = ""
     width: int
     height: int
     image_url: str
@@ -113,6 +115,31 @@ class Photo(BaseModel):
 
 class PhotoDetail(Photo):
     regions: list[Region]
+
+
+class ProjectCard(BaseModel):
+    """What the projects list shows for one photo: no interpretation or regions, and a small
+    thumbnail whose URL never changes (the browser keeps it)."""
+
+    id: str
+    prompt: str
+    name: str = ""
+    mode: MaskingMode | None = None
+    approved: bool = False
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+    thumbnail_url: str
+
+
+class PhotoPatch(BaseModel):
+    name: str = Field(max_length=200)
+
+
+class ProjectPage(BaseModel):
+    items: list[ProjectCard]
+    # Where the next page starts; None when this was the last one.
+    next_offset: int | None = None
+    total: int
 
 
 class DetectRequest(BaseModel):
@@ -217,6 +244,27 @@ class CreateRegionRequest(BaseModel):
     side: Side | None = None
     color: str | None = Field(default=None, pattern=r"^#[0-9a-fA-F]{6}$")
     polyline: list[list[int]] | None = None
+
+
+class RestoreRegionRequest(BaseModel):
+    """A region deleted in the editor, brought back by Undo exactly as it was: same id, source,
+    type and path. An area carries its mask as a PNG data URL."""
+
+    id: str
+    kind: RegionKind
+    role: RegionRole = "target"
+    label: str = Field(max_length=200)
+    geometry: GeometryType
+    source: Literal["auto", "manual", "inferred"]
+    color: str = Field(pattern=r"^#[0-9a-fA-F]{6}$")
+    score: float = 1.0
+    visible: bool = True
+    side: Side | None = None
+    edge: Edge | None = None
+    polyline: list[list[int]] | None = None
+    confidence: float | None = None
+    sources: list[str] | None = None
+    mask: str | None = None
 
 
 class RegionPatch(BaseModel):

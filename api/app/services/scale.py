@@ -27,7 +27,13 @@ to the other's the same way.
 
 Pitch. A rake lies in its gable wall, so its slope there is the roof's pitch whatever the scale:
 the rakes on gable walls the camera sees well measure it before anything is placed. Else the
-photo's estimated standard pitch, else 6/12. Every face is taken to share it.
+photo's estimated standard pitch, else 6/12. A gable whose own rakes measured a pitch keeps it for
+the faces rising from the eaves at its rakes' feet (a porch or dormer pitched unlike the main
+roof); every other face takes the photo's pitch.
+
+Wall distances are passed on corner by corner ("propagate"), and also fitted from every link at
+once (_walls_linear, a robust least-squares fit); SCALE_WALL_SOLVE picks which places the lines,
+and the debug record compares both.
 
 Lines, by edge:
   - eave: on its wall's eave plane. junction: on its wall.
@@ -108,6 +114,7 @@ class Line:
     edge: str | None
     side: str | None
     topology: str | None = None  # "shared": roof on both sides (hip, valley, ridge); "free": one
+    blocked: list[bool] | None = None  # per end (first, last): an object in front of the house there
 
 
 @dataclass
@@ -125,9 +132,11 @@ class Placed:
     side: str | None = None         # the facade a level line was given
     side_how: str | None = None     # how: walls.Assignment.how, or "chosen" by consistency
     spread: float | None = None     # relative: how far the length moves under the photo's own errors
+    evidence: list | None = None    # what the length rests on: [{"what", "lines"?, ...}]
 
     def to_dict(self) -> dict:
         return {"wall": self.wall, "warning": self.warning, "side": self.side, "side_how": self.side_how,
+                "evidence": self.evidence,
                 "points3d": [[round(float(v), 2) for v in p] for p in self.points3d] if self.points3d else None,
                 "length_in": round(self.length_in, 1) if self.length_in is not None else None,
                 "plane": self.plane, "method": self.method, "assumption": self.assumption,
@@ -150,11 +159,16 @@ class Solution:
     camera: Camera | None = None                # the camera the solve used (the gables' rakes may pick another)
     camera_check: dict | None = None            # the cameras tried and what their rakes said
     reference_check: dict | None = None         # a second known length against the photo's
+    reference_quality: dict | None = None       # how far the measurement itself can be trusted
+    scale_check: dict | None = None             # the doors' heights against the typed length
+    next_measurement: dict | None = None        # the line whose length would help most (_next_measurement)
 
     def to_dict(self) -> dict:
         return {"walls": self.walls, "lines": {k: v.to_dict() for k, v in self.lines.items()}, "needs": self.needs,
                 "warning": self.warning, "pitch": self.pitch, "checks": self.checks, "reference": self.reference,
-                "choice": self.choice, "camera_check": self.camera_check, "reference_check": self.reference_check}
+                "choice": self.choice, "camera_check": self.camera_check, "reference_check": self.reference_check,
+                "reference_quality": self.reference_quality, "scale_check": self.scale_check,
+                "next_measurement": self.next_measurement}
 
 
 class Trace:
@@ -674,6 +688,9 @@ class _Prep:
     overrides: dict
     features: list
     rake_check: dict = field(default_factory=dict)
+    rake_pitches: dict = field(default_factory=dict)   # rake id -> the pitch it measured on its gable wall
+    wall_solve: str = "propagate"                       # which wall distances place the lines (WALL_SOLVES)
+    check: dict | None = None                           # a second known length {region_id, length_in}
 
 
 def _prepare(camera: Camera, lines: list[Line], measurement: dict | None, interpreted: dict | None,
@@ -727,7 +744,8 @@ def _prepare(camera: Camera, lines: list[Line], measurement: dict | None, interp
             ref_assign = (walls_module.assign_points(camera, pixels, lines, assign, facades, tolerance, reach, given)
                           if pixels else None)
         reference = {"pixels": pixels, "length_in": float(measurement["length_in"]), "region_id": region_id,
-                     "on_eave": on_eave, "given": given, "hint": measurement.get("facade")}
+                     "on_eave": on_eave, "given": given, "hint": measurement.get("facade"),
+                     "blocked": measurement.get("blocked")}
         trace.step("3_measurement", by="line" if region_id else "points", region_id=region_id, pixels=pixels,
                    length_in=measurement.get("length_in"), facade_given=given,
                    side_assignment=ref_assign.to_dict() if ref_assign else None, on_eave=on_eave)
@@ -744,6 +762,7 @@ def _prepare(camera: Camera, lines: list[Line], measurement: dict | None, interp
                  for line_id, found in assign.items()}
     as_hip = _hip_readings(lines, facade_of, reach, (measurement or {}).get("region_id"))
     peak, lone = [], []
+    rake_pitches: dict[str, float] = {}
     readings: list[tuple[Line, str, float]] = []   # every rake read on a gable wall, believable or not
     for rake in lines:
         if rake.edge != "rake":
@@ -782,6 +801,7 @@ def _prepare(camera: Camera, lines: list[Line], measurement: dict | None, interp
         trace.add("5_pitch", "rakes", {"id": rake.id, "used": True, "gable": gable, "gable_how": how,
                                        "rise": round(pitch, 2), "at_peak": at_peak})
         (peak if at_peak else lone).append(pitch)
+        rake_pitches[rake.id] = pitch
     chosen = peak or lone
     if chosen:
         rise, rise_source = float(np.median(chosen)), "measured"
@@ -797,7 +817,7 @@ def _prepare(camera: Camera, lines: list[Line], measurement: dict | None, interp
                camera_check=rake_check)
     focal_note = None if camera.focal_source != "assumed" else "the lens is assumed, so depth is approximate"
     return _Prep(camera, lines, by_id, reach, tolerance, facades, normals, up, assign, reference, ref_assign,
-                 rise, rise_source, focal_note, overrides, features, rake_check)
+                 rise, rise_source, focal_note, overrides, features, rake_check, rake_pitches)
 
 
 # Two rakes of one gable read on its wall agree on the pitch to within this ratio when the wall
@@ -829,18 +849,21 @@ def _rake_check(readings: list[tuple[Line, str, float]], reach: float) -> dict:
 
 def solve(camera: Camera, lines: list[Line], measurement: dict | None, interpreted: dict | None = None,
           tolerance_deg: float = 3.0, overrides: dict | None = None, trace: Trace | None = None,
-          features: list | None = None, check: dict | None = None) -> Solution:
+          features: list | None = None, check: dict | None = None, wall_solve: str = "propagate") -> Solution:
     """Scale and 3-D for every line. `measurement` is Photo.scale's {facade, facade_given, points
-    or region_id, length_in}; `overrides` is {line id: {"mid": [x, y], "length_in"}} for lines the
-    geometry cannot place; `features` are detected doors and garage doors ({"id", "kind", "label",
-    "top", "bottom", "left", "right"} in pixels), checked for standard sizes. `trace` records every
-    step (SCALE_DEBUG). The solve may use another camera than `camera` when the gables' rakes
-    reject it (Solution.camera, Solution.camera_check)."""
+    or region_id, length_in, blocked?}; `overrides` is {line id: {"mid": [x, y], "length_in"}} for
+    lines the geometry cannot place; `features` are detected doors and garage doors ({"id", "kind",
+    "label", "top", "bottom", "left", "right"} in pixels), checked for standard sizes. `trace`
+    records every step (SCALE_DEBUG). The solve may use another camera than `camera` when the
+    gables' rakes reject it (Solution.camera, Solution.camera_check). `wall_solve` picks which
+    wall distances place the lines (WALL_SOLVES); both are always computed and traced."""
     trace = trace if trace is not None else Trace(enabled=False)
     camera, camera_check = _checked_camera(camera, lines, measurement, interpreted, tolerance_deg,
                                            overrides or {}, features or [])
     prep = _prepare(camera, lines, measurement, interpreted, tolerance_deg, overrides or {},
                     [dict(f) for f in (features or [])], trace)
+    prep.wall_solve = wall_solve if wall_solve in WALL_SOLVES else "propagate"
+    prep.check = check if check and check.get("region_id") else None
     trace.step("1_camera", camera_check=camera_check)
     solution = _choose(prep, trace)
     solution.camera, solution.camera_check = camera, camera_check
@@ -856,6 +879,10 @@ SECOND_REFERENCE_SLACK = 0.05
 def _second_reference(solution: Solution, check: dict, trace: Trace) -> None:
     """The second known length against what the solve made of its line: the one test of the scale
     that needs no assumption about houses."""
+    if solution.reference_check and solution.reference_check.get("used"):
+        # The second length measured a wall the first did not reach: nothing to check it against.
+        trace.step("9_result", reference_check=solution.reference_check)
+        return
     typed = float(check["length_in"])
     done = solution.lines.get(check["region_id"])
     solved = done.length_in if done is not None and done.points3d and done.method != "override" else None
@@ -1068,7 +1095,9 @@ def _variants(prep: _Prep) -> list[tuple[str, _Prep]]:
     step = PITCH_DOUBT.get(prep.rise_source, 2.0)
     for change in (-step, step):
         if prep.rise + change > 0.5:
-            out.append((f"pitch {change:+.0f}/12", replace(prep, rise=prep.rise + change)))
+            # Each gable's own pitch moves with it: they are read off the same kind of evidence.
+            moved = {k: v + change for k, v in prep.rake_pitches.items() if v + change > 0.5}
+            out.append((f"pitch {change:+.0f}/12", replace(prep, rise=prep.rise + change, rake_pitches=moved)))
     return out
 
 
@@ -1131,7 +1160,6 @@ def _uncertainty(prep: _Prep, choice: dict, solution: Solution, trace: Trace) ->
 def _core(prep: _Prep, choice: dict, trace: Trace) -> Solution:
     camera, lines, by_id, reach, up = prep.camera, prep.lines, prep.by_id, prep.reach, prep.up
     solution = Solution(pitch={"rise": round(prep.rise, 1), "source": prep.rise_source})
-    angle = float(np.arctan2(prep.rise, 12.0))
     pitch_words = {"measured": f"the {prep.rise:.1f}/12 pitch measured on the gable rakes",
                    "estimated": f"an estimated {prep.rise:g}/12 pitch"}.get(prep.rise_source,
                                                                             f"an assumed {prep.rise:g}/12 pitch")
@@ -1237,6 +1265,32 @@ def _core(prep: _Prep, choice: dict, trace: Trace) -> Solution:
             wall_facade[key] = facade
             normals[key] = prep.normals.get(facade)
 
+    # Each gable's own pitch, from its own rakes: a porch or a dormer is often pitched unlike the
+    # main roof. A roof face takes the pitch of the gable whose rakes stand at its eave's ends (a
+    # gable's rakes come down where the eaves its faces rise from end), else the photo's pitch.
+    group_rise: dict[str, float] = {}
+    for key in set(gable_key.values()):
+        rises = [prep.rake_pitches[rake_id] for rake_id, k in gable_key.items() if k == key and rake_id in prep.rake_pitches]
+        if rises:
+            group_rise[key] = float(np.median(rises))
+    trace.step("5_pitch", groups={k: round(v, 2) for k, v in group_rise.items()})
+
+    def rise_for(line_id: str | None = None, eave_id: str | None = None) -> float:
+        """The pitch a roof face through this line (a rake's own gable) or rising from this eave takes."""
+        own = group_rise.get(gable_key.get(line_id)) if line_id else None
+        if own is not None:
+            return own
+        eave = by_id.get(eave_id) if eave_id else None
+        if eave is not None:
+            found = [group_rise[key] for rake_id, key in gable_key.items() if key in group_rise
+                     and any(_ends_meet(_top_and_foot(by_id[rake_id])[1], tip, reach) for tip in (eave.points[0], eave.points[-1]))]
+            if found:
+                return float(np.median(found))
+        return prep.rise
+
+    def angle_of(rise: float) -> float:
+        return float(np.arctan2(rise, 12.0))
+
     # 3. The measurement fixes its wall's distance.
     walls: dict = solution.walls
     measured = None
@@ -1294,8 +1348,10 @@ def _core(prep: _Prep, choice: dict, trace: Trace) -> Solution:
         else:
             measured_plane = sign * ref["length_in"] / _length(unit)
             walls[key] = {"distance_in": measured_plane + sign * (EAVE_OVERHANG_IN if reference_on_eave else 0.0),
-                          "source": "measured", "facade": facade}
+                          "source": "measured", "facade": facade,
+                          "evidence": [{"what": "your measurement", **({"lines": [reference_id]} if reference_id else {})}]}
             measured = key
+            solution.reference_quality = _reference_quality(camera, pixels, normal, ref)
             trace.step("3_measurement", length_at_unit_distance=_length(unit), measured_plane_in=measured_plane,
                        wall_distance_in=walls[key]["distance_in"],
                        overhang_added_in=EAVE_OVERHANG_IN if reference_on_eave else 0.0)
@@ -1310,97 +1366,174 @@ def _core(prep: _Prep, choice: dict, trace: Trace) -> Solution:
     # 5. Distances: through shared corners and through roof faces, until nothing new is reached.
     rejected: set = set()
     links = []
-    changed = bool(walls)
-    while changed:
-        changed = False
-        candidates: dict[str, list[float]] = {}
-        through_pitch: dict[str, bool] = {}
-        for a in lines:
-            known = wall_of.get(a.id)
-            if known not in walls:
-                continue
-            for b in lines:
-                other = wall_of.get(b.id)
-                if other is None or other in walls or normals.get(other) is None:
+    seeds = {measured: walls[measured]} if measured else {}   # walls a typed length measured
+
+    def propagate() -> None:
+        """Corner by corner from every measured wall, until nothing new is reached."""
+        changed = bool(walls)
+        while changed:
+            changed = False
+            candidates: dict[str, list[float]] = {}
+            evidence: dict[str, list[dict]] = {}
+            through_pitch: dict[str, bool] = {}
+            for a in lines:
+                known = wall_of.get(a.id)
+                if known not in walls:
                     continue
-                if wall_facade.get(other) == wall_facade.get(known):
-                    continue    # parallel walls share no corner
-                for end in (a.points[0], a.points[-1]):
-                    for tip in (b.points[0], b.points[-1]):
-                        if _ends_meet(end, tip, reach):
-                            # The corner is on a's own plane, and on b's; b's wall is b's overhang
-                            # behind that.
-                            corner = [(end[0] + tip[0]) / 2, (end[1] + tip[1]) / 2]
-                            if abs(float(normals[known] @ camera.ray(corner))) < GRAZING_MIN:
-                                continue    # the known wall seen edge-on there: the corner's depth is noise
-                            point = _on_plane(camera, corner, normals[known],
-                                              _nearer(walls[known]["distance_in"], _overhang(a)))
-                            if point is not None:
-                                value = float(normals[other] @ point)
-                                candidates.setdefault(other, []).append(value + float(np.sign(value)) * _overhang(b))
-                                through_pitch[other] = through_pitch.get(other, False) or bool(walls[known].get("via_pitch"))
-                                trace.add("4_walls", "corners", {
-                                    "from_line": a.id, "from_wall": known, "to_line": b.id, "to_wall": other,
-                                    "corner_px": [round(corner[0], 1), round(corner[1], 1)],
-                                    "to_wall_distance_in": round(candidates[other][-1], 1)})
-        for other, values in candidates.items():
-            # Every point of a wall in view lies on one side of the camera. Corners that put the
-            # wall through the camera, or on both sides of it, are corners of some other wall
-            # (a misread line), and a median of them is a plane through the lens.
-            values = [v for v in values if abs(v) > 1.0]
-            if not values or (min(values) < 0 < max(values)):
-                if other not in rejected:
-                    rejected.add(other)
-                    trace.add("4_walls", "rejected", {"wall": other, "values": [round(v, 1) for v in values],
-                                                      "why": "no corner off the lens" if not values
-                                                      else "corners on both sides of the camera"})
-                continue
-            walls[other] = {"distance_in": float(np.median(values)), "source": "corner",
-                            "facade": wall_facade[other], "via_pitch": through_pitch.get(other, False)}
-            changed = True
-        for setback in setbacks:
-            link = _link(camera, setback, walls, normals, by_id, up, angle, wall_of.get(setback.eave))
-            if link:
-                links.append(link)
-                changed = True
-        # A gable standing on its own wall's eave: a rake's foot on an eave of the same direction
-        # puts the gable end in that eave's wall, at its distance. Parallel walls share no corner,
-        # so without this a cross gable flush with the front wall, and every wall reached only
-        # through it, stayed unmeasured (7d231dc3: the front gables, then the side gable beyond).
-        for rake_id, key in gable_key.items():
-            if key in walls or normals.get(key) is None:
-                continue
-            _, foot = _top_and_foot(by_id[rake_id])
-            for other in lines:
-                other_key = wall_of.get(other.id)
-                if (other.edge not in WALL_EDGES or other_key not in walls
-                        or wall_facade.get(other_key) != wall_facade.get(key)):
-                    continue
-                if _to_polyline(foot, other.points) <= reach:
-                    walls[key] = {"distance_in": walls[other_key]["distance_in"], "source": "corner",
-                                  "facade": wall_facade[key], "via_pitch": bool(walls[other_key].get("via_pitch"))}
-                    links.append({"from": other_key, "to": key, "distance_in": round(walls[key]["distance_in"], 1),
-                                  "why": "gable on its eave"})
-                    changed = True
-                    break
-        if not changed:
-            # A run of a facade no corner reaches is taken in line with a run of that facade that
-            # is known (the measured one first): the old one-plane-per-side reading, and said so.
-            # Only once nothing else moves, so a corner always wins over this.
-            for key, facade in split_of.items():
-                for k in (key, facade):
-                    if k in walls:
+                for b in lines:
+                    other = wall_of.get(b.id)
+                    if other is None or other in walls or normals.get(other) is None:
                         continue
-                    siblings = [s for s in (measured, facade, *split_of)
-                                if s and s != k and s in walls and wall_facade.get(s) == facade]
-                    if siblings:
-                        source = walls[siblings[0]]
-                        walls[k] = {"distance_in": source["distance_in"], "source": "same plane", "facade": facade,
-                                    "via_pitch": bool(source.get("via_pitch")), "same_as": siblings[0]}
-                        trace.add("4_walls", "same_plane", {"wall": k, "as": siblings[0]})
+                    if wall_facade.get(other) == wall_facade.get(known):
+                        continue    # parallel walls share no corner
+                    for end in (a.points[0], a.points[-1]):
+                        for tip in (b.points[0], b.points[-1]):
+                            if _ends_meet(end, tip, reach):
+                                # The corner is on a's own plane, and on b's; b's wall is b's overhang
+                                # behind that.
+                                corner = [(end[0] + tip[0]) / 2, (end[1] + tip[1]) / 2]
+                                if abs(float(normals[known] @ camera.ray(corner))) < GRAZING_MIN:
+                                    continue    # the known wall seen edge-on there: the corner's depth is noise
+                                point = _on_plane(camera, corner, normals[known],
+                                                  _nearer(walls[known]["distance_in"], _overhang(a)))
+                                if point is not None:
+                                    value = float(normals[other] @ point)
+                                    candidates.setdefault(other, []).append(value + float(np.sign(value)) * _overhang(b))
+                                    evidence.setdefault(other, []).append({"what": "corner", "lines": [a.id, b.id],
+                                                                           "from_wall": known,
+                                                                           "distance_in": round(candidates[other][-1], 1)})
+                                    through_pitch[other] = through_pitch.get(other, False) or bool(walls[known].get("via_pitch"))
+                                    trace.add("4_walls", "corners", {
+                                        "from_line": a.id, "from_wall": known, "to_line": b.id, "to_wall": other,
+                                        "corner_px": [round(corner[0], 1), round(corner[1], 1)],
+                                        "to_wall_distance_in": round(candidates[other][-1], 1)})
+            for other, values in candidates.items():
+                # Every point of a wall in view lies on one side of the camera. Corners that put the
+                # wall through the camera, or on both sides of it, are corners of some other wall
+                # (a misread line), and a median of them is a plane through the lens.
+                values = [v for v in values if abs(v) > 1.0]
+                if not values or (min(values) < 0 < max(values)):
+                    if other not in rejected:
+                        rejected.add(other)
+                        trace.add("4_walls", "rejected", {"wall": other, "values": [round(v, 1) for v in values],
+                                                          "why": "no corner off the lens" if not values
+                                                          else "corners on both sides of the camera"})
+                    continue
+                walls[other] = {"distance_in": float(np.median(values)), "source": "corner",
+                                "facade": wall_facade[other], "via_pitch": through_pitch.get(other, False),
+                                "evidence": evidence.get(other, [])}
+                changed = True
+            for setback in setbacks:
+                rise = rise_for(eave_id=setback.eave)
+                link = _link(camera, setback, walls, normals, by_id, up, angle_of(rise), wall_of.get(setback.eave))
+                if link:
+                    links.append(link)
+                    walls[link["to"]]["evidence"] = [{"what": "roof face", "lines": [setback.eave, setback.junction],
+                                                      "from_wall": link["from"], "rise": round(rise, 2)}]
+                    changed = True
+            # A gable standing on its own wall's eave: a rake's foot on an eave of the same direction
+            # puts the gable end in that eave's wall, at its distance. Parallel walls share no corner,
+            # so without this a cross gable flush with the front wall, and every wall reached only
+            # through it, stayed unmeasured (7d231dc3: the front gables, then the side gable beyond).
+            for rake_id, key in gable_key.items():
+                if key in walls or normals.get(key) is None:
+                    continue
+                _, foot = _top_and_foot(by_id[rake_id])
+                for other in lines:
+                    other_key = wall_of.get(other.id)
+                    if (other.edge not in WALL_EDGES or other_key not in walls
+                            or wall_facade.get(other_key) != wall_facade.get(key)):
+                        continue
+                    if _to_polyline(foot, other.points) <= reach:
+                        walls[key] = {"distance_in": walls[other_key]["distance_in"], "source": "corner",
+                                      "facade": wall_facade[key], "via_pitch": bool(walls[other_key].get("via_pitch")),
+                                      "evidence": [{"what": "gable on its eave", "lines": [rake_id, other.id],
+                                                    "from_wall": other_key}]}
+                        links.append({"from": other_key, "to": key, "distance_in": round(walls[key]["distance_in"], 1),
+                                      "why": "gable on its eave"})
                         changed = True
+                        break
+            if not changed:
+                # A run of a facade no corner reaches is taken in line with a run of that facade that
+                # is known (the measured one first): the old one-plane-per-side reading, and said so.
+                # Only once nothing else moves, so a corner always wins over this.
+                for key, facade in split_of.items():
+                    for k in (key, facade):
+                        if k in walls:
+                            continue
+                        siblings = [s for s in (*seeds, facade, *split_of)
+                                    if s and s != k and s in walls and wall_facade.get(s) == facade]
+                        if siblings:
+                            source = walls[siblings[0]]
+                            walls[k] = {"distance_in": source["distance_in"], "source": "same plane", "facade": facade,
+                                        "via_pitch": bool(source.get("via_pitch")), "same_as": siblings[0],
+                                        "evidence": [{"what": "same plane", "from_wall": siblings[0]}]}
+                            trace.add("4_walls", "same_plane", {"wall": k, "as": siblings[0]})
+                            changed = True
+
+    def fitted() -> tuple[dict, dict]:
+        """The same distances from every link at once (_walls_linear)."""
+        return _walls_linear(camera, lines, wall_of, normals, wall_facade, setbacks, split_of, gable_key,
+                             by_id, up, reach, seeds, rise_for, angle_of)
+
+    check = prep.check or {}
+    check_id = check.get("region_id")
+
+    def second_seed(used: dict) -> tuple[str, dict] | None:
+        """A second known length on a wall the first did not reach (or reached only by taking it in
+        line with another run): that wall's own distance, the way step 3 takes the first's. On a
+        wall the first reached, the second stays a check (_second_reference)."""
+        line = by_id.get(check_id) if check_id and measured else None
+        if line is None or line.id == reference_id or not check.get("length_in"):
+            return None
+        key = wall_of.get(line.id)
+        normal = normals.get(key) if key else None
+        if normal is None or (key in used and used[key].get("source") != "same plane"):
+            return None
+        if _grazing(camera, line.points, normal) < GRAZING_MIN:
+            return None
+        sign = 1.0 if float(normal @ camera.ray(line.points[0])) > 0 else -1.0
+        unit = [_on_plane(camera, p, normal, sign) for p in line.points]
+        if any(p is None for p in unit) or _length(unit) <= 0:
+            return None
+        plane = sign * float(check["length_in"]) / _length(unit)
+        return key, {"distance_in": plane + sign * _overhang(line), "source": "second measurement",
+                     "facade": wall_facade.get(key, key),
+                     "evidence": [{"what": "your second length", "lines": [line.id]}]}
+
+    propagate()
+    linear, report = fitted() if seeds else ({}, {})
+    second = second_seed(linear if prep.wall_solve == "linear" else walls)
+    if second is not None:
+        # Everything again from both measured walls: what the first reached only "in line" moves.
+        key, entry = second
+        seeds[key] = entry
+        wall_of[check_id] = key
+        walls.clear()
+        walls.update(seeds)
+        rejected.clear()
+        links.clear()
+        propagate()
+        linear, report = fitted()
+        solution.reference_check = {"region_id": check_id, "typed_in": round(float(check["length_in"]), 1),
+                                    "solved_in": None, "off": None, "used": "measurement", "wall": key}
+        trace.step("3_measurement", second={"line": check_id, "wall": key,
+                                             "wall_distance_in": round(entry["distance_in"], 1)})
     trace.step("4_walls", walls={k: dict(w) for k, w in walls.items()}, links=links,
                unreached=[k for k in wall_facade if k not in walls])
+
+    # Both wall solves are always computed so the debug record compares them; the linear one
+    # places the lines only when SCALE_WALL_SOLVE=linear.
+    if seeds:
+        report["compare"] = {k: {"propagate": round(walls[k]["distance_in"], 1) if k in walls else None,
+                                 "linear": round(linear[k]["distance_in"], 1) if k in linear else None}
+                             for k in sorted(set(walls) | set(linear))}
+        report["used"] = prep.wall_solve
+        trace.step("4_walls", linear=report)
+        if prep.wall_solve == "linear":
+            walls.clear()
+            walls.update(linear)
+            rejected = {tuple(pair) for pair in report["outlier_corners"]}
 
     # 6. Placement.
     focal_note = prep.focal_note
@@ -1414,12 +1547,14 @@ def _core(prep: _Prep, choice: dict, trace: Trace) -> Solution:
         if any(p is None for p in points):
             return Placed(line.id, needs="edge_on", side=facade_of.get(line.id), side_how=side_how.get(line.id))
         notes, confidence = [], EXACT
-        if key != measured and focal_note:
+        if key not in seeds and focal_note:
             notes.append(focal_note)
             confidence = ASSUMED
         if walls[key].get("via_pitch"):
             notes.append(link_note)
             confidence = _worst(confidence, pitch_sure)
+        if walls[key].get("source") == "second measurement":
+            notes.append("its wall's scale is from your second length")
         if walls[key].get("source") == "same plane":
             notes.append(f"taken in line with the {wall_facade.get(key, key)} wall it does not join: "
                          "no corner gives its own depth")
@@ -1435,7 +1570,14 @@ def _core(prep: _Prep, choice: dict, trace: Trace) -> Solution:
             notes.append("side chosen by consistency: its direction fits more than one wall")
             confidence = _worst(confidence, STATED)
         return Placed(line.id, points, _length(points), plane, method, assumption="; ".join(notes) or None,
-                      confidence=confidence, wall=key, side=facade_of.get(line.id), side_how=side_how.get(line.id))
+                      confidence=confidence, wall=key, side=facade_of.get(line.id), side_how=side_how.get(line.id),
+                      evidence=wall_evidence(key))
+
+    def wall_evidence(key: str) -> list[dict]:
+        """A wall's distance and what gave it: the measurement, corners, a roof face."""
+        wall = walls[key]
+        return [{"what": "wall", "wall": key, "source": wall.get("source"),
+                 "distance_in": round(float(wall["distance_in"]), 1), "from": wall.get("evidence") or []}]
 
     placed: dict[str, Placed] = {}
     for line in lines:
@@ -1449,6 +1591,9 @@ def _core(prep: _Prep, choice: dict, trace: Trace) -> Solution:
         where = wall_facade.get(key, key) + (" set-back wall" if "+" in key else " wall")
         if line.id == reference_id:
             placed[line.id] = on_wall(line, key, "measured", f"{where}, your measurement")
+            continue
+        if line.id == check_id and walls[key].get("source") == "second measurement":
+            placed[line.id] = on_wall(line, key, "measured", f"{where}, your second length")
             continue
         grazing = _grazing(camera, line.points, normals[key])
         if grazing < GRAZING_MIN:
@@ -1470,23 +1615,31 @@ def _core(prep: _Prep, choice: dict, trace: Trace) -> Solution:
                      if any(_ends_meet(foot, tip, reach) for tip in (e.points[0], e.points[-1]))), None)
 
     face_level: dict[str, np.ndarray] = {}   # a line put on a roof face -> that face's level direction
+    face_rise: dict[str, float] = {}          # ... and the pitch that face took
 
     def on_face(line: Line, level: np.ndarray, through: np.ndarray, method: str, plane: str, why: str | None,
-                sure: str | None, back: bool = False, source: str | None = None) -> Placed:
-        normal, offset = _roof_face(level, through, up, angle, back)
+                sure: str | None, back: bool = False, source: str | None = None, rise: float | None = None) -> Placed:
+        rise = prep.rise if rise is None else rise
+        normal, offset = _roof_face(level, through, up, angle_of(rise), back)
         points = [_on_plane(camera, p, normal, offset) for p in line.points]
         if any(p is None for p in points):
             return Placed(line.id, needs="edge_on")
-        notes = [n for n in (why, f"depth from {pitch_words}", focal_note) if n]
-        trace.line(line.id, face="back" if back else "front", face_from=source)
+        own = abs(rise - prep.rise) > 1e-6
+        words = f"the {rise:.1f}/12 pitch measured on this roof's own gable rakes" if own else pitch_words
+        notes = [n for n in (why, f"depth from {words}", focal_note) if n]
+        trace.line(line.id, face="back" if back else "front", face_from=source, face_rise=round(rise, 2))
         face_level[line.id] = level
+        face_rise[line.id] = rise
+        evidence = [{"what": "roof face", **({"lines": [source]} if source else {}), "rise": round(rise, 2),
+                     "pitch": "this gable's rakes" if own else prep.rise_source}]
         return Placed(line.id, points, _length(points), plane, method, assumption="; ".join(notes),
-                      confidence=_worst(pitch_sure, sure))
+                      confidence=_worst(STATED if own else pitch_sure, sure), evidence=evidence)
 
     def from_eave(line: Line, eave: tuple[Line, Placed], plane: str, why: str | None) -> Placed:
         done = eave[1]
         return on_face(line, done.points3d[-1] - done.points3d[0], (done.points3d[0] + done.points3d[-1]) / 2,
-                       "pitch", plane, why, done.confidence, source=eave[0].id)
+                       "pitch", plane, why, done.confidence, source=eave[0].id,
+                       rise=rise_for(line.id, eave[0].id))
 
     def gable_through_foot(line: Line, gable: str) -> None:
         """A gable wall no corner reached (its rake was not a rake then): through the corner at the
@@ -1508,7 +1661,8 @@ def _core(prep: _Prep, choice: dict, trace: Trace) -> Solution:
                         through_pitch = through_pitch or bool(walls[done.wall].get("via_pitch"))
         if values and not min(values) < 0 < max(values):
             walls[gable] = {"distance_in": float(np.median(values)), "source": "corner",
-                            "facade": wall_facade.get(gable, gable), "via_pitch": through_pitch}
+                            "facade": wall_facade.get(gable, gable), "via_pitch": through_pitch,
+                            "evidence": [{"what": "corner at the rake's foot", "lines": [line.id]}]}
 
     pending: list[tuple[Line, Placed | None, str, str | None, str]] = []
 
@@ -1602,7 +1756,11 @@ def _core(prep: _Prep, choice: dict, trace: Trace) -> Solution:
                 assumption=(HIP_WHY[as_hip[line.id]] if line.id in as_hip else "")
                 + f"adjacent roof faces share one pitch (implies {implied:.1f}/12)"
                 + (f"; {focal_note}" if focal_note else ""),
-                confidence=_worst(STATED, corners_confidence(placed, lines, end, reach)))
+                confidence=_worst(STATED, corners_confidence(placed, lines, end, reach)),
+                evidence=[{"what": "hip over the corner's bisector", "bisector": how,
+                           "lines": [other.id for other in lines if other.edge in WALL_EDGES and other.id in placed
+                                     and any(_ends_meet(end, tip, reach) for tip in (other.points[0], other.points[-1]))],
+                           "implied_rise": round(implied, 2)}])
             break
 
     # A rake read as a hip that the hip rule could not place goes back to the rake rule.
@@ -1645,7 +1803,8 @@ def _core(prep: _Prep, choice: dict, trace: Trace) -> Solution:
             done = placed[partner.id]
             peak = max(done.points3d, key=lambda p: float(p @ up))
             face = on_face(line, face_level[partner.id], peak, "pitch", "roof face beyond the ridge",
-                           "the far slope of the gable, from its peak", done.confidence, back=True, source=partner.id)
+                           "the far slope of the gable, from its peak", done.confidence, back=True, source=partner.id,
+                           rise=face_rise.get(partner.id))
             if face.points3d:
                 placed[line.id] = face
                 continue
@@ -1704,7 +1863,8 @@ def _core(prep: _Prep, choice: dict, trace: Trace) -> Solution:
             notes = [n for n in (assumption, focal_note) if n]
             placed[line.id] = Placed(line.id, points, _length(points), f"between the {' and the '.join(whats)}s"
                                      if len(whats) == 1 else f"between the {whats[0]} and the {whats[1]}", "ridge",
-                                     assumption="; ".join(notes) or None, confidence=confidence)
+                                     assumption="; ".join(notes) or None, confidence=confidence,
+                                     evidence=[{"what": "between two anchors", "anchors": [ends[0][2], ends[1][2]]}])
             continue
         facade = facade_of.get(line.id)
         if facade not in prep.normals or not camera.horizontal or facade not in camera.facades:
@@ -1722,7 +1882,8 @@ def _core(prep: _Prep, choice: dict, trace: Trace) -> Solution:
                 what, "from a hip, which assumes one pitch")
             notes = [n for n in (assumption, focal_note) if n]
             placed[line.id] = Placed(line.id, points, _length(points), f"level from the {what}", "ridge",
-                                     assumption="; ".join(notes) or None, confidence=sure)
+                                     assumption="; ".join(notes) or None, confidence=sure,
+                                     evidence=[{"what": "level from one anchor", "anchors": [what]}])
             break
 
     # (c0) a valley whose two ends lie on placed lines (a dormer's side eave above, the line where
@@ -1765,7 +1926,8 @@ def _core(prep: _Prep, choice: dict, trace: Trace) -> Solution:
         placed[line.id] = Placed(line.id, points, _length(points),
                                  f"between the {ends[0][1].edge} and the {ends[1][1].edge} it joins", "valley",
                                  assumption="; ".join(notes),
-                                 confidence=_worst(STATED, ends[0][2].confidence, ends[1][2].confidence))
+                                 confidence=_worst(STATED, ends[0][2].confidence, ends[1][2].confidence),
+                                 evidence=[{"what": "between the lines it joins", "lines": [ends[0][1].id, ends[1][1].id]}])
         trace.line(line.id, valley_between=[ends[0][1].id, ends[1][1].id])
 
     # (c) the rest of the ridges, hips and valleys: the face rising from the nearest eave.
@@ -1842,13 +2004,34 @@ def _core(prep: _Prep, choice: dict, trace: Trace) -> Solution:
     context = checks_module.Context(camera, lines, placed, walls, wall_of, normals, up, measured, reach,
                                     _overhang, features, len(rejected))
     solution.penalty, solution.checks = checks_module.evaluate(context)
+    # Said, never scored: none of these depends on which wall an undecided line is on.
+    solution.checks += _symmetry(lines, placed, gable_key, up, reach)
+    if ref is not None and measured:
+        # The doors' heights against the typed length: a warning only, the typed length stands.
+        solution.scale_check = checks_module.scale_evidence(features, ref["length_in"])
+        if solution.scale_check and solution.scale_check.get("message"):
+            solution.checks.insert(0, {"kind": "scale", "lines": [s["id"] for s in solution.scale_check["sources"]],
+                                       "message": solution.scale_check["message"]})
+    quality = solution.reference_quality
+    if quality and quality["grade"] == "poor":
+        solution.checks.append({"kind": "reference", "lines": [reference_id] if reference_id else [],
+                                "message": "Your measurement is a weak base for the whole house: "
+                                           + "; ".join(quality["reasons"])
+                                           + ". Measure something longer and squarer to the camera, such as a whole "
+                                             "eave or a garage door's width."})
     undecided = [line_id for line_id, how in side_how.items() if how == "ambiguous"]
     if undecided:
         solution.checks.append({"kind": "side", "lines": undecided,
                                 "message": "The side of the house some lines are on is unclear from the photo; "
                                            "check their side."})
-    solution.warning = next((c["message"] for c in solution.checks if c["kind"] in ("plausibility", "size")), None)
+    solution.warning = next((c["message"] for c in solution.checks
+                             if c["kind"] in ("scale", "plausibility", "size")), None)
+    solution.next_measurement = _next_measurement(camera, lines, walls, wall_of, normals, wall_facade,
+                                                  (report or {}).get("edges", []), measured, quality,
+                                                  second is not None)
     trace.step("8_checks", penalty=round(solution.penalty, 3), checks=solution.checks,
+               scale_check=solution.scale_check, reference_quality=solution.reference_quality,
+               next_measurement=solution.next_measurement,
                features=[{k: f.get(k) for k in ("id", "kind", "label", "wall", "measured", "side_assignment")}
                          for f in features])
     for line_id, done in placed.items():
@@ -1921,7 +2104,9 @@ def _estimate_from_neighbours(lines: list[Line], solution: "Solution", reach: fl
                        "set it by hand, or measure that part, for a firm figure",
             confidence=ASSUMED, needs=None, wall=done.wall if done else None,
             side=done.side if done else None, side_how=done.side_how if done else None,
-            spread=done.spread if done else None)
+            spread=done.spread if done else None,
+            evidence=[{"what": "scale of the lines around it", "lines": [item[1].id for item in chosen],
+                       "in_per_px": round(ratio, 3)}])
 
 
 def corners_confidence(placed: dict, lines: list[Line], end, reach: float) -> str | None:
@@ -1973,3 +2158,376 @@ def _link(camera: Camera, setback: walls_module.SetBack, walls: dict, normals: d
         walls[main] = {"distance_in": found, "source": "roof face", "facade": setback.facade, "via_pitch": True}
         return {"from": high, "to": main, "distance_in": round(found, 1)}
     return None
+
+
+# -- wall distances from every link at once ----------------------------------------------------------
+
+# Which wall distances place the lines (SCALE_WALL_SOLVE). Both are computed on every solve and the
+# debug record compares them; "propagate" stays the default until measured houses show "linear"
+# is at least as good.
+WALL_SOLVES = ("propagate", "linear")
+# A link whose distance misses the fit by this share has its weight halved (a Cauchy loss): one
+# misread corner cannot pull a wall the way it pulls a median of two.
+LINK_CAUCHY = 0.05
+SAME_PLANE_WEIGHT = 0.1           # a run no link reaches, held in line with its sibling, barely
+OUTLIER_WEIGHT = 0.25             # a link weighed below this in the end is reported as an outlier
+
+
+def _wall_sign(camera: Camera, key: str, lines: list[Line], wall_of: dict, normals: dict) -> float | None:
+    """The sign a wall's distance must have for its lines to be in front of the camera."""
+    for line in lines:
+        if wall_of.get(line.id) == key:
+            return 1.0 if float(normals[key] @ camera.ray(line.points[0])) > 0 else -1.0
+    return None
+
+
+def _walls_linear(camera: Camera, lines: list[Line], wall_of: dict, normals: dict, wall_facade: dict,
+                  setbacks: list, split_of: dict, gable_key: dict, by_id: dict, up: np.ndarray, reach: float,
+                  seeds: dict, rise_for, angle_of) -> tuple[dict, dict]:
+    """Every wall's distance from every link at once: a robust weighted least-squares fit.
+
+    With the camera and the pitch fixed, each link is linear in the wall distances:
+      - a corner where lines of walls A and B meet: its ray meets A's plane (the one the camera sees
+        better) at P = r·(d_A − s_A·o_a)/(n_A·r), and B's plane passes through it, so
+        d_B − α·d_A = −α·s_A·o_a + s_B·o_b, α = (n_B·r)/(n_A·r), o the lines' overhangs;
+      - a set-back wall through the roof face from the eave below: d_high = κ·d_main + c (the same
+        construction as _link, which is affine in d_main);
+      - a gable standing on its own wall's eave: d_gable = d_wall;
+      - a run no link reaches: in line with a known run of its facade, weighted SAME_PLANE_WEIGHT.
+    The measured walls (`seeds`: key -> wall entry) are fixed. Iteratively reweighted with a Cauchy
+    loss (LINK_CAUCHY, relative to the wall's distance), so a misread corner loses its say instead of being outvoted by order
+    or a median. A wall the fit puts behind the camera, or that only outliers reach, is dropped.
+    Returns (walls, report)."""
+    usable = {k for k, n in normals.items() if n is not None}
+    rows: list[dict] = []
+    for i, a in enumerate(lines):
+        ka = wall_of.get(a.id)
+        if ka not in usable:
+            continue
+        for b in lines[i + 1:]:
+            kb = wall_of.get(b.id)
+            if kb not in usable or kb == ka or wall_facade.get(ka) == wall_facade.get(kb):
+                continue    # parallel walls share no corner
+            for end in (a.points[0], a.points[-1]):
+                for tip in (b.points[0], b.points[-1]):
+                    if not _ends_meet(end, tip, reach):
+                        continue
+                    ray = camera.ray([(end[0] + tip[0]) / 2, (end[1] + tip[1]) / 2])
+                    fa, fb = float(normals[ka] @ ray), float(normals[kb] @ ray)
+                    if max(abs(fa), abs(fb)) < GRAZING_MIN:
+                        continue    # both walls edge-on there: the corner's depth is noise
+                    if abs(fa) >= abs(fb):
+                        base, line_base, f_base, other, line_other, f_other = ka, a, fa, kb, b, fb
+                    else:
+                        base, line_base, f_base, other, line_other, f_other = kb, b, fb, ka, a, fa
+                    alpha = f_other / f_base
+                    rhs = (-alpha * float(np.sign(f_base)) * _overhang(line_base)
+                           + float(np.sign(f_other)) * _overhang(line_other))
+                    rows.append({"coef": {other: 1.0, base: -alpha}, "rhs": rhs, "w0": 1.0, "what": "corner",
+                                 "lines": [a.id, b.id], "pitch": False})
+    for setback in setbacks:
+        main, high = wall_of.get(setback.eave) or setback.facade, setback.key
+        eave = by_id.get(setback.eave)
+        normal = normals.get(setback.facade)
+        if eave is None or normal is None or high not in usable:
+            continue
+        sign = 1.0 if float(normal @ camera.ray(eave.points[0])) > 0 else -1.0
+        rise = rise_for(eave_id=setback.eave)
+        found = []
+        for known in (1000.0, 2000.0):
+            trial = {main: {"distance_in": sign * known}}
+            if _link(camera, setback, trial, normals, by_id, up, angle_of(rise), main) and high in trial:
+                found.append(trial[high]["distance_in"])
+        if len(found) == 2:
+            kappa = (found[1] - found[0]) / (sign * 1000.0)
+            rows.append({"coef": {high: 1.0, main: -kappa}, "rhs": found[0] - kappa * sign * 1000.0, "w0": 1.0,
+                         "what": "roof face", "lines": [setback.eave, setback.junction], "pitch": True,
+                         "rise": round(rise, 2)})
+    for rake_id, key in gable_key.items():
+        if key not in usable or rake_id not in by_id:
+            continue
+        _, foot = _top_and_foot(by_id[rake_id])
+        for other in lines:
+            other_key = wall_of.get(other.id)
+            if (other.edge not in WALL_EDGES or other_key not in usable or other_key == key
+                    or wall_facade.get(other_key) != wall_facade.get(key)):
+                continue
+            if _to_polyline(foot, other.points) <= reach:
+                rows.append({"coef": {key: 1.0, other_key: -1.0}, "rhs": 0.0, "w0": 1.0,
+                             "what": "gable on its eave", "lines": [rake_id, other.id], "pitch": False})
+                break
+
+    def reached_from(rows_in: list[dict]) -> set:
+        found, changed = set(seeds), True
+        while changed:
+            changed = False
+            for row in rows_in:
+                keys = set(row["coef"])
+                if keys & found and not keys <= found:
+                    found |= keys
+                    changed = True
+        return found
+
+    reached = reached_from(rows)
+    for key, facade in split_of.items():
+        for k in (key, facade):
+            if k in reached or k not in usable:
+                continue
+            siblings = [s for s in (*seeds, facade, *split_of) if s and s != k and s in reached
+                        and wall_facade.get(s) == facade]
+            if siblings:
+                rows.append({"coef": {k: 1.0, siblings[0]: -1.0}, "rhs": 0.0, "w0": SAME_PLANE_WEIGHT,
+                             "what": "same plane", "lines": [], "pitch": False, "same_as": siblings[0]})
+                reached.add(k)
+    reached = reached_from(rows)
+    report: dict = {"links": len(rows), "outlier_corners": [], "dropped": {}, "unreached": [],
+                    "edges": [sorted(row["coef"]) for row in rows]}
+    out = {k: dict(entry) for k, entry in seeds.items()}
+    fixed = {k: float(entry["distance_in"]) for k, entry in seeds.items()}
+    keys = sorted(k for k in reached if k not in seeds)
+    if not keys:
+        return out, report
+    index = {k: i for i, k in enumerate(keys)}
+    used = [row for row in rows if set(row["coef"]) <= reached]
+    A = np.zeros((len(used), len(keys)))
+    b = np.zeros(len(used))
+    for i, row in enumerate(used):
+        b[i] = row["rhs"]
+        for k, c in row["coef"].items():
+            if k in fixed:
+                b[i] -= c * fixed[k]
+            else:
+                A[i, index[k]] += c
+    w0 = np.array([row["w0"] for row in used])
+    weights = w0.copy()
+    x = np.zeros(len(keys))
+    relative = np.zeros(len(used))
+    # Each row reads the wall whose coefficient is 1; its miss is taken relative to that distance.
+    reads = [next(k for k, c in row["coef"].items() if c == 1.0) for row in used]
+    for _ in range(20):
+        root = np.sqrt(weights)
+        x = np.linalg.lstsq(A * root[:, None], b * root, rcond=None)[0]
+        size = np.array([max(abs(fixed[k] if k in fixed else float(x[index[k]])), 1.0) for k in reads])
+        relative = (A @ x - b) / size
+        weights = w0 / (1.0 + (relative / LINK_CAUCHY) ** 2)
+    for row, weight, miss in zip(used, weights, relative):
+        row["weight"], row["miss"] = float(weight / row["w0"]), float(miss)
+        if row["what"] == "corner" and row["weight"] < OUTLIER_WEIGHT:
+            report["outlier_corners"].append(list(row["lines"]))
+    # Which walls are reached through a roof face: along the links that held, from the measurement.
+    via = {k: bool(entry.get("via_pitch")) for k, entry in seeds.items()}
+    changed = True
+    while changed:
+        changed = False
+        for row in used:
+            if row["weight"] < OUTLIER_WEIGHT:
+                continue
+            known = [k for k in row["coef"] if k in via]
+            for k in row["coef"]:
+                if k not in via and known:
+                    via[k] = any(via[j] for j in known) or row["pitch"]
+                    changed = True
+    for k in keys:
+        mine = [row for row in used if k in row["coef"]]
+        held = [row for row in mine if row["weight"] >= OUTLIER_WEIGHT]
+        distance = float(x[index[k]])
+        expected = _wall_sign(camera, k, lines, wall_of, normals)
+        if not held:
+            report["dropped"][k] = "only outlying links reach it"
+            continue
+        if abs(distance) <= 1.0 or (expected is not None and np.sign(distance) != expected):
+            report["dropped"][k] = "the fit puts it behind the camera"
+            continue
+        only_same = all(row["what"] == "same plane" for row in held)
+        misses = [row["miss"] for row in held]
+        out[k] = {"distance_in": distance, "source": "same plane" if only_same else "solved",
+                  "facade": wall_facade.get(k, k), "via_pitch": bool(via.get(k, False)),
+                  "residual": round(float(np.sqrt(np.mean(np.square(misses)))), 4),
+                  "evidence": [{"what": row["what"], **({"lines": row["lines"]} if row["lines"] else {}),
+                                **({"same_as": row["same_as"]} if "same_as" in row else {}),
+                                **({"rise": row["rise"]} if "rise" in row else {}),
+                                "weight": round(row["weight"], 2), "miss": round(row["miss"], 3)} for row in mine]}
+        if only_same:
+            out[k]["same_as"] = held[0].get("same_as")
+    report["unreached"] = sorted(k for k in usable if k not in out and k not in report["dropped"])
+    return out, report
+
+
+# -- what the measurement itself is worth ---------------------------------------------------------------
+
+REFERENCE_TAP = (0.025, 0.05)        # fair, poor: a pixel's slip at each end, relative to the length
+REFERENCE_VIEW_DEG = (30.0, 15.0)    # fair, poor: how squarely the camera sees its wall
+
+
+def _reference_quality(camera: Camera, pixels, normal: np.ndarray, ref: dict) -> dict:
+    """How far the typed measurement can carry the house: its length in the photo (a pixel's slip at
+    each end), how squarely its wall is seen, and whether an object hides an end of it."""
+    length = sum(float(np.hypot(b[0] - a[0], b[1] - a[1])) for a, b in zip(pixels[:-1], pixels[1:]))
+    tap = 2.0 / length if length > 0 else float("inf")
+    view = float(np.degrees(np.arcsin(min(1.0, _grazing(camera, pixels, normal)))))
+    blocked = bool(any(ref.get("blocked") or []))
+    rank, reasons = 0, []
+    if tap > REFERENCE_TAP[1]:
+        rank = 2
+        reasons.append(f"it is only {length:.0f} px long in the photo, so a pixel's slip at each end moves every "
+                       f"length by up to {tap:.0%}")
+    elif tap > REFERENCE_TAP[0]:
+        rank = 1
+        reasons.append(f"it is {length:.0f} px long, so a pixel's slip at each end moves every length by up to {tap:.0%}")
+    if view < REFERENCE_VIEW_DEG[1]:
+        rank = 2
+        reasons.append(f"its wall is seen nearly edge-on ({view:.0f} deg)")
+    elif view < REFERENCE_VIEW_DEG[0]:
+        rank = max(rank, 1)
+        reasons.append(f"its wall is seen at a slant ({view:.0f} deg)")
+    if blocked:
+        rank = 2
+        reasons.append("an end of it is behind something in front of the house")
+    return {"grade": ("good", "fair", "poor")[rank], "pixels": round(length, 1),
+            "tap_error": round(tap, 3) if np.isfinite(tap) else None, "view_deg": round(view, 1),
+            "blocked": blocked, "reasons": reasons}
+
+
+# -- sides that should match -----------------------------------------------------------------------------
+
+SYMMETRY_SLACK = {"rake": 0.10, "hip": 0.15}    # two sides further apart than this are questioned
+
+
+def _end_story(line: Line, index: int, lines: list[Line], reach: float) -> str:
+    """What one end of a line meets, in words a salesperson can check."""
+    end = line.points[index]
+    if line.blocked and line.blocked[0 if index == 0 else -1]:
+        return "is behind something in front of the house"
+    met = [other.edge or "line" for other in lines if other is not line
+           and (any(_ends_meet(end, tip, reach) for tip in (other.points[0], other.points[-1]))
+                or (other.edge in WALL_EDGES and _to_polyline(end, other.points) <= reach))]
+    if not met:
+        return "meets no other line, so it was probably traced short (hidden by another part of the house)"
+    if "eave" in met:
+        return "stops at an eave"
+    return f"runs on to a {met[0]}"
+
+
+def _symmetry(lines: list[Line], placed: dict, gable_key: dict, up: np.ndarray, reach: float) -> list[dict]:
+    """A gable's two rakes, and two hips meeting at one top, are usually of a length. Where they are
+    not, say so and why it may be: one end hidden or traced short, one traced past the eave line,
+    or the roof really is uneven. Said, never scored or forced: a saltbox's sides differ."""
+    found, seen = [], set()
+    for a in lines:
+        if a.edge not in ("rake", "hip") or a.id not in placed:
+            continue
+        for b in lines:
+            if b is a or b.edge != a.edge or b.id not in placed or (b.id, a.id) in seen:
+                continue
+            da, db = placed[a.id], placed[b.id]
+            if not (da.points3d and db.points3d and da.length_in and db.length_in):
+                continue
+            if a.edge == "rake":
+                if (da.method != "gable" or db.method != "gable" or a.id not in gable_key
+                        or gable_key.get(a.id) != gable_key.get(b.id)):
+                    continue
+            elif da.method != "hip" or db.method != "hip":
+                continue
+            if not _ends_meet(_top_and_foot(a)[0], _top_and_foot(b)[0], reach):
+                continue
+            seen.add((a.id, b.id))
+            short, long_ = (a, b) if da.length_in <= db.length_in else (b, a)
+            ls, ll = placed[short.id].length_in, placed[long_.id].length_in
+            if ll / ls - 1.0 <= SYMMETRY_SLACK[a.edge]:
+                continue
+
+            def foot_height(line: Line) -> float:
+                return min(float(p @ up) for p in placed[line.id].points3d)
+
+            def foot_index(line: Line) -> int:
+                return 0 if line.points[0][1] > line.points[-1][1] else -1
+
+            drop = abs(foot_height(short) - foot_height(long_))
+            words = "rakes of one gable" if a.edge == "rake" else "hips meeting at one top"
+            message = (f"These {words} usually match but read {_feet(ls)} and {_feet(ll)}; their feet are "
+                       f"{_feet(drop)} apart in height. The shorter one's foot "
+                       f"{_end_story(short, foot_index(short), lines, reach)}; the longer one's "
+                       f"{_end_story(long_, foot_index(long_), lines, reach)}. Check where each ends, or set one "
+                       "by hand if this roof really is uneven.")
+            found.append({"kind": "symmetry", "lines": [short.id, long_.id], "message": message})
+    return found
+
+
+# -- what to measure next ---------------------------------------------------------------------------------
+
+NEXT_MIN_PX = 150.0                                  # a line to measure: this long in the photo...
+NEXT_MIN_VIEW = float(np.sin(np.radians(30.0)))      # ... and its wall seen at least this squarely
+
+
+def _next_measurement(camera: Camera, lines: list[Line], walls: dict, wall_of: dict, normals: dict,
+                      wall_facade: dict, edges: list, measured: str | None, quality: dict | None,
+                      second_used: bool) -> dict | None:
+    """The one line whose length would help the solve most, or None.
+
+    - The measurement is weak (reference_quality "poor"): a longer, squarer line on the measured
+      wall to measure instead.
+    - Walls no corner carries the measurement to (or only "in line" with another run): the line,
+      on such a wall, whose length as a second measurement would place the most lines. A wall's
+      group is the walls its links join (the linear solve's rows), so measuring one reaches all.
+    Candidates are eaves and junctions at least NEXT_MIN_PX long on a wall the camera sees at
+    30 degrees or more: a short or slanted one would carry its own error to every line."""
+    def span(line: Line) -> float:
+        return float(np.hypot(line.points[-1][0] - line.points[0][0], line.points[-1][1] - line.points[0][1]))
+
+    def measurable(line: Line, key: str | None) -> bool:
+        normal = normals.get(key) if key else None
+        return (line.edge in WALL_EDGES and normal is not None and span(line) >= NEXT_MIN_PX
+                and _grazing(camera, line.points, normal) >= NEXT_MIN_VIEW)
+
+    if quality and quality.get("grade") == "poor" and measured:
+        better = [line for line in lines if wall_of.get(line.id) == measured and measurable(line, measured)
+                  and span(line) > 1.5 * float(quality.get("pixels") or 0.0)]
+        if better:
+            best = max(better, key=span)
+            return {"line_id": best.id, "kind": "instead", "wall": measured, "would_place": None,
+                    "why": f"it is {span(best):.0f} px long on the wall you measured, so a pixel's slip moves every "
+                           "length far less; measure it instead"}
+    if second_used:
+        return None
+    open_walls = {key for key, normal in normals.items() if normal is not None
+                  and (key not in walls or walls[key].get("source") == "same plane")}
+    holders: dict[str, int] = {}
+    for line in lines:
+        key = wall_of.get(line.id)
+        if key in open_walls:
+            holders[key] = holders.get(key, 0) + 1
+    if not holders:
+        return None
+    joined: dict[str, set] = {key: set() for key in holders}
+    for keys in edges:
+        inside = [k for k in keys if k in holders]
+        for k in inside:
+            joined[k].update(j for j in inside if j != k)
+
+    def group(key: str) -> set:
+        found, todo = {key}, [key]
+        while todo:
+            for other in joined.get(todo.pop(), ()):
+                if other not in found:
+                    found.add(other)
+                    todo.append(other)
+        return found
+
+    best = None
+    for line in lines:
+        key = wall_of.get(line.id)
+        if key not in holders or not measurable(line, key):
+            continue
+        reached = group(key)
+        count = sum(holders[k] for k in reached)
+        if best is None or (count, span(line)) > (best[0], span(best[1])):
+            best = (count, line, key)
+    if best is None:
+        return None
+    count, line, key = best
+    facade = wall_facade.get(key, key)
+    unreached = key not in walls
+    return {"line_id": line.id, "kind": "second", "wall": key, "would_place": count,
+            "why": (f"no corner carries your measurement to this {facade} wall" if unreached
+                    else f"this {facade} wall is only taken in line with another run")
+                   + f"; its length as your second length would measure {count} line{'s' if count != 1 else ''} there"}

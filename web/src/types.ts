@@ -23,7 +23,7 @@ export type Side = "front" | "left" | "right";
 export type Edge = "eave" | "rake" | "hip" | "ridge" | "valley" | "junction" | "unknown";
 export type MaskingMode = "manual" | "automatic";
 // "find": Find in Box — drag a box where detection missed roof lines; the server detects inside it.
-export type Tool = "select" | "brush" | "erase" | "vertex" | "move" | "box" | "line" | "click" | "house" | "find" | "measure" | "wreath";
+export type Tool = "select" | "brush" | "erase" | "vertex" | "move" | "line" | "click" | "house" | "find" | "measure" | "wreath";
 
 // "blocker" is something standing in front of the house — a palm, a tree, a car. It is detected
 // so a line passing behind it can be joined up and reported, and it is never lit itself.
@@ -197,11 +197,23 @@ export interface LineGeometry {
   side_how?: string | null;
   // Relative: how far the length moves under the photo's own small errors (0.06 = ±6%).
   spread?: number | null;
+  // What the length rests on (the wall's distance and what gave it, a roof face, anchors).
+  evidence?: Record<string, unknown>[] | null;
 }
 
 // One independent check that failed (services/checks.py), with the lines it is about.
 export interface ScaleCheck {
-  kind: "size" | "meets" | "pitch" | "eave_height" | "plausibility" | "side" | "second_reference";
+  kind:
+    | "size"
+    | "meets"
+    | "pitch"
+    | "eave_height"
+    | "plausibility"
+    | "side"
+    | "second_reference"
+    | "scale"
+    | "reference"
+    | "symmetry";
   message: string;
   lines: string[];
   labels?: string[];
@@ -222,7 +234,10 @@ export interface ScaleDebug {
 export interface PhotoGeometry {
   // The line the scale was measured on has been edited since: the scale moved with it.
   reference_edited?: boolean;
-  walls: Record<string, { distance_in: number; source: "measured" | "corner" | "roof face"; facade?: Side }>;
+  walls: Record<
+    string,
+    { distance_in: number; source: "measured" | "corner" | "roof face" | "solved" | "same plane"; facade?: Side }
+  >;
   lines: Record<string, LineGeometry>;
   needs: string | null;
   // The gravest failed check, in words (the measurement makes the house implausible, a door the wrong size).
@@ -232,7 +247,44 @@ export interface PhotoGeometry {
   // Where the measurement went: the wall, its side, and how the side was decided.
   reference?: { wall: string; facade: Side; how: string } | null;
   // A second known length against the photo's length for its line; `off` is relative (0.03 = 3% long).
-  reference_check?: { region_id: string; typed_in: number; solved_in: number | null; off: number | null } | null;
+  // `used`: it measured a wall the first length does not reach, so it is part of the scale, not a check.
+  reference_check?: {
+    region_id: string;
+    typed_in: number;
+    solved_in: number | null;
+    off: number | null;
+    used?: "measurement";
+    wall?: string;
+  } | null;
+  // How far the measurement itself can be trusted: its length in the photo, how squarely its wall
+  // is seen, whether an object hides an end.
+  reference_quality?: {
+    grade: "good" | "fair" | "poor";
+    pixels: number;
+    tap_error: number | null;
+    view_deg: number;
+    blocked: boolean;
+    reasons: string[];
+  } | null;
+  // The line whose length would help the solve most: "instead" of a weak measurement, or as a
+  // "second" length that measures a wall the first does not reach.
+  next_measurement?: {
+    line_id: string;
+    label?: string | null;
+    kind: "instead" | "second";
+    wall: string;
+    would_place: number | null;
+    why: string;
+  } | null;
+  // The doors' heights against the typed length: a warning only, the typed length stands.
+  scale_check?: {
+    typed_in: number;
+    factor: number;
+    suggested_in: number;
+    conflict: boolean;
+    message: string | null;
+    sources: { id: string; kind: string; label: string | null; height_in: number; factor: number }[];
+  } | null;
   debug?: ScaleDebug;
   camera: { focal_source: "vp" | "exif" | "assumed"; focal_35mm: number; facades: Side[] };
 }
@@ -257,6 +309,8 @@ export interface RegionPlacement {
   strand_estimate_ft?: number;
   strand_set?: boolean;
   trunk?: { diameter_in: number; height_ft: number; turns: number };
+  // Lit fronds strung crown to tip: how many fronds, and each one's traced path in photo pixels.
+  fronds?: { count: number; paths: number[][][] };
   scale_from?: string;
   // Wreaths: [x, y, diameter px] of the ring, and its size.
   ring?: number[];
@@ -348,6 +402,8 @@ export interface TargetHouse {
 export interface Photo {
   id: string;
   prompt: string;
+  // The project's name (customer or address); empty for photos uploaded before names existed.
+  name?: string;
   width: number;
   height: number;
   image_url: string;
@@ -356,6 +412,26 @@ export interface Photo {
   interpreted: Interpreted | null;
   focal_35mm?: number | null;
   scale?: { measurement?: Measurement; overrides?: Record<string, ScaleOverride>; check?: ScaleCheckInput } | null;
+}
+
+// One card of the projects list (GET /photos/projects): no interpretation or regions.
+export type ProjectStatus = "not_started" | "in_progress" | "locked";
+
+export interface ProjectCard {
+  id: string;
+  prompt: string;
+  name?: string;
+  mode: MaskingMode | null;
+  approved: boolean;
+  created_at?: string | null;
+  updated_at?: string | null;
+  thumbnail_url: string;
+}
+
+export interface ProjectPage {
+  items: ProjectCard[];
+  next_offset: number | null;
+  total: number;
 }
 
 export interface PhotoDetail extends Photo {

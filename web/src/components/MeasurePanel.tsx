@@ -51,6 +51,12 @@ interface Props {
   // solve made of it.
   onCheck?: (check: ScaleCheckInput | null) => void;
   checkResult?: PhotoGeometry["reference_check"];
+  // How far the saved measurement can carry the house, and what the doors' heights say of it.
+  referenceQuality?: PhotoGeometry["reference_quality"];
+  scaleCheck?: PhotoGeometry["scale_check"];
+  // The line whose length would help most, and selecting it to measure.
+  nextMeasurement?: PhotoGeometry["next_measurement"];
+  onSelectLine?: (id: string) => void;
 }
 
 // Below this many pixels a reference's own tapping error is several percent of every length.
@@ -72,6 +78,7 @@ export function remeasured(saved: Measurement): Measurement {
 
 export function MeasurePanel({
   photo, mode, setMode, points, onResetPoints, line, busy, onSave, onClear, onRemeasure, onCheck, checkResult,
+  referenceQuality, scaleCheck, nextMeasurement, onSelectLine,
 }: Props) {
   const [feet, setFeet] = useState("");
   const [inches, setInches] = useState("");
@@ -204,14 +211,38 @@ export function MeasurePanel({
           {saved.facade_given ? `on the ${saved.facade} side.` : "with its side read from the photo."}
         </p>
       )}
+      {saved && referenceQuality && referenceQuality.grade !== "good" && (
+        <p className={referenceQuality.grade === "poor" ? "small unknown-note" : "muted small"}>
+          {referenceQuality.grade === "poor" ? "Weak measurement" : "Fair measurement"}: {referenceQuality.reasons.join("; ")}.
+        </p>
+      )}
+      {saved && scaleCheck && (
+        <p className={scaleCheck.conflict ? "small unknown-note" : "small ok-text"}>
+          {scaleCheck.conflict
+            ? `The doors disagree: they suggest about ${formatLength(scaleCheck.suggested_in)} instead of ${formatLength(scaleCheck.typed_in)}.`
+            : `The ${scaleCheck.sources.length === 1 ? "door agrees" : "doors agree"} with this measurement.`}
+        </p>
+      )}
+      {saved && nextMeasurement && (
+        <p className="small">
+          {nextMeasurement.kind === "instead" ? "Better to measure" : "Measure next"}: {nextMeasurement.label ?? "this line"}{" "}
+          ({nextMeasurement.why}).{" "}
+          {onSelectLine && (
+            <button className="link" disabled={busy} onClick={() => onSelectLine(nextMeasurement.line_id)}>
+              Select it
+            </button>
+          )}
+        </p>
+      )}
       <p className="muted small">{lensNote(photo)}</p>
 
       {saved && onCheck && (
         <div className="measure-check">
           <h4>Check with a second length</h4>
           <p className="muted small">
-            In "Along a line", tap another line whose length you know (a second eave, a garage door top) and type it. It
-            changes nothing: it shows how far the photo's length for that line is from yours.
+            In "Along a line", tap another line whose length you know (a second eave, a garage door top) and type it. On a
+            wall your measurement already reaches it only shows how far the photo's length is from yours; on a wall it does
+            not reach, it measures that wall.
           </p>
           <p className="small">{line ? `Line: ${line.label}` : "No line selected."}</p>
           <div className="measure-length">
@@ -234,7 +265,13 @@ export function MeasurePanel({
               </button>
             )}
           </div>
-          {savedCheck && checkResult && (
+          {savedCheck && checkResult?.used && (
+            <p className="small ok-text">
+              {checkLabel ?? "The line"}: you {formatLength(checkResult.typed_in)}. No corner carries your first measurement to
+              its wall, so this length measures that wall and the lines on it.
+            </p>
+          )}
+          {savedCheck && checkResult && !checkResult.used && (
             <p className={checkResult.off != null && Math.abs(checkResult.off) <= 0.05 ? "small ok-text" : "small unknown-note"}>
               {checkLabel ?? "The line"}: you {formatLength(checkResult.typed_in)},{" "}
               {checkResult.solved_in == null

@@ -1,21 +1,30 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import * as api from "./api";
-import { MaskCanvas, type MaskCanvasHandle } from "./canvas/MaskCanvas";
+import { MaskCanvas, type MaskCanvasHandle, type Snapshot } from "./canvas/MaskCanvas";
 import { AccountMenu } from "./components/AccountMenu";
+import { CanvasLegend } from "./components/CanvasLegend";
+import { ConfirmDialog, type Confirmation } from "./components/ConfirmDialog";
+import { DetectionProgress } from "./components/DetectionProgress";
+import { ProjectName } from "./components/ProjectName";
+import { ShortcutSheet } from "./components/ShortcutSheet";
+import { StepBar, type Step as ProgressStep } from "./components/StepBar";
+import { Toasts, type Notice } from "./components/Toasts";
 import { Activity } from "./components/Activity";
 import { Auth } from "./components/Auth";
 import { ModeChooser } from "./components/ModeChooser";
 import { Products } from "./components/Products";
+import { forgetProjects, Projects, rememberProject } from "./components/Projects";
 import { ThemeToggle, type Theme } from "./components/ThemeToggle";
 import { EdgePicker } from "./components/EdgePicker";
 import { EDGE_COLORS, needsOverride, RegionPanel } from "./components/RegionPanel";
-import { ToolDock, ViewportControls } from "./components/Toolbar";
+import { HistoryButtons, ToolDock, ViewportControls } from "./components/Toolbar";
 import { Upload } from "./components/Upload";
 import { Specification } from "./components/Specification";
 import { formatLength, MeasurePanel, remeasured, type MeasureMode } from "./components/MeasurePanel";
 import { ScaleDebugPanel, stepFile } from "./components/ScaleDebugPanel";
 import { guideSeen, hasGuide, markGuideSeen, ToolGuide } from "./components/ToolGuide";
+import { forgetThumbnails } from "./thumbnails";
 import { BLOCKER_KINDS, geometryOf, KIND_COLORS } from "./types";
 import type {
   Design,
@@ -35,6 +44,32 @@ import type {
   User,
 } from "./types";
 
+// One undo step: a stroke or a line edit on the canvas (the state before it), a change made in the
+// list (the values before and after), or a line or area added or deleted (`present`: whether it
+// exists after the change; `region` and `mask` are what to bring back).
+type Step =
+  | { type: "canvas"; snapshot: Snapshot }
+  | { type: "patch"; id: string; before: Partial<Region>; after: Partial<Region> }
+  | { type: "exists"; region: Region; mask: string | null; present: boolean };
+
+const HISTORY_LIMIT = 30;
+
+// Where the app is, in the address bar after "#/": the projects list, a new upload, the product
+// library, or one photo. A hash, so the API's own paths (/photos/...) never clash with a page's, and
+// the browser's Back and Forward move between these.
+type Route = { name: "projects" } | { name: "new" } | { name: "products" } | { name: "photo"; id: string };
+
+function readRoute(): Route {
+  const [name, id] = window.location.hash.replace(/^#\/?/, "").split("/");
+  if (name === "photo" && id) return { name: "photo", id };
+  if (name === "new") return { name: "new" };
+  if (name === "products") return { name: "products" };
+  return { name: "projects" };
+}
+
+const stepRegion = (step: Step) =>
+  step.type === "canvas" ? step.snapshot.regionId : step.type === "patch" ? step.id : step.region.id;
+
 export default function App() {
   const [user, setUser] = useState<User | null>(null);
   const [checkingSession, setCheckingSession] = useState(true);
@@ -44,14 +79,30 @@ export default function App() {
   );
   const [photo, setPhoto] = useState<PhotoDetail | null>(null);
   const [activeId, setActiveId] = useState<string | null>(null);
+  // The whole house, picked by tapping its roof with Select (a line or area pick clears it).
+  const [houseSelected, setHouseSelected] = useState(false);
   const [tool, setTool] = useState<Tool>("select");
   const [brushSize, setBrushSize] = useState(40);
   const [zoom, setZoom] = useState(1);
   const [history, setHistory] = useState({ canUndo: false, canRedo: false });
+  // Undo and redo stacks, newest last. A step being applied blocks the next one.
+  const past = useRef<Step[]>([]);
+  const future = useRef<Step[]>([]);
+  const travelling = useRef(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // A neutral message, e.g. that Find in Box found nothing new. Not an error.
-  const [notice, setNotice] = useState<string | null>(null);
+  const [notice, setNotice] = useState<Notice | null>(null);
+  const say = (text: string, action?: Notice["action"]) => setNotice({ text, action });
+  // An action asked first (detect again, approve, delete a project).
+  const [confirmation, setConfirmation] = useState<Confirmation | null>(null);
+  // Detection running: the whole app waits behind its progress card.
+  const [detecting, setDetecting] = useState<{ label: string; staged: boolean } | null>(null);
+  // Night preview: the photo darkened, only the lights.
+  const [night, setNight] = useState(false);
+  const [shortcuts, setShortcuts] = useState(false);
+  // Narrow screens: the panel is a sheet under the photo that folds down to its handle.
+  const [sheetOpen, setSheetOpen] = useState(true);
   // A roof line just drawn, waiting for its type to be confirmed; `picked` once someone chose.
   const [typing, setTyping] = useState<{ id: string; picked: boolean } | null>(null);
   // Development (ROOFLINE_DEBUG): the pipeline stage whose roof lines are drawn over the photo.
@@ -64,6 +115,8 @@ export default function App() {
   // The sidebar shows either the lines and areas, or the lighting for them.
   const [sidebarTab, setSidebarTab] = useState<"regions" | "lighting">("regions");
   const [showProducts, setShowProducts] = useState(false);
+  // With no photo open: the projects list, or (after "New photo") the upload form.
+  const [showUpload, setShowUpload] = useState(false);
   const [showObstacles, setShowObstacles] = useState(false);
   // Measure tool: two points tapped on a feature, or a line picked on the photo.
   const [measureMode, setMeasureMode] = useState<MeasureMode>("points");
@@ -149,6 +202,7 @@ export default function App() {
   const resetWorkspace = () => {
     setPhoto(null);
     setActiveId(null);
+    setHouseSelected(false);
     setDrawingKind(null);
     setDesign(null);
     setSidebarTab("regions");
@@ -160,6 +214,7 @@ export default function App() {
     if (cause instanceof api.UnauthorizedError) {
       setUser(null);
       resetWorkspace();
+      forgetProjects();
       return;
     }
     setError(cause instanceof Error ? cause.message : String(cause));
@@ -182,6 +237,40 @@ export default function App() {
     await api.logout().catch(() => undefined);
     setUser(null);
     resetWorkspace();
+    // The next account on this browser sees none of this one's projects.
+    forgetProjects();
+    void forgetThumbnails();
+  };
+
+  const reportHistory = () => setHistory({ canUndo: past.current.length > 0, canRedo: future.current.length > 0 });
+
+  const record = (step: Step) => {
+    past.current.push(step);
+    if (past.current.length > HISTORY_LIMIT) past.current.shift();
+    future.current = [];
+    reportHistory();
+  };
+
+  const clearHistory = () => {
+    past.current = [];
+    future.current = [];
+    reportHistory();
+  };
+
+  // After lines were redrawn or joined on the server: steps about a line or area that is gone go,
+  // except one that brings back what was deleted on purpose. With `redrawn` (a House tap), detected
+  // lines are not brought back either: the tap drew their replacements.
+  const pruneHistory = (regions: Region[], redrawn = false) => {
+    const ids = new Set(regions.map((region) => region.id));
+    const keep = (step: Step, absentAfter: boolean) => {
+      if (step.type === "exists" && absentAfter) {
+        return !ids.has(step.region.id) && !(redrawn && step.region.geometry === "line" && step.region.source !== "manual");
+      }
+      return ids.has(stepRegion(step));
+    };
+    past.current = past.current.filter((step) => keep(step, step.type === "exists" && !step.present));
+    future.current = future.current.filter((step) => keep(step, step.type === "exists" && step.present));
+    reportHistory();
   };
 
   const mergeRegion = (region: Region) =>
@@ -194,12 +283,47 @@ export default function App() {
         : current,
     );
 
-  const handleUpload = (file: File, prompt: string) =>
+  const handleUpload = (file: File, prompt: string, name: string) =>
     guard(async () => {
-      const uploaded = await api.uploadPhoto(file, prompt);
+      const uploaded = await api.uploadPhoto(file, prompt, name);
+      rememberProject(uploaded);
       setDesign(null);
       setPhoto(await api.getPhoto(uploaded.id));
+      setShowUpload(false);
     });
+
+  // A project from the list opens where it was left: the mode choice, or the editor.
+  const handleOpenProject = (id: string) =>
+    guard(async () => {
+      const detail = await api.getPhoto(id);
+      setDesign(null);
+      setActiveId(null);
+      setSidebarTab("regions");
+      setShowUpload(false);
+      setNight(false);
+      setPhoto(detail);
+      return true;
+    });
+
+  const handleRename = (name: string) =>
+    guard(async () => {
+      if (!photo) return;
+      const saved = await api.renamePhoto(photo.id, name);
+      setPhoto((current) => (current && current.id === saved.id ? { ...current, name: saved.name } : current));
+      rememberProject({ ...photo, name: saved.name });
+    });
+
+  // Leave the open photo for the projects list, or for a new upload.
+  const goToProjects = (upload = false) => {
+    // Its card shows where it was left (mode, locked), without reading the list again.
+    if (photo) rememberProject(photo);
+    setPhoto(null);
+    setActiveId(null);
+    setDrawingKind(null);
+    setDesign(null);
+    setNight(false);
+    setShowUpload(upload);
+  };
 
   // The library changed under us. Refresh it, and read the instruction again so the
   // confirmation screen resolves against the new list without a reload.
@@ -223,9 +347,17 @@ export default function App() {
     guard(async () => {
       if (!photo) return;
       await api.setMode(photo.id, mode);
-      if (mode === "automatic") await api.detectRegions(photo.id);
+      if (mode === "automatic") {
+        setDetecting({ label: "Detecting the house", staged: true });
+        try {
+          await api.detectRegions(photo.id);
+        } finally {
+          setDetecting(null);
+        }
+      }
       const detail = await api.getPhoto(photo.id);
       setPhoto(detail);
+      clearHistory();
       // Start on the first thing the instruction asked for, never on an obstacle.
       const first = detail.regions.find((region) => region.role !== "blocker");
       setActiveId(first?.id ?? null);
@@ -241,8 +373,15 @@ export default function App() {
   const handleRedetect = (allKinds = false) =>
     guard(async () => {
       if (!photo) return;
-      await api.detectRegions(photo.id, { allKinds });
+      setDetecting({ label: allKinds ? "Detecting everything" : "Detecting again", staged: true });
+      try {
+        await api.detectRegions(photo.id, { allKinds });
+      } finally {
+        setDetecting(null);
+      }
       setPhoto(await api.getPhoto(photo.id));
+      // Every detected line and area was replaced: nothing to step back through.
+      clearHistory();
     });
 
   const handleMaskCommit = useCallback(
@@ -254,6 +393,7 @@ export default function App() {
       if (BLOCKER_KINDS.includes(region.kind)) {
         const detail = await api.getPhoto(photo!.id);
         setPhoto(detail);
+        pruneHistory(detail.regions);
         setActiveId((current) => (current && detail.regions.some((r) => r.id === current) ? current : region.id));
       } else mergeRegion(region);
       return region;
@@ -293,39 +433,45 @@ export default function App() {
     [photo?.id],
   );
 
-  // Find in Box: detection runs inside the box and only adds lines; the new ones are selected.
-  const handleFindInBox = (box: number[]) =>
+  // A line or area picked, on the photo or in the list: it is what is selected now, not the house,
+  // and the list shows it (a pick on the photo while Lighting is open goes back to the list).
+  const selectRegion = (id: string | null, fromPhoto = false) => {
+    setActiveId(id);
+    setHouseSelected(false);
+    if (id && fromPhoto) setSidebarTab("regions");
+  };
+
+  const selectHouse = () => {
+    setActiveId(null);
+    setHouseSelected(true);
+    setSidebarTab("regions");
+  };
+
+  // Find lines: detection runs inside the box and only adds lines; the new ones are selected.
+  const handleBox = (box: number[]) =>
     guard(async () => {
       if (!photo) return;
       setNotice(null);
-      const found = await api.findLinesInBox(photo.id, box);
+      setDetecting({ label: "Finding lines in the box", staged: false });
+      let found: Region[];
+      try {
+        found = await api.findLinesInBox(photo.id, box);
+      } finally {
+        setDetecting(null);
+      }
       setPhoto(await api.getPhoto(photo.id));
-      if (found.length) setActiveId(found[0].id);
-      else setNotice("No new roof lines found in that box. Try a box closer around the missing roof edge.");
+      if (found.length) selectRegion(found[0].id);
+      else say("No new roof lines found in that box. Try a box closer around the missing roof edge.");
     });
-
-  const handleBox = (box: number[]) =>
-    tool === "find"
-      ? handleFindInBox(box)
-      : guard(async () => {
-          if (!photo) return;
-          const active = photo.regions.find((item) => item.id === activeId);
-          const region = await api.refineRegion(photo.id, {
-            box,
-            region_id: active?.geometry === "area" ? active.id : undefined,
-            kind: active?.geometry === "area" ? active.kind : "custom",
-          });
-          setPhoto(await api.getPhoto(photo.id));
-          setActiveId(region.id);
-          setTool("brush");
-        });
 
   const handlePoint = (point: number[]) =>
     guard(async () => {
       if (!photo) return;
       const region = await api.refineRegion(photo.id, { point, kind: "custom" });
-      setPhoto(await api.getPhoto(photo.id));
+      const detail = await api.getPhoto(photo.id);
+      setPhoto(detail);
       setActiveId(region.id);
+      record({ type: "exists", region: detail.regions.find((r) => r.id === region.id) ?? region, mask: null, present: true });
     });
 
   // A tap with the House tool redraws the detected roof lines, so a selected line, and the undo
@@ -335,9 +481,7 @@ export default function App() {
     if (!photo || photo.approved || busy) return;
     void guard(async () => {
       const detail = await api.tapHousePlane(photo.id, point);
-      canvasRef.current?.forget(
-        photo.regions.filter((r) => !detail.regions.some((d) => d.id === r.id)).map((r) => r.id),
-      );
+      pruneHistory(detail.regions, true);
       setPhoto(detail);
       setActiveId((current) => (current && detail.regions.some((r) => r.id === current) ? current : null));
       if (design) setDesign(await api.getDesign(photo.id));
@@ -364,7 +508,7 @@ export default function App() {
       const measured = lines.filter((line) => line.length_in != null).length;
       const waiting = lines.length - measured;
       const side = found.reference?.facade ?? saved.scale?.measurement?.facade ?? "front";
-      setNotice(
+      say(
         `Scale set from ${formatLength(measurement.length_in)} on the ${side} side. ` +
           `${measured} ${measured === 1 ? "line" : "lines"} measured` +
           (waiting ? `; ${waiting} ${waiting === 1 ? "needs" : "need"} attention (marked ? on the photo).` : ".") +
@@ -411,31 +555,134 @@ export default function App() {
     void guard(async () => {
       const detail = await api.addWreath(photo.id, point);
       setPhoto(detail);
-      setActiveId(detail.regions[detail.regions.length - 1]?.id ?? null);
+      const added = detail.regions[detail.regions.length - 1];
+      setActiveId(added?.id ?? null);
+      if (added) record({ type: "exists", region: added, mask: null, present: true });
     });
+  };
+
+  // A change to a line or area, shown at once and then saved; the server's answer replaces it.
+  const savePatch = async (id: string, patch: Partial<Region>) => {
+    if (!photo) return;
+    const current = photo.regions.find((item) => item.id === id);
+    if (current) mergeRegion({ ...current, ...patch } as Region);
+    const saved = await api.patchRegion(photo.id, id, patch);
+    // A kind change can turn an area into, or out of, something lines pass behind.
+    if (patch.kind) setPhoto(await api.getPhoto(photo.id));
+    else mergeRegion(saved);
+    // A line's type, side or visibility decides which confirmed requests light it.
+    if (design && ("edge" in patch || "side" in patch || "visible" in patch || "kind" in patch))
+      setDesign(await api.getDesign(photo.id));
   };
 
   const handlePatch = (id: string, patch: Partial<Region>) =>
     guard(async () => {
       if (!photo) return;
-      mergeRegion({ ...photo.regions.find((item) => item.id === id)!, ...patch } as Region);
-      const saved = await api.patchRegion(photo.id, id, patch);
-      // A kind change can turn an area into, or out of, something lines pass behind.
-      if (patch.kind) setPhoto(await api.getPhoto(photo.id));
-      else mergeRegion(saved);
-      // A line's type, side or visibility decides which confirmed requests light it.
-      if (design && ("edge" in patch || "side" in patch || "visible" in patch || "kind" in patch))
-        setDesign(await api.getDesign(photo.id));
+      const current = photo.regions.find((item) => item.id === id);
+      if (current) {
+        const before = Object.fromEntries(
+          Object.keys(patch).map((key) => [key, current[key as keyof Region] ?? null]),
+        ) as Partial<Region>;
+        record({ type: "patch", id, before, after: patch });
+      }
+      await savePatch(id, patch);
     });
 
+  // The × in the list and the Delete key do the same: the line or area goes, and nothing is
+  // selected after it (selecting the next row made a second Delete remove something unseen).
   const handleDelete = (id: string) =>
     guard(async () => {
       if (!photo) return;
+      const region = photo.regions.find((item) => item.id === id);
+      // An area's painted mask, kept so Undo brings it back as it was.
+      const mask = canvasRef.current?.maskData(id) ?? null;
       await api.deleteRegion(photo.id, id);
       const detail = await api.getPhoto(photo.id);
       setPhoto(detail);
-      if (activeId === id) setActiveId(detail.regions[0]?.id ?? null);
+      if (activeId === id) setActiveId(null);
+      if (region) {
+        record({ type: "exists", region, mask, present: false });
+        say(`Deleted ${region.label}.`, { label: "Undo", run: () => void travelRef.current("undo") });
+      }
     });
+
+  // Puts one step back (undo) or forward again (redo); returns the step for the other stack.
+  const applyStep = async (step: Step, direction: "undo" | "redo"): Promise<Step | null> => {
+    if (!photo) return null;
+    if (step.type === "canvas") {
+      const canvas = canvasRef.current;
+      if (!canvas) return null;
+      const now = canvas.capture(step.snapshot.regionId, step.snapshot.type);
+      await canvas.restore(step.snapshot);
+      return now ? { type: "canvas", snapshot: now } : null;
+    }
+    if (step.type === "patch") {
+      await savePatch(step.id, direction === "undo" ? step.before : step.after);
+      return step;
+    }
+    const wanted = direction === "undo" ? !step.present : step.present;
+    if (wanted) {
+      await api.restoreRegion(photo.id, step.region, step.mask);
+      setPhoto(await api.getPhoto(photo.id));
+      setActiveId(step.region.id);
+      if (design) setDesign(await api.getDesign(photo.id));
+      return step;
+    }
+    // Taken away again: as it is now, edits since included, so a redo brings that back.
+    const region = photo.regions.find((item) => item.id === step.region.id) ?? step.region;
+    const mask = canvasRef.current?.maskData(region.id) ?? step.mask;
+    await api.deleteRegion(photo.id, region.id);
+    setPhoto(await api.getPhoto(photo.id));
+    setActiveId((current) => (current === region.id ? null : current));
+    if (design) setDesign(await api.getDesign(photo.id));
+    return { ...step, region, mask };
+  };
+
+  // The toast's Undo runs after later renders: it calls the newest travel, with the newest photo.
+  const travelRef = useRef<(direction: "undo" | "redo") => Promise<void>>(async () => undefined);
+  const travel = async (direction: "undo" | "redo") => {
+    const from = direction === "undo" ? past : future;
+    const to = direction === "undo" ? future : past;
+    if (travelling.current || busy || !photo || photo.approved || !from.current.length) return;
+    const step = from.current.pop()!;
+    travelling.current = true;
+    reportHistory();
+    try {
+      const done = await guard(() => applyStep(step, direction));
+      if (done === undefined) from.current.push(step);
+      else if (done) to.current.push(done);
+    } finally {
+      travelling.current = false;
+      reportHistory();
+    }
+  };
+  travelRef.current = travel;
+
+  // Asked first: detecting again replaces every detected line and area, and approving locks.
+  const askRedetect = (allKinds: boolean) =>
+    setConfirmation({
+      title: allKinds ? "Detect every kind of area?" : "Detect again?",
+      body:
+        "Every line and area found automatically is replaced, so your changes to them are lost and undo starts over. " +
+        "Lines and areas you drew stay." + (allKinds ? " Areas the instruction did not name are found too." : ""),
+      confirm: allKinds ? "Detect everything" : "Detect again",
+      danger: true,
+      run: () => void handleRedetect(allKinds),
+    });
+
+  const askApprove = () =>
+    setConfirmation({
+      title: "Approve and lock this design?",
+      body: "The lines, areas and lighting are locked so the quote cannot change by accident. You can reopen it from your account menu to correct it.",
+      confirm: "Approve",
+      run: () => void handleApprove(),
+    });
+
+  const toggleNight = (on: boolean) => {
+    setNight(on);
+    const lit = Object.values(placement?.regions ?? {}).some((placed) => placed.bulbs?.length);
+    if (on && !lit) say("No lights are placed yet: measure the house and confirm the lighting to see them at night.");
+  };
 
   const handleAdd = (kind: RegionKind) => {
     setTyping(null);
@@ -451,6 +698,7 @@ export default function App() {
       setPhoto(await api.getPhoto(photo.id));
       setActiveId(region.id);
       setTool("brush");
+      record({ type: "exists", region, mask: null, present: true });
     });
   };
 
@@ -462,6 +710,7 @@ export default function App() {
       const region = await api.createRegion(photo.id, { kind: drawingKind, geometry: "line", polyline });
       setDrawingKind(null);
       setPhoto(await api.getPhoto(photo.id));
+      record({ type: "exists", region, mask: null, present: true });
       setActiveId(region.id);
       setTool("vertex");
       if (region.kind === "roof") setTyping({ id: region.id, picked: false });
@@ -482,30 +731,80 @@ export default function App() {
   const handleReopen = () =>
     guard(async () => photo && setPhoto(await api.reopenPhoto(photo.id)));
 
-  useEffect(() => {
-    const onKey = (event: KeyboardEvent) => {
-      if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement) return;
-      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "z") {
+  // The key handler reads this render's state through a ref, so Delete removes what is selected
+  // now, not what was selected when the listener was added.
+  const keyRef = useRef<(event: KeyboardEvent) => void>(() => undefined);
+  keyRef.current = (event: KeyboardEvent) => {
+    // A dialog or detection in progress has the keyboard to itself.
+    if (confirmation || shortcuts || detecting) return;
+    const target = event.target;
+    if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement
+        || (target instanceof HTMLElement && target.isContentEditable)) return;
+    if ((event.metaKey || event.ctrlKey) && (event.key.toLowerCase() === "z" || event.key.toLowerCase() === "y")) {
+      event.preventDefault();
+      void travel(event.shiftKey || event.key.toLowerCase() === "y" ? "redo" : "undo");
+      return;
+    }
+    if (event.metaKey || event.ctrlKey || event.altKey) return;
+    if (event.key === "?") {
+      event.preventDefault();
+      setShortcuts(true);
+      return;
+    }
+    if (event.key === "n" && photo?.mode) {
+      toggleNight(!night);
+      return;
+    }
+    if (event.key === "Delete" || event.key === "Backspace") {
+      // The selected line or area goes, as with its × in the list. Never while drawing a line,
+      // on a locked photo, or with the whole house selected (that is not one thing to delete).
+      if (!photo || photo.approved || drawingKind || busy) return;
+      if (activeId) {
         event.preventDefault();
-        event.shiftKey ? canvasRef.current?.redo() : canvasRef.current?.undo();
-        return;
+        void handleDelete(activeId);
+      } else if (houseSelected) {
+        say("Select one line or area to delete it. The house itself stays; tap roofs out of it with the House tool.");
       }
-      // chooseTool, not setTool: it also clears a half-drawn line, which setTool left stranded.
-      if (event.key === "b") chooseTool("brush");
-      if (event.key === "s") chooseTool("select");
-      if (event.key === "e") chooseTool("erase");
-      if (event.key === "v") chooseTool("vertex");
-      if (event.key === "m") chooseTool("move");
-      if (event.key === "[") setBrushSize((size) => Math.max(4, size - 6));
-      if (event.key === "]") setBrushSize((size) => Math.min(200, size + 6));
-    };
+      return;
+    }
+    if (event.key === "Escape" && !drawingKind) {
+      selectRegion(null);
+      return;
+    }
+    // chooseTool, not setTool: it also clears a half-drawn line, which setTool left stranded.
+    if (event.key === "b") chooseTool("brush");
+    if (event.key === "s") chooseTool("select");
+    if (event.key === "e") chooseTool("erase");
+    if (event.key === "v") chooseTool("vertex");
+    if (event.key === "m") chooseTool("move");
+    if (event.key === "h" && houseAvailable) chooseTool("house");
+    if (event.key === "a") chooseTool("click");
+    if (event.key === "f") chooseTool("find");
+    if (event.key === "r") chooseTool("measure");
+    if (event.key === "w") chooseTool("wreath");
+    if (event.key === "[") setBrushSize((size) => Math.max(4, size - 6));
+    if (event.key === "]") setBrushSize((size) => Math.min(200, size + 6));
+  };
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => keyRef.current(event);
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
   const active = photo?.regions.find((item) => item.id === activeId);
-  // Only a photo detected with TARGET_HOUSE_ONLY on has roof planes to tap.
-  const houseAvailable = Boolean(photo?.interpreted?.target?.planes?.length);
+  // Every detection stores the roof planes; a photo detected before that has none to tap.
+  const housePlanes = photo?.interpreted?.target?.planes ?? [];
+  const houseAvailable = housePlanes.length > 0;
+  const houseRoofs = houseAvailable ? housePlanes.filter((plane) => plane.keep).length : (photo?.interpreted?.planes?.length ?? 0);
+
+  // Measure's panel sits above the list: opening Measure, or picking the line to measure, brings
+  // it into view rather than leaving it scrolled away.
+  const measurePanelRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (tool !== "measure") return;
+    const frame = requestAnimationFrame(() => measurePanelRef.current?.scrollIntoView({ block: "start", behavior: "smooth" }));
+    return () => cancelAnimationFrame(frame);
+  }, [tool, activeId, measureMode]);
   // The picker belongs to the photo the line was drawn on.
   useEffect(() => setTyping(null), [photo?.id]);
   const typingRegion = (typing && !photo?.approved && photo?.regions.find((region) => region.id === typing.id)) || null;
@@ -521,7 +820,7 @@ export default function App() {
   useEffect(() => {
     // Picking a region switches to a tool that can edit it, but never interrupts selecting.
     if (!active || drawingKind || tool === "select") return;
-    if (active.geometry === "line" && tool !== "vertex" && tool !== "move" && tool !== "box" && tool !== "find")
+    if (active.geometry === "line" && tool !== "vertex" && tool !== "move" && tool !== "find")
       setTool("vertex");
     if (active.geometry === "area" && (tool === "vertex" || tool === "move")) setTool("brush");
   }, [activeId]);
@@ -539,11 +838,134 @@ export default function App() {
     if (scaleStep && !scaleDebug?.steps?.[scaleStep]) setScaleStep(null);
   }, [scaleStep, scaleDebug]);
 
-  // The House tool's button goes when the photo has no planes to tap (another photo, or one
-  // detected again with the flag off); the tool goes with it rather than lingering unseen.
+  // The House tool's button is disabled when the photo has no planes to tap (detected before they
+  // were stored); the tool goes with it rather than lingering unusable.
   useEffect(() => {
     if (tool === "house" && !houseAvailable) setTool("select");
   }, [tool, houseAvailable]);
+
+  // A house selection and the undo history belong to the photo they were made on; the house gives
+  // way to any line or area selected after it (a new object, a drawn line, a find).
+  useEffect(() => {
+    setHouseSelected(false);
+    clearHistory();
+  }, [photo?.id]);
+  useEffect(() => {
+    if (activeId) setHouseSelected(false);
+  }, [activeId]);
+
+  const routeNow = !user ? null : showProducts ? "products" : photo ? `photo/${photo.id}` : showUpload ? "new" : "projects";
+  // Declared before the effect that reads the address at sign-in, so it never pushes over it.
+  const routeReady = useRef(false);
+  useEffect(() => {
+    if (!routeNow || !routeReady.current) return;
+    if (window.location.hash !== `#/${routeNow}`) window.history.pushState(null, "", `#/${routeNow}`);
+  }, [routeNow]);
+  const applyRoute = useRef<(route: Route) => void>(() => undefined);
+  applyRoute.current = (route: Route) => {
+    if (route.name === "products") {
+      setShowProducts(true);
+      return;
+    }
+    setShowProducts(false);
+    if (route.name === "photo") {
+      if (photo?.id !== route.id) {
+        void handleOpenProject(route.id).then((opened) => {
+          if (!opened) window.history.replaceState(null, "", "#/projects");
+        });
+      }
+      return;
+    }
+    if (photo) rememberProject(photo);
+    setPhoto(null);
+    setActiveId(null);
+    setDrawingKind(null);
+    setDesign(null);
+    setShowUpload(route.name === "new");
+  };
+  useEffect(() => {
+    if (!user) {
+      routeReady.current = false;
+      return;
+    }
+    if (routeReady.current) return;
+    routeReady.current = true;
+    applyRoute.current(readRoute());
+  }, [user?.id]);
+  useEffect(() => {
+    const onPop = () => routeReady.current && applyRoute.current(readRoute());
+    window.addEventListener("popstate", onPop);
+    return () => window.removeEventListener("popstate", onPop);
+  }, []);
+
+  // Where the photo stands, step by step, for the header's progress bar.
+  const roofLineRegions = photo?.regions.filter((r) => r.geometry === "line" && r.kind === "roof") ?? [];
+  const untyped = roofLineRegions.filter((r) => r.edge === "unknown" && r.visible);
+  const steps: ProgressStep[] = photo
+    ? [
+        {
+          id: "detect",
+          label: "Detect",
+          state: photo.regions.length ? "done" : "todo",
+          detail: photo.regions.length ? "Lines and areas found. Detect again from the panel to start over." : "Nothing found yet: detect the photo.",
+          run: photo.approved ? undefined : () => askRedetect(false),
+        },
+        {
+          id: "lines",
+          label: "Check lines",
+          state: roofLineRegions.length && !untyped.length ? "done" : "todo",
+          detail: untyped.length
+            ? `${untyped.length} roof ${untyped.length === 1 ? "line needs" : "lines need"} a type`
+            : roofLineRegions.length
+              ? "Every roof line has a type. Take a neighbour's roof out with House if its lines show."
+              : "No roof lines yet: draw one with + Add, or detect again.",
+          run: photo.approved
+            ? undefined
+            : () => {
+                setSidebarTab("regions");
+                setNight(false);
+                chooseTool("select");
+                if (untyped.length) selectRegion(untyped[0].id, true);
+                else say("Tap a line to check it, Delete to remove it, and House to take a neighbour's roof out.");
+              },
+        },
+        {
+          id: "measure",
+          label: "Measure",
+          state: photo.scale?.measurement ? "done" : "todo",
+          detail: photo.scale?.measurement ? "Scale set. Measure again to change it." : "Give the photo real scale from one known length.",
+          run: photo.approved
+            ? undefined
+            : () => {
+                setNight(false);
+                chooseTool("measure");
+              },
+        },
+        {
+          id: "lighting",
+          label: "Lighting",
+          state: !requests.length ? "skip" : design ? "done" : "todo",
+          detail: !requests.length
+            ? "The instruction names no lighting."
+            : design
+              ? `Confirmed for ${design.regions.length} ${design.regions.length === 1 ? "line or area" : "lines and areas"}`
+              : attention
+                ? `${attention} to check before confirming`
+                : "Confirm the lighting",
+          run: () => {
+            setSheetOpen(true);
+            setSidebarTab("lighting");
+          },
+        },
+        {
+          id: "approve",
+          label: photo.approved ? "Locked" : "Approve",
+          state: photo.approved ? "done" : "todo",
+          detail: photo.approved ? "Locked. Reopen it from your account menu to change it." : "Lock the design for the quote.",
+          run: photo.approved ? undefined : askApprove,
+        },
+      ]
+    : [];
 
   if (checkingSession) return <div className="app" />;
 
@@ -566,16 +988,10 @@ export default function App() {
   return (
     <div className="app">
       <Activity />
-      {error && (
-        <div className="error" onClick={() => setError(null)}>
-          {error}
-        </div>
-      )}
-      {notice && !error && (
-        <div className="notice" onClick={() => setNotice(null)}>
-          {notice}
-        </div>
-      )}
+      <Toasts notice={notice} error={error} onDismissNotice={() => setNotice(null)} onDismissError={() => setError(null)} />
+      {confirmation && <ConfirmDialog confirmation={confirmation} onClose={() => setConfirmation(null)} />}
+      {detecting && <DetectionProgress label={detecting.label} staged={detecting.staged} />}
+      {shortcuts && <ShortcutSheet onClose={() => setShortcuts(false)} />}
       {typingRegion && (
         <EdgePicker
           region={typingRegion}
@@ -592,14 +1008,14 @@ export default function App() {
         <>
           <div className="account-bar">
             <span className="brand">Light Design</span>
+            {(photo || showUpload) && !showProducts && (
+              <button className="link" disabled={busy} onClick={() => goToProjects(false)}>
+                ← Your projects
+              </button>
+            )}
             <div className="spacer" />
-            <AccountMenu
-              user={user}
-              theme={theme}
-              onThemeChange={setTheme}
-              onOpenProducts={() => setShowProducts(true)}
-              onSignOut={handleSignOut}
-            />
+            <ThemeToggle theme={theme} onChange={setTheme} />
+            <AccountMenu user={user} onOpenProducts={() => setShowProducts(true)} onSignOut={handleSignOut} />
           </div>
           <main className="entry">
             {showProducts ? (
@@ -617,8 +1033,17 @@ export default function App() {
                 onInterpret={handleInterpret}
                 onChoose={handleMode}
               />
+            ) : showUpload ? (
+              <Upload busy={busy} onSubmit={handleUpload} onCancel={() => setShowUpload(false)} />
             ) : (
-              <Upload busy={busy} onSubmit={handleUpload} />
+              <Projects
+                userId={user.id}
+                busy={busy}
+                onOpen={(id) => void handleOpenProject(id)}
+                onNew={() => setShowUpload(true)}
+                onConfirm={setConfirmation}
+                onError={setError}
+              />
             )}
           </main>
         </>
@@ -627,51 +1052,29 @@ export default function App() {
       {photo && photo.mode && !showProducts && (
         <div className="workspace">
           <header className="header">
-            <div className="header-title">
-              <strong>Light Design</strong>
-              {photo.approved ? (
-                <span className="badge ok">Locked</span>
-              ) : (
-                <span className="badge">Draft</span>
-              )}
-              {photo.interpreted && (
-                <button
-                  className={
-                    requests.length
-                      ? design
-                        ? "badge ok status"
-                        : "badge warn status"
-                      : photo.interpreted.matched
-                        ? "badge status"
-                        : "badge warn status"
-                  }
-                  title="Open the lighting for this photo"
-                  onClick={() => setSidebarTab("lighting")}
-                >
-                  {requests.length
-                    ? design
-                      ? `Lighting confirmed for ${design.regions.length} ${design.regions.length === 1 ? "line or area" : "lines and areas"}`
-                      : attention
-                        ? `Lighting: ${attention} to check`
-                        : "Lighting not confirmed yet"
-                    : photo.interpreted.matched
-                      ? "Masking only what the instruction named"
-                      : "No lighting recognised in the instruction"}
-                </button>
-              )}
-            </div>
+            <nav className="breadcrumb" aria-label="Breadcrumb">
+              <button className="crumb" disabled={busy} onClick={() => goToProjects(false)} title="All your projects">
+                Projects
+              </button>
+              <span className="crumb-sep" aria-hidden="true">/</span>
+              <ProjectName key={photo.id} photo={photo} busy={busy} onRename={(name) => void handleRename(name)} />
+            </nav>
+            <StepBar steps={steps} busy={busy} />
             <div className="header-actions">
+              {!photo.approved && (
+                <HistoryButtons
+                  canUndo={history.canUndo && !busy}
+                  canRedo={history.canRedo && !busy}
+                  onUndo={() => void travel("undo")}
+                  onRedo={() => void travel("redo")}
+                />
+              )}
+              <ThemeToggle theme={theme} onChange={setTheme} />
               <AccountMenu
                 user={user}
-                theme={theme}
-                onThemeChange={setTheme}
                 onOpenProducts={() => setShowProducts(true)}
                 onSignOut={handleSignOut}
                 onReopen={photo.approved ? handleReopen : undefined}
-                onNewPhoto={() => {
-                  setPhoto(null);
-                  setActiveId(null);
-                }}
               />
             </div>
           </header>
@@ -689,12 +1092,15 @@ export default function App() {
                 showObstacles={showObstacles}
                 onMaskCommit={handleMaskCommit}
                 onPolylineCommit={handlePolylineCommit}
-                onSelect={setActiveId}
+                onSelect={(id) => selectRegion(id, true)}
+                houseSelected={houseSelected}
+                onSelectHouse={selectHouse}
                 onBox={handleBox}
                 onPoint={handlePoint}
                 onHouseTap={handleHouseTap}
                 onRemoveAt={handleDelete}
-                onHistoryChange={setHistory}
+                onRecord={(snapshot) => record({ type: "canvas", snapshot })}
+                onZoom={setZoom}
                 drawingColor={drawingKind ? KIND_COLORS[drawingKind] : null}
                 onDrawFinish={handleDrawFinish}
                 onDrawCancel={() => setDrawingKind(null)}
@@ -713,7 +1119,9 @@ export default function App() {
                 geometry={geometry?.lines}
                 showLengths={showLengths && Boolean(photo.scale?.measurement)}
                 backdrop={scaleDebug && scaleStep ? stepFile(scaleDebug, scaleStep) : null}
+                night={night}
               />
+              {!night && <CanvasLegend regions={photo.regions} />}
               {photo.interpreted?.roofline_debug?.stages && (
                 <label className="debug-stage" title="Development: the roof lines at one stage of detection">
                   <span>Stage</span>
@@ -727,23 +1135,33 @@ export default function App() {
                   </select>
                 </label>
               )}
-              {!photo.approved && (
+              {!photo.approved && !night && (
+                <ToolDock tool={tool} setTool={chooseTool} brushSize={brushSize} setBrushSize={setBrushSize}
+                          active={active} houseAvailable={houseAvailable}
+                          onHelp={hasGuide(tool) ? () => setGuide(tool) : undefined}
+                          onShortcuts={() => setShortcuts(true)} />
+              )}
+              {(
                 <>
-                  <ToolDock tool={tool} setTool={chooseTool} brushSize={brushSize} setBrushSize={setBrushSize}
-                            active={active} houseAvailable={houseAvailable}
-                            onHelp={hasGuide(tool) ? () => setGuide(tool) : undefined} />
                   <ViewportControls
                     zoom={zoom}
                     setZoom={setZoom}
-                    history={history}
-                    onUndo={() => canvasRef.current?.undo()}
-                    onRedo={() => canvasRef.current?.redo()}
+                    night={{ on: night, set: toggleNight }}
                     lengths={photo.scale?.measurement ? { on: showLengths, set: setShowLengths } : null}
                   />
                 </>
               )}
             </div>
-            <aside className="sidebar">
+            <aside className={sheetOpen ? "sidebar" : "sidebar collapsed"}>
+              <button
+                className="sheet-handle"
+                aria-expanded={sheetOpen}
+                onClick={() => setSheetOpen(!sheetOpen)}
+                title={sheetOpen ? "Fold the panel down to see more of the photo" : "Open the panel"}
+              >
+                <span className="sheet-grip" aria-hidden="true" />
+                {sheetOpen ? "Hide panel" : "Lines, areas & lighting"}
+              </button>
               <div className="tabs" role="tablist">
                 <button
                   role="tab"
@@ -774,6 +1192,7 @@ export default function App() {
                   />
                 )}
                 {tool === "measure" && !photo.approved && (
+                  <div ref={measurePanelRef}>
                   <MeasurePanel
                     photo={photo}
                     mode={measureMode}
@@ -790,7 +1209,16 @@ export default function App() {
                     onRemeasure={handleRemeasure}
                     onCheck={handleCheck}
                     checkResult={geometry?.reference_check ?? null}
+                    referenceQuality={geometry?.reference_quality ?? null}
+                    scaleCheck={geometry?.scale_check ?? null}
+                    nextMeasurement={geometry?.next_measurement ?? null}
+                    onSelectLine={(id) => {
+                      setMeasureMode("line");
+                      setMeasurePoints([]);
+                      selectRegion(id);
+                    }}
                   />
+                  </div>
                 )}
                 {sidebarTab === "regions" ? (
                   <RegionPanel
@@ -799,7 +1227,17 @@ export default function App() {
                     drawingKind={drawingKind}
                     showObstacles={showObstacles}
                     onShowObstacles={setShowObstacles}
-                    onSelect={setActiveId}
+                    onSelect={(id) => selectRegion(id)}
+                    house={
+                      houseSelected
+                        ? {
+                            roofs: houseRoofs,
+                            onChangeRoofs: houseAvailable && !photo.approved ? () => chooseTool("house") : undefined,
+                            onClear: () => setHouseSelected(false),
+                          }
+                        : null
+                    }
+                    follow={tool !== "measure"}
                     onPatch={handlePatch}
                     onDelete={handleDelete}
                     onAdd={(kind) => {
@@ -843,18 +1281,18 @@ export default function App() {
                   <button
                     title="Detect again from the instruction. Replaces every detected line and area; ones you drew stay."
                     disabled={busy}
-                    onClick={() => handleRedetect(false)}
+                    onClick={() => askRedetect(false)}
                   >
                     Re-detect
                   </button>
                   <button
                     title="Detect every kind of area, not only the ones the instruction names"
                     disabled={busy}
-                    onClick={() => handleRedetect(true)}
+                    onClick={() => askRedetect(true)}
                   >
                     Detect everything
                   </button>
-                  <button className="primary" title="Lock these lines and areas" disabled={busy} onClick={handleApprove}>
+                  <button className="primary" title="Lock these lines and areas" disabled={busy} onClick={askApprove}>
                     Approve
                   </button>
                 </div>

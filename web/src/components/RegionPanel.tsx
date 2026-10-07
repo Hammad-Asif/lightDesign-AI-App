@@ -11,7 +11,8 @@ interface Props {
   drawingKind: RegionKind | null;
   showObstacles: boolean;
   onShowObstacles: (show: boolean) => void;
-  onSelect: (id: string) => void;
+  // A row or a photo pick selects; null goes back from one item to the whole list.
+  onSelect: (id: string | null) => void;
   onPatch: (
     id: string,
     patch: Partial<Pick<Region, "label" | "kind" | "side" | "edge" | "color" | "visible">>,
@@ -36,6 +37,12 @@ interface Props {
   onMeasure?: () => void;
   // Measure again with the last saved values.
   onRemeasure?: () => void;
+  // The whole house, picked by tapping its roof with Select: how many roofs it has, and changing
+  // which roofs belong to it (the House tool).
+  house?: { roofs: number; onChangeRoofs?: () => void; onClear: () => void } | null;
+  // Scroll the selected row into view when the selection changes (off while Measure is open, so
+  // the panel stays on the measurement).
+  follow?: boolean;
 }
 
 const LENS: Record<string, string> = {
@@ -71,6 +78,7 @@ function ScaleSummary({ roofLines, geometry, measurement, lens, onMeasure, onRem
   }
   const waiting = roofLines.filter((line) => geometry?.[line.id] && (geometry[line.id].length_in == null || geometry[line.id].warning));
   const measured = roofLines.filter((line) => geometry?.[line.id]?.length_in != null).length;
+  const otherChecks = (checks ?? []).filter((check) => check.message !== warning);
   return (
     <div className="scale-summary">
       <p>
@@ -95,18 +103,24 @@ function ScaleSummary({ roofLines, geometry, measurement, lens, onMeasure, onRem
         <p className="warn-text">The line you measured has been edited since, and the scale moved with it. Check its length.</p>
       )}
       {warning && <p className="warn-text">{warning}</p>}
-      {(checks ?? [])
-        .filter((check) => check.message !== warning)
-        .map((check, index) => (
-          <p key={index} className="warn-text small">
-            {check.message}{" "}
-            {check.lines.length > 0 && (
-              <button className="link" title="Select the line this is about" onClick={() => onSelect(check.lines[0])}>
-                {check.labels?.[0] ?? "Show"}
-              </button>
-            )}
-          </p>
-        ))}
+      {otherChecks.length > 0 && (
+        // The checks are details: one line says how many, opening it lists them.
+        <details className="scale-checks">
+          <summary className="warn-text small">
+            {otherChecks.length} {otherChecks.length === 1 ? "thing" : "things"} to check about the scale
+          </summary>
+          {otherChecks.map((check, index) => (
+            <p key={index} className="warn-text small">
+              {check.message}{" "}
+              {check.lines.length > 0 && (
+                <button className="link" title="Select the line this is about" onClick={() => onSelect(check.lines[0])}>
+                  {check.labels?.[0] ?? "Show"}
+                </button>
+              )}
+            </p>
+          ))}
+        </details>
+      )}
       <p className="muted">
         {measured} {measured === 1 ? "line" : "lines"} measured
         {waiting.length > 0 && (
@@ -205,6 +219,7 @@ function Lights({ region, lights, onOverride }: {
           {lights.strand_set ? "" : "≈ "}
           {lights.strand_ft} ft of strand, {lights.count} bulbs{hidden}
           {lights.trunk ? ` · trunk about ${lights.trunk.diameter_in} in across, ${lights.trunk.height_ft} ft tall` : ""}
+          {lights.fronds ? ` · along ${lights.fronds.count} ${lights.fronds.count === 1 ? "frond" : "fronds"}, crown to tip` : ""}
           {lights.strand_set ? " · length set by you" : ` · estimated from ${lights.scale_from}`}
         </p>
         {onOverride && (
@@ -360,6 +375,7 @@ function groupLines(lines: Region[]): { key: string; label: string; regions: Reg
   });
 }
 
+
 export function RegionPanel({
   regions,
   activeId,
@@ -381,6 +397,8 @@ export function RegionPanel({
   scaleChecks,
   referenceSide,
   onRemeasure,
+  house = null,
+  follow = true,
 }: Props) {
   const targets = regions.filter((region) => region.role !== "blocker");
   // A line is lit when it is visible: detected-but-unrequested edges (ridges, roof meeting wall)
@@ -389,16 +407,17 @@ export function RegionPanel({
   const unlit = targets.filter((region) => region.geometry === "line" && !region.visible);
   const areas = targets.filter((region) => region.geometry === "area");
   const blockers = regions.filter((region) => region.role === "blocker");
+  const roofLines = targets.filter((region) => region.geometry === "line" && region.kind === "roof");
 
   const holds = (group: Region[]) => group.some((region) => region.id === activeId);
-  const [open, setOpen] = useState({ unlit: false, blockers: false, add: false });
+  // "More" holds the roof edges that are not lit and the obstacles: found, rarely worked on.
+  const [open, setOpen] = useState({ more: false, add: false });
   // Lit-line groups (Eave, Rake, ...) start open; collapsed ones are remembered by key.
   const [litGroupsOpen, setLitGroupsOpen] = useState<Record<string, boolean>>({});
   // A selection made on the photo opens the section it sits in, so it is never selected unseen.
   useEffect(() => {
     setOpen((current) => ({
-      unlit: current.unlit || holds(unlit),
-      blockers: current.blockers || holds(blockers),
+      more: current.more || holds(unlit) || holds(blockers),
       add: current.add || Boolean(drawingKind),
     }));
     if (activeId) {
@@ -410,17 +429,48 @@ export function RegionPanel({
     }
   }, [activeId, drawingKind]);
 
-  // Selecting on the photo has to show up here, even when the row is scrolled out of sight.
+  // Selecting on the photo has to show up here, even when the row is scrolled out of sight. The
+  // scroll waits for the render that opened the row's section (a row in a closed section cannot
+  // be scrolled to), then one frame for its layout, and centres the row.
   const activeRow = useRef<HTMLLIElement | null>(null);
+  const pendingScroll = useRef(false);
   useEffect(() => {
-    activeRow.current?.scrollIntoView({ block: "nearest" });
-  }, [activeId]);
+    if (activeId && follow) pendingScroll.current = true;
+  }, [activeId, follow]);
+  useEffect(() => {
+    if (!pendingScroll.current || !activeRow.current) return;
+    const row = activeRow.current;
+    const frame = requestAnimationFrame(() => {
+      if (!row.offsetParent) return; // still inside a closed section: the next render tries again
+      row.scrollIntoView({ block: "center", behavior: "smooth" });
+      pendingScroll.current = false;
+    });
+    return () => cancelAnimationFrame(frame);
+  });
 
   const row = (region: Region) => {
     const isActive = region.id === activeId;
     const hidden = region.geometry === "line" ? hiddenShare(region) : 0;
     const measured = region.geometry === "line" ? geometry?.[region.id] : undefined;
     const lights = placement?.[region.id];
+    // One flag on a closed row, the one that matters most: a type to check, else the real length,
+    // else the bulbs, else how much is hidden. The open row says all of it.
+    const flag = isActive
+      ? null
+      : region.kind === "roof" && region.edge === "unknown"
+        ? <span className="region-flag warn" title="Edge type not identified">check</span>
+        : measured?.length_in != null
+          ? <span className="region-flag" title={measured.assumption ?? "Measured"}>{formatLength(measured.length_in)}</span>
+          : lights?.count != null
+            ? (
+              <span className="region-flag" title={lights.estimated ? "Estimated" : "Bulbs placed"}>
+                {lights.estimated ? "≈ " : ""}
+                {lights.count} {lights.count === 1 ? "bulb" : "bulbs"}
+              </span>
+            )
+            : hidden > 0
+              ? <span className="region-flag" title={`${hidden}% passes behind objects — no lights there`}>{hidden}% hidden</span>
+              : null;
     return (
       <li
         key={region.id}
@@ -444,27 +494,7 @@ export function RegionPanel({
           ) : (
             <span className="region-name">{shortLabel(region.label)}</span>
           )}
-          {hidden > 0 && !isActive && (
-            <span className="region-flag" title={`${hidden}% passes behind objects — no lights there`}>
-              {hidden}% hidden
-            </span>
-          )}
-          {lights?.count != null && !isActive && (
-            <span className="region-flag" title={lights.estimated ? "Estimated" : "Bulbs placed"}>
-              {lights.estimated ? "≈ " : ""}
-              {lights.count} {lights.count === 1 ? "bulb" : "bulbs"}
-            </span>
-          )}
-          {measured?.length_in != null && !isActive && (
-            <span className="region-flag" title={measured.assumption ?? "Measured"}>
-              {formatLength(measured.length_in)}
-            </span>
-          )}
-          {region.kind === "roof" && region.edge === "unknown" && !isActive && (
-            <span className="region-flag warn" title="Edge type not identified">
-              check
-            </span>
-          )}
+          {flag}
           <button
             className="icon"
             title={region.visible ? (region.geometry === "line" ? "Don't light this line" : "Hide") : region.geometry === "line" ? "Light this line" : "Show"}
@@ -478,7 +508,7 @@ export function RegionPanel({
           </button>
           <button
             className="icon"
-            title="Delete"
+            title="Delete (Delete key)"
             aria-label="Delete"
             onClick={(event) => {
               event.stopPropagation();
@@ -552,12 +582,11 @@ export function RegionPanel({
                 />
               )}
 
-              <span className="source">
-                {region.source === "auto"
-                  ? `found · ${Math.round((region.confidence ?? region.score) * 100)}%${sourceNote(region)}`
-                  : region.source === "inferred"
-                    ? "continued"
-                    : "drawn by you"}
+              <span
+                className="source"
+                title={region.source === "auto" ? `Detection confidence ${Math.round((region.confidence ?? region.score) * 100)}%${sourceNote(region)}` : undefined}
+              >
+                {region.source === "auto" ? "found automatically" : region.source === "inferred" ? "continued behind an object" : "drawn by you"}
               </span>
             </div>
 
@@ -590,11 +619,68 @@ export function RegionPanel({
   };
 
   const shownEdges = LIT_EDGES.filter(({ edge }) => lit.some((line) => line.edge === edge));
+  const litRoof = roofLines.filter((region) => region.visible).length;
+
+  // Select-first: with a line or area selected, the panel is about that one thing (its type, side,
+  // length and lights), as an inspector; the whole list is one step back.
+  const selected = activeId ? regions.find((region) => region.id === activeId) : undefined;
+  if (selected) {
+    const where =
+      selected.role === "blocker"
+        ? "Obstacle in front of the house"
+        : selected.geometry === "line"
+          ? selected.visible ? "Line to light" : "Roof edge, not lit"
+          : "Area";
+    return (
+      <div className="region-panel inspector">
+        <div className="inspector-head">
+          <button className="link" onClick={() => onSelect(null)} title="Back to every line and area (Esc)">
+            ← All lines & areas
+          </button>
+          <span className="muted small">{where}</span>
+        </div>
+        <ul>{row(selected)}</ul>
+        <p className="muted small inspector-keys">
+          Delete key removes it · Esc goes back to the list · Ctrl+Z undoes a change
+        </p>
+      </div>
+    );
+  }
 
   return (
     <div className="region-panel">
+      {house && (
+        <div className="house-card">
+          <div className="house-card-head">
+            <strong>The house</strong>
+            <button className="link" onClick={house.onClear}>
+              Clear
+            </button>
+          </div>
+          <p className="muted small">
+            {house.roofs} {house.roofs === 1 ? "roof" : "roofs"} · {roofLines.length} roof {roofLines.length === 1 ? "line" : "lines"}, {litRoof} lit
+          </p>
+          <div className="house-card-actions">
+            <button
+              disabled={litRoof === roofLines.length}
+              onClick={() => roofLines.forEach((region) => !region.visible && onPatch(region.id, { visible: true }))}
+            >
+              Light all its lines
+            </button>
+            <button disabled={!litRoof} onClick={() => roofLines.forEach((region) => region.visible && onPatch(region.id, { visible: false }))}>
+              Light none
+            </button>
+            {house.onChangeRoofs && (
+              <button title="Tap roofs in or out of the house (House tool)" onClick={house.onChangeRoofs}>
+                Change roofs
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+
       <ScaleSummary
-        roofLines={targets.filter((region) => region.geometry === "line" && region.kind === "roof")}
+        roofLines={roofLines}
         geometry={geometry}
         measurement={measurement}
         lens={lens}
@@ -607,6 +693,48 @@ export function RegionPanel({
         checks={scaleChecks}
         side={referenceSide}
       />
+
+      <div className="panel-bar">
+        <span className="muted small">
+          {lit.length} {lit.length === 1 ? "line" : "lines"} to light · {areas.length} {areas.length === 1 ? "area" : "areas"}
+        </span>
+        <button
+          className={open.add ? "add-toggle active" : "add-toggle"}
+          aria-expanded={open.add}
+          onClick={() => setOpen((current) => ({ ...current, add: !current.add }))}
+        >
+          + Add
+        </button>
+      </div>
+      {open.add && (
+        <div className="add-panel">
+          {drawingKind ? (
+            <p className="drawing-hint">
+              Click along the {KIND_LABELS[drawingKind].toLowerCase()} on the photo. Enter to finish, Esc to cancel.
+            </p>
+          ) : (
+            <p className="muted small">Pick what to add: a line is drawn by clicking along it, an area is painted with the brush.</p>
+          )}
+          {KIND_GROUPS.map((group) => (
+            <div key={group.title} className="add-group">
+              <h3>{group.title}</h3>
+              <div className="add-grid">
+                {group.kinds.map((kind) => (
+                  <button
+                    key={kind}
+                    className={drawingKind === kind ? "add-kind drawing" : "add-kind"}
+                    onClick={() => onAdd(kind)}
+                  >
+                    <span className="swatch" style={{ background: KIND_COLORS[kind] }} />
+                    {KIND_LABELS[kind]}
+                  </button>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
       <h2>
         Lines to light <span className="count">{lit.length}</span>
       </h2>
@@ -648,19 +776,7 @@ export function RegionPanel({
           );
         })
       ) : (
-        <p className="muted small">None yet. Add a line below and click along the roofline to draw it.</p>
-      )}
-
-      {unlit.length > 0 && (
-        <Section
-          title="Other roof edges, not lit"
-          count={unlit.length}
-          open={open.unlit}
-          onToggle={(value) => setOpen((current) => ({ ...current, unlit: value }))}
-          note={<p className="muted small">Found on the roof but not part of the instruction. Use ○ to light one.</p>}
-        >
-          <ul>{unlit.map(row)}</ul>
-        </Section>
+        <p className="muted small">None yet. Use + Add above, then click along the roofline to draw one.</p>
       )}
 
       <h2>
@@ -669,65 +785,43 @@ export function RegionPanel({
       {areas.length ? (
         <ul>{areas.map(row)}</ul>
       ) : (
-        <p className="muted small">None yet. Add one below, then paint it with the brush.</p>
+        <p className="muted small">None yet. Use + Add above, or Add object on the photo.</p>
       )}
 
-      {blockers.length > 0 && (
+      {(unlit.length > 0 || blockers.length > 0) && (
         <Section
-          title="Obstacles in front of the house"
-          count={blockers.length}
-          open={open.blockers}
-          onToggle={(value) => setOpen((current) => ({ ...current, blockers: value }))}
-          note={
-            <>
+          title="More"
+          count={unlit.length + blockers.length}
+          open={open.more}
+          onToggle={(value) => setOpen((current) => ({ ...current, more: value }))}
+        >
+          {unlit.length > 0 && (
+            <div className="more-group">
+              <h3>
+                Other roof edges, not lit <span className="count">{unlit.length}</span>
+              </h3>
+              <p className="muted small">Found on the roof but not asked for. Use ○ to light one.</p>
+              <ul>{unlit.map(row)}</ul>
+            </div>
+          )}
+          {blockers.length > 0 && (
+            <div className="more-group">
+              <h3>
+                Obstacles in front of the house <span className="count">{blockers.length}</span>
+              </h3>
               <p className="muted small">
-                Found so the roofline can continue behind trees, palms and cars. Never lit. If a
-                line joins wrongly, correct the obstacle here.
+                Found so the roofline can continue behind trees, palms and cars. Never lit. If a line joins wrongly,
+                correct the obstacle here.
               </p>
               <label className="check">
-                <input
-                  type="checkbox"
-                  checked={showObstacles}
-                  onChange={(event) => onShowObstacles(event.target.checked)}
-                />
+                <input type="checkbox" checked={showObstacles} onChange={(event) => onShowObstacles(event.target.checked)} />
                 Show on the photo
               </label>
-            </>
-          }
-        >
-          <ul>{blockers.map(row)}</ul>
+              <ul>{blockers.map(row)}</ul>
+            </div>
+          )}
         </Section>
       )}
-
-      <Section
-        title="Add a line or area"
-        open={open.add}
-        onToggle={(value) => setOpen((current) => ({ ...current, add: value }))}
-      >
-        {drawingKind && (
-          <p className="drawing-hint">
-            Click along the {KIND_LABELS[drawingKind].toLowerCase()} on the photo. Enter to finish,
-            Esc to cancel.
-          </p>
-        )}
-        {KIND_GROUPS.map((group) => (
-          <div key={group.title} className="add-group">
-            <h3>{group.title}</h3>
-            <div className="add-grid">
-              {group.kinds.map((kind) => (
-                <button
-                  key={kind}
-                  className={drawingKind === kind ? "add-kind drawing" : "add-kind"}
-                  onClick={() => onAdd(kind)}
-                >
-                  <span className="swatch" style={{ background: KIND_COLORS[kind] }} />
-                  {KIND_LABELS[kind]}
-                </button>
-              ))}
-            </div>
-          </div>
-        ))}
-      </Section>
     </div>
   );
 }

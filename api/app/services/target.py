@@ -15,8 +15,9 @@ call, which planes are the target house's roof:
      material in similar light: a neighbour further back, seen past the target's porch.
   3. Of the planes left over: one the frame cuts off is a neighbour; one at least a quarter of
      the house's size is a second roof section a wall keeps apart from the first, like a
-     garage, and stays; a smaller one mostly beside the house's width is a neighbour further
-     back; a smaller one within it (a porch, a lower roof) stays.
+     garage, and stays, but only when it is near the house and the same roofing material as it
+     (see _section); a smaller one mostly beside the house's width is a neighbour further back;
+     a smaller one within it (a porch, a lower roof) stays.
   4. A house is one column of the photo: neighbours stand beside it, never above or below it. A
      plane lying mostly within the columns of the planes kept so far (and not cut by the frame)
      is the same house, repeated until nothing changes. This keeps an upper storey or turret
@@ -54,6 +55,13 @@ INSIDE_SHARE = 0.50             # of a plane's width: this much within the house
 # Measured on ten photos: same-roof seams 1.0-6.3 apart, a neighbour set back behind a porch 9.1.
 MATERIAL_AB = 8.0
 MATERIAL_SAME_LIGHT = 25.0      # median L* difference, 8-bit scale
+# A separate roof section (rule 3) joins only when it is this near the house (of the width) and
+# no further than this in colour from the house's closest-coloured plane, whatever the light.
+# Measured on 17 annotated photos: the house's own wings and garages lay 0.07-0.15 of the width
+# away and 1.0-3.6 apart in colour; the neighbours kept as sections lay 0.06-0.29 away and 8.1-15.3
+# apart, or 2.2-2.8 apart but 0.23-0.27 away. Neighbours were 11 of the 14 wrongly kept planes.
+SECTION_GAP_FRACTION = 0.15
+SECTION_AB = 6.5
 EVIDENCE_MARGIN_FRACTION = 0.02  # of the width: a dropped plane's column is widened this much each side
 EVIDENCE_EDGE = 1000            # px: long edge the evidence region is worked out at; segments are tested by midpoint
 LINE_REACH_FRACTION = 0.006     # of the width: a line this close to a plane counts as lying on it
@@ -166,6 +174,24 @@ def _set_back(other: int, touching: int, house: set, masks: list[np.ndarray], co
     return abs(l1 - l2) <= MATERIAL_SAME_LIGHT and float(np.hypot(a1 - a2, b1 - b2)) >= MATERIAL_AB
 
 
+def _section(other: int, house: set, masks: list[np.ndarray], colours, near: np.ndarray) -> bool:
+    """Is `other`, a large plane sharing no seam with the house, another section of it?
+
+    A garage or wing behind its own wall shares no outline with the main roof, but it stands close
+    to it and is roofed alike. A neighbour of similar size is further off, or a different roof:
+    both are required to join. `near` is the distance (px) from every pixel to the house's planes.
+    Without the photo only the distance is judged.
+    """
+    gap = float(near[masks[other]].min()) / masks[other].shape[1]
+    if gap > SECTION_GAP_FRACTION:
+        return False
+    if colours is None or colours[other] is None:
+        return True
+    distances = [float(np.hypot(*(colours[other][1:] - colours[index][1:])))
+                 for index in house if colours[index] is not None]
+    return not distances or min(distances) <= SECTION_AB
+
+
 def select(masks: list[np.ndarray], image=None) -> list[bool]:
     """Per plane: does it belong to the house being quoted? `image` (the photo) lets roof colour
     tell a neighbour set back behind the house from a wing of it; without it that test is skipped."""
@@ -196,6 +222,8 @@ def select(masks: list[np.ndarray], image=None) -> list[bool]:
 
     # Rule 3: what is left over, judged against the house's size and width.
     area, x0, x1 = _extent(small, house)
+    union = np.logical_or.reduce([small[index] for index in house])
+    near = cv2.distanceTransform((~union).astype(np.uint8), cv2.DIST_L2, 3)
     keep = []
     for index in range(count):
         if index in house:
@@ -203,7 +231,7 @@ def select(masks: list[np.ndarray], image=None) -> list[bool]:
         elif cut[index]:
             keep.append(False)
         elif float(small[index].sum()) >= SECTION_SHARE * area:
-            keep.append(True)
+            keep.append(_section(index, house, small, colours, near))
         else:
             keep.append(_inside_share(small[index], x0, x1) >= INSIDE_SHARE)
 
@@ -279,7 +307,8 @@ def on_house(lines: list[tuple], masks: list[np.ndarray], keep: list[bool]) -> l
     flag off; this then takes the neighbours' lines away. A line belongs to the house when at
     least as much of it lies on the house's planes as on the dropped ones. A line along an
     outline the house shares with a neighbour lies on both and stays, so no target edge is lost
-    for touching a neighbour's roof.
+    for touching a neighbour's roof. A tie that says nothing (a gutter just outside both, on
+    neither) goes to the nearer plane, so a dropped roof's gutter goes with it.
     """
     if all(keep) or not lines or not masks:
         return list(lines)
@@ -293,6 +322,8 @@ def on_house(lines: list[tuple], masks: list[np.ndarray], keep: list[bool]) -> l
         (kept if keep_it else dropped)[small > 0] = 1
     reach = max(1, round(LINE_REACH_FRACTION * size[0]))
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * reach + 1, 2 * reach + 1))
+    to_kept = cv2.distanceTransform((1 - kept).astype(np.uint8), cv2.DIST_L2, 3) if kept.any() else None
+    to_dropped = cv2.distanceTransform((1 - dropped).astype(np.uint8), cv2.DIST_L2, 3) if dropped.any() else None
     kept, dropped = cv2.dilate(kept, kernel).astype(bool), cv2.dilate(dropped, kernel).astype(bool)
 
     out = []
@@ -305,7 +336,11 @@ def on_house(lines: list[tuple], masks: list[np.ndarray], keep: list[bool]) -> l
         samples = np.asarray(samples)
         xs = np.clip(np.rint(samples[:, 0]).astype(int), 0, size[0] - 1)
         ys = np.clip(np.rint(samples[:, 1]).astype(int), 0, size[1] - 1)
-        if float(kept[ys, xs].mean()) >= float(dropped[ys, xs].mean()):
+        on_kept, on_dropped = float(kept[ys, xs].mean()), float(dropped[ys, xs].mean())
+        if on_kept == on_dropped and to_kept is not None and to_dropped is not None:
+            if float(np.median(to_kept[ys, xs])) <= float(np.median(to_dropped[ys, xs])):
+                out.append(line)
+        elif on_kept >= on_dropped:
             out.append(line)
     return out
 

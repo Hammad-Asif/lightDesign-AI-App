@@ -2,14 +2,15 @@ import uuid
 
 import numpy as np
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
+from fastapi.responses import FileResponse
 
 from app.config import get_settings
 from app.models import Photo as PhotoRow
 from app.models import Region as RegionRow
-from app.schemas import (DesignOut, DesignPut, InterpretRequest, ModeRequest, Photo, PhotoDetail, ScaleCheckPut,
-                         ScaleOverride, ScalePut, WreathRequest)
-from app.services import camera, detect, fusion, lighting, patterns, placement, scale, scale_debug
+from app.schemas import (DesignOut, DesignPut, InterpretRequest, ModeRequest, Photo, PhotoDetail, PhotoPatch,
+                         ProjectPage, ScaleCheckPut, ScaleOverride, ScalePut, WreathRequest)
+from app.services import camera, detect, fusion, lighting, occlusion, patterns, placement, scale, scale_debug
 from app.storage import Store, get_store, photo_dict, region_dict
 
 router = APIRouter(prefix="/photos", tags=["photos"])
@@ -30,6 +31,7 @@ def list_photos(store: Store = Depends(get_store)):
 def upload(
     file: UploadFile = File(...),
     prompt: str = Form(""),
+    name: str = Form("", max_length=200),
     store: Store = Depends(get_store),
 ):
     settings = get_settings()
@@ -39,7 +41,7 @@ def upload(
     if len(data) > settings.max_upload_mb * 1024 * 1024:
         raise HTTPException(413, f"Image exceeds {settings.max_upload_mb} MB")
     try:
-        photo = store.create_photo(data, prompt.strip(), settings.max_image_edge)
+        photo = store.create_photo(data, prompt.strip(), settings.max_image_edge, name.strip())
     except OSError:
         raise HTTPException(400, "Could not read that image file")
     # Read the instruction straight away: what it resolved to is shown before any detection.
@@ -51,9 +53,62 @@ def _interpret(store: Store, photo: PhotoRow) -> PhotoRow:
     return store.update_photo(photo, interpreted={**(photo.interpreted or {}), **read})
 
 
+PROJECTS_PAGE_MAX = 50
+PROJECT_STATUSES = {"not_started", "in_progress", "locked"}
+
+
+def _status(photo: PhotoRow) -> str:
+    return "locked" if photo.approved else "in_progress" if photo.mode else "not_started"
+
+
+@router.get("/projects", response_model=ProjectPage)
+def projects(offset: int = Query(0, ge=0), limit: int = Query(10, ge=1, le=PROJECTS_PAGE_MAX),
+             status: str | None = Query(None), q: str = Query("", max_length=200),
+             store: Store = Depends(get_store)):
+    """The signed-in account's projects, newest first, one page at a time, for the home screen;
+    narrowed by status (not_started, in_progress, locked) and by words in the name or instruction.
+    A photo whose image file is gone is left out: there is nothing to open."""
+    if status is not None and status not in PROJECT_STATUSES:
+        raise HTTPException(400, "Unknown status")
+    words = q.lower().split()
+    photos = [photo for photo in store.list_photos()
+              if (status is None or _status(photo) == status)
+              and all(word in f"{photo.name or ''} {photo.prompt or ''}".lower() for word in words)
+              and store.has_image(photo)]
+    page = photos[offset:offset + limit]
+    return {
+        "items": [{"id": str(photo.id), "prompt": photo.prompt, "name": photo.name or "",
+                   "mode": photo.mode, "approved": photo.approved,
+                   "created_at": photo.created_at, "updated_at": photo.updated_at,
+                   "thumbnail_url": f"/photos/{photo.id}/thumbnail"} for photo in page],
+        "next_offset": offset + limit if offset + limit < len(photos) else None,
+        "total": len(photos),
+    }
+
+
+@router.get("/{photo_id}/thumbnail")
+def thumbnail(photo_id: str, store: Store = Depends(get_store)):
+    """A small JPEG of the photo. The original never changes, so the browser may keep it for good."""
+    path = store.thumbnail(store.photo(photo_id))
+    return FileResponse(path, media_type="image/jpeg",
+                        headers={"Cache-Control": "private, max-age=31536000, immutable"})
+
+
 @router.get("/{photo_id}", response_model=PhotoDetail)
 def detail(photo_id: str, store: Store = Depends(get_store)):
     return _detail(store, store.photo(photo_id))
+
+
+@router.patch("/{photo_id}", response_model=Photo)
+def rename(photo_id: str, body: PhotoPatch, store: Store = Depends(get_store)):
+    """The project's name: the customer or the address it is known by."""
+    return photo_dict(store.update_photo(store.photo(photo_id), name=body.name.strip()))
+
+
+@router.delete("/{photo_id}", status_code=204)
+def delete_photo(photo_id: str, store: Store = Depends(get_store)):
+    """The project for good: the photo, its lines and areas, its lighting and every file."""
+    store.delete_photo(store.photo(photo_id))
 
 
 @router.put("/{photo_id}/mode", response_model=Photo)
@@ -266,11 +321,28 @@ def add_wreath(photo_id: str, body: WreathRequest, store: Store = Depends(get_st
     return _detail(store, photo)
 
 
-def roof_lines(regions, topology: dict | None = None) -> list[scale.Line]:
-    """The photo's roof lines as the scale solver reads them."""
+def roof_lines(regions, topology: dict | None = None, blockers: np.ndarray | None = None) -> list[scale.Line]:
+    """The photo's roof lines as the scale solver reads them; with `blockers`, which of each line's
+    ends an object in front of the house covers."""
     return [scale.Line(str(r.id), [list(map(float, p)) for p in r.polyline], r.edge, r.side,
-                       (topology or {}).get(str(r.id)))
+                       (topology or {}).get(str(r.id)),
+                       [_near_blocker(blockers, r.polyline[0]), _near_blocker(blockers, r.polyline[-1])]
+                       if blockers is not None else None)
             for r in regions if r.geometry == "line" and r.kind == "roof" and r.polyline and len(r.polyline) >= 2]
+
+
+BLOCKED_END_FRACTION = 0.01   # of the long edge: an object this close to a line's end hides that end
+
+
+def _near_blocker(blockers: np.ndarray | None, point) -> bool:
+    """Is any blocking object within BLOCKED_END_FRACTION of this photo point?"""
+    if blockers is None:
+        return False
+    height, width = blockers.shape
+    radius = max(3, int(round(BLOCKED_END_FRACTION * max(height, width))))
+    x, y = int(round(float(point[0]))), int(round(float(point[1])))
+    window = blockers[max(0, y - radius):min(height, y + radius + 1), max(0, x - radius):min(width, x + radius + 1)]
+    return bool(window.size and window.any())
 
 
 TOPOLOGY_OFFSET = 0.012     # of the long edge: how far to each side of a line the roof is looked for
@@ -356,10 +428,18 @@ def _features(store: Store, photo: PhotoRow, regions) -> list[dict]:
 
 def _solve(store: Store, photo: PhotoRow, regions, trace: scale.Trace | None = None) -> tuple[camera.Camera, scale.Solution]:
     found = _camera(store, photo)
-    solved = scale.solve(found, roof_lines(regions, _topology(store, photo, regions)),
-                         (photo.scale or {}).get("measurement"), photo.interpreted, get_settings().roofline_vp_deg,
+    settings = get_settings()
+    blockers = store.area_union(photo, regions, occlusion.BLOCKER_KINDS)
+    lines = roof_lines(regions, _topology(store, photo, regions), blockers)
+    measurement = (photo.scale or {}).get("measurement")
+    if measurement and blockers is not None:
+        # Whether an object in front of the house hides an end of the measurement (its quality).
+        ends = next((line.points for line in lines if line.id == measurement.get("region_id")), None)             or measurement.get("points") or []
+        if len(ends) >= 2:
+            measurement = {**measurement, "blocked": [_near_blocker(blockers, ends[0]), _near_blocker(blockers, ends[-1])]}
+    solved = scale.solve(found, lines, measurement, photo.interpreted, settings.roofline_vp_deg,
                          (photo.scale or {}).get("overrides"), trace=trace, features=_features(store, photo, regions),
-                         check=(photo.scale or {}).get("check"))
+                         check=(photo.scale or {}).get("check"), wall_solve=settings.scale_wall_solve)
     # The gables' rakes may have rejected the stored camera for another: everything after the
     # solve (overlays, bulbs, wreaths) must use the one the lengths came from.
     return solved.camera or found, solved
@@ -381,6 +461,8 @@ def geometry(photo_id: str, store: Store = Depends(get_store)):
     out = solved.to_dict()
     for check in out["checks"]:
         check["labels"] = [labels.get(line_id, line_id) for line_id in check.get("lines", [])]
+    if out.get("next_measurement"):
+        out["next_measurement"]["label"] = labels.get(out["next_measurement"]["line_id"])
     if trace is not None:
         directory = store.photo_dir(photo.id) / "debug"
         lines = roof_lines(regions, _topology(store, photo, regions))
@@ -407,9 +489,13 @@ def placement_(photo_id: str, store: Store = Depends(get_store)):
     catalogue = {str(p.id): p for p in [*store.products(), *store.products(archived=True)]}
     overrides = (photo.scale or {}).get("overrides") or {}
     placed = placement.place(found, regions, rows, catalogue, solved, overrides)
-    # Areas need their masks: lit trunks, canopies, fronds and hedges, and every wreath.
+    # Areas need their masks: lit trunks, canopies, fronds and hedges, and every wreath; with lit
+    # fronds, every trunk and collar too (the fronds are traced from the top of their trunk).
+    fronds_lit = any(r.kind == "palm_frond" and str(r.id) in rows for r in regions)
     masks = {str(r.id): store.read_mask(photo.id, r.id) for r in regions
-             if r.geometry == "area" and (str(r.id) in rows or r.kind == "wreath")}
+             if r.geometry == "area" and (str(r.id) in rows or r.kind == "wreath"
+                                          or (fronds_lit and r.kind in ("palm_trunk", "palm_collar")))}
     placed.update(placement.place_areas(found, regions, rows, catalogue, solved, overrides,
-                                        {k: v for k, v in masks.items() if v is not None}))
+                                        {k: v for k, v in masks.items() if v is not None},
+                                        frond_lines=get_settings().palm_frond_lines))
     return {"regions": placed, "needs": solved.needs or (None if design else "lighting")}

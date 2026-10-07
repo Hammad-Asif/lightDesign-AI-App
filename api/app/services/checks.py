@@ -26,9 +26,17 @@ from app.services.camera import Camera
 STANDARD = {
     "garage_door": {"name": "a garage door", "height": (78.0, 108.0), "width": (84.0, 228.0),
                     "typical": "7 to 8 ft tall, 8 to 9 ft wide (single) or 16 ft (double)"},
-    "door": {"name": "an entry door", "height": (74.0, 102.0), "width": (26.0, 60.0),
+    # Width up to a 16 ft sliding patio door: "door" covers those too, and only the height is standard.
+    "door": {"name": "a door", "height": (74.0, 102.0), "width": (26.0, 200.0),
              "typical": "about 6 ft 8 in tall"},
 }
+# Heights the doors are built to (in): entry and patio doors 80 in (some 84 or 96), garage doors 7 or
+# 8 ft. Heights, not widths: a garage is 8 or 16 ft wide, a patio door 5 to 16, but nearly every
+# door is about as tall as every other.
+DOOR_HEIGHT = {"door": (78.0, 96.0), "garage_door": (84.0, 96.0)}
+# The doors' scale this far from the typed length's (either way) is said: past the spread of door
+# heights, the typed length or what it was tapped on is the likelier mistake.
+SCALE_CONFLICT = 0.20
 PLAUSIBLE_PITCH = (2.0, 18.0)          # rise per 12
 ONE_STOREY_EAVE_FT = 80.0              # eaves this low above the camera are one storey
 ONE_STOREY_HEIGHT_FT = 8.0
@@ -243,3 +251,37 @@ def evaluate(ctx: Context) -> tuple[float, list[dict]]:
                                          f"{feet / measured[0]:.1f} times as wide as the measured one. "
                                          "Check the measurement and the side it is on."})
     return penalty, found
+
+
+def scale_evidence(features: list, typed_in: float) -> dict | None:
+    """The doors' heights as a second opinion on the scale. Each door measured on its wall says how
+    far the scale would have to move for it to stand a standard height (1 when it already does);
+    their median against the typed length. A conflict is a warning only: the typed length stands.
+    A door whose bottom is hidden (a car, a shrub) reads short, so a lone short door is said
+    gently. None when no door was measured."""
+    sources = []
+    for feature in features:
+        heights = DOOR_HEIGHT.get(feature.get("kind"))
+        measured = (feature.get("measured") or {}).get("height_in")
+        if heights is None or not measured or measured <= 0:
+            continue
+        low, high = heights
+        factor = 1.0 if low <= measured <= high else (low / measured if measured < low else high / measured)
+        sources.append({"id": feature["id"], "kind": feature["kind"], "label": feature.get("label"),
+                        "height_in": round(float(measured), 1), "factor": round(float(factor), 3)})
+    if not sources:
+        return None
+    factor = float(np.exp(np.median([np.log(s["factor"]) for s in sources])))
+    suggested = typed_in * factor
+    out = {"typed_in": round(float(typed_in), 1), "factor": round(factor, 3), "suggested_in": round(suggested, 1),
+           "sources": sources, "conflict": False, "message": None}
+    if abs(np.log(factor)) <= np.log(1.0 + SCALE_CONFLICT):
+        return out
+    out["conflict"] = True
+    shown = ", ".join(f"{s['label'] or STANDARD[s['kind']]['name']} {_feet(s['height_in'])}" for s in sources[:3])
+    which = "door" if len(sources) == 1 else "doors"
+    out["message"] = (f"Your measurement ({_feet(typed_in)}) makes the {which} {'too tall' if factor < 1 else 'too short'}: "
+                      f"{shown}, where doors are about 6 ft 8 in and garage doors 7 to 8 ft. The {which} suggest your "
+                      f"length is nearer {_feet(suggested)}. Check the length you typed and what you measured"
+                      + (", unless a door's bottom is hidden" if factor > 1 else "") + ".")
+    return out

@@ -72,6 +72,8 @@ class Photo(Timestamped, Base):
         ForeignKey("users.id", ondelete="CASCADE"), index=True
     )
     prompt: Mapped[str] = mapped_column(Text, default="", server_default="")
+    # The project's name on the projects list: the customer or the address. Empty: the instruction stands in.
+    name: Mapped[str] = mapped_column(String(200), default="", server_default="")
     width: Mapped[int]
     height: Mapped[int]
     mode: Mapped[str | None] = mapped_column(String(16))

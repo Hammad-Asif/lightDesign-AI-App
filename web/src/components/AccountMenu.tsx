@@ -1,22 +1,19 @@
 import { useEffect, useRef, useState } from "react";
 
 import type { User } from "../types";
-import type { Theme } from "./ThemeToggle";
 
 interface Props {
   user: User;
-  theme: Theme;
-  onThemeChange: (theme: Theme) => void;
   onOpenProducts: () => void;
   onSignOut: () => void;
   // Only shown inside the workspace, not on the entry screens.
-  onNewPhoto?: () => void;
   onReopen?: () => void;
 }
 
-// Global, account-level controls (who's signed in, theme, sign out) live behind one menu so
-// they never compete with the per-photo actions in the header or toolbar.
-export function AccountMenu({ user, theme, onThemeChange, onOpenProducts, onSignOut, onNewPhoto, onReopen }: Props) {
+// Account-level controls (who's signed in, the product library, sign out) live behind one menu so
+// they never compete with the per-photo actions in the header. The theme and a new photo have
+// their own buttons on the bar.
+export function AccountMenu({ user, onOpenProducts, onSignOut, onReopen }: Props) {
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement | null>(null);
 
@@ -73,12 +70,8 @@ export function AccountMenu({ user, theme, onThemeChange, onOpenProducts, onSign
             </div>
           </div>
           <div className="menu-divider" />
-          {onNewPhoto && item(onNewPhoto, "New photo")}
           {item(onOpenProducts, "Products", "open-products")}
           {onReopen && item(onReopen, "Reopen for correction")}
-          <button role="menuitem" className="menu-item" onClick={() => onThemeChange(theme === "dark" ? "light" : "dark")}>
-            {theme === "dark" ? "Switch to light mode" : "Switch to dark mode"}
-          </button>
           <div className="menu-divider" />
           {item(onSignOut, "Sign out")}
         </div>

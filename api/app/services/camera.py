@@ -47,6 +47,13 @@ AT_INFINITY = 1e-9
 # A "vertical" vanishing point more than this far off the photo's own vertical, seen from its
 # centre, is not the vertical: a steeply foreshortened wall's level lines taken for uprights.
 VERTICAL_MAX_DEG = 25.0
+# ... nor one nearer the centre than this share of the long edge. The vertical lies f / tan(tilt)
+# from the centre, so this near it means a camera tilted 55 degrees (26 mm lens) or 38 (14 mm):
+# no hand-held house photo. A point there is on the horizon, where the photo's tilt puts it
+# (a side wall receding straight from a front-on camera), and its lines run up the photo only
+# because it is close (9fd3d8e1: (499, 55), 286 px from the centre of a 1024 px photo, while a
+# "facade" point 9688 px straight down was the real vertical).
+VERTICAL_MIN_REACH = 0.5
 # Finding the facade detection missed: a segment agrees with a vanishing point within this; the
 # found point must hold this share of the segments' length that no other point explains, and at
 # least this many of them.
@@ -246,6 +253,59 @@ def _off_vertical(vp: list[float], centre: np.ndarray) -> float:
     return float(np.degrees(np.arccos(min(1.0, abs(_unit(direction)[1])))))
 
 
+def _vertical_ok(vp: list[float] | None, centre: np.ndarray, long_edge: float) -> bool:
+    """Can this vanishing point be the vertical: along the photo's vertical, and far enough out
+    for a hand-held camera's tilt (VERTICAL_MAX_DEG, VERTICAL_MIN_REACH)."""
+    if vp is None or _off_vertical(vp, centre) > VERTICAL_MAX_DEG:
+        return False
+    return vp[2] == 0.0 or float(np.linalg.norm(np.array(vp[:2]) - centre)) >= VERTICAL_MIN_REACH * long_edge
+
+
+def _facade_names(horizontal: list, centre: np.ndarray, long_edge: float) -> list[str]:
+    """fusion._facades for pixel vanishing points: the one farthest out faces the camera ("front"),
+    the others are named by the side of the photo they lie on."""
+    reach = [float("inf") if vp[2] == 0.0 else float(np.linalg.norm(np.array(vp[:2]) - centre)) for vp in horizontal]
+    names = []
+    for vp, far in zip(horizontal, reach):
+        x = vp[0] if vp[2] == 0.0 else vp[0] - centre[0]
+        front = far == max(reach) if len(horizontal) >= 2 else far >= fusion.FRONT_VP_REACH * long_edge / 2
+        names.append("front" if front else ("left" if x < 0 else "right"))
+    return names
+
+
+def _settled_vertical(vertical: list[float] | None, horizontal: list, facades: list[str], centre: np.ndarray,
+                      long_edge: float, checks: dict) -> tuple[list[float] | None, list, list[str]]:
+    """The vertical, tested for where a hand-held camera can put it. A "vertical" too near the
+    centre is a horizontal vanishing point on the horizon; a "facade" point far out along the
+    photo's vertical is the vertical. They swap, and the facades are named again. A vertical
+    failing with nothing to replace it is dropped (None: refit from uprights, or a level camera).
+    Unchanged when the vertical holds."""
+    if vertical is None or _vertical_ok(vertical, centre, long_edge):
+        return vertical, horizontal, facades
+    along = _off_vertical(vertical, centre) <= VERTICAL_MAX_DEG
+    candidates = [i for i, vp in enumerate(horizontal) if _vertical_ok(vp, centre, long_edge)]
+    if not candidates:
+        checks["vertical_rejected"] = [round(v, 1) for v in vertical]
+        checks["vertical_why"] = ("too near the centre for a hand-held camera's tilt" if along
+                                  else f"more than {VERTICAL_MAX_DEG:.0f} deg off the photo's vertical")
+        return None, horizontal, facades
+
+    def reach(vp):
+        return float("inf") if vp[2] == 0.0 else float(np.linalg.norm(np.array(vp[:2]) - centre))
+
+    chosen = max(candidates, key=lambda i: reach(horizontal[i]))
+    rest = [vp for i, vp in enumerate(horizontal) if i != chosen]
+    if along:
+        rest.append(list(vertical))     # on the horizon, near the centre: a wall receding from the camera
+    checks["vertical_swapped"] = {"was_vertical": [round(v, 1) for v in vertical],
+                                  "now_vertical": [round(v, 1) for v in horizontal[chosen]],
+                                  "was_facade": facades[chosen] if chosen < len(facades) else None,
+                                  "why": "the vertical was too near the centre; a facade point lay far out along "
+                                         "the photo's vertical" if along else
+                                         f"the vertical was more than {VERTICAL_MAX_DEG:.0f} deg off the photo's vertical"}
+    return list(horizontal[chosen]), rest, _facade_names(rest, centre, long_edge)
+
+
 def _agrees(segments: np.ndarray, vp: np.ndarray) -> np.ndarray:
     """Per pixel segment: does it run toward the homogeneous pixel vanishing point?"""
     starts, ends = segments[:, :2], segments[:, 2:]
@@ -347,14 +407,17 @@ def build(scene: partition.Scene | None, size: tuple[int, int], focal_35mm: floa
         if on_house is not None and len(on_house) == len(segments) and np.any(on_house):
             segments = segments[np.asarray(on_house, bool)]
             checks["segments"] = "target house only"
-    if vertical is not None and _off_vertical(vertical, centre) > VERTICAL_MAX_DEG:
-        # Not the vertical: fitted afresh from the photo's upright segments, else a level camera.
-        checks["vertical_rejected"] = [round(v, 1) for v in vertical]
-        vertical = None
+    # Not the vertical (off the photo's vertical, or too near the centre): a facade point far out
+    # along the vertical takes its place, else it is fitted afresh from the photo's upright
+    # segments, else the camera is level.
+    vertical, horizontal, facades = _settled_vertical(vertical, horizontal or [], facades, centre, long_edge, checks)
     if vertical is None and segments is not None:
-        vertical = _vertical_from_segments(segments, size)
-        if vertical is not None:
+        fitted = _vertical_from_segments(segments, size)
+        if _vertical_ok(fitted, centre, long_edge):
+            vertical = fitted
             checks["vertical"] = "fitted to upright segments"
+        elif fitted is not None:
+            checks["vertical_fit_rejected"] = [round(v, 1) for v in fitted]
     found_second = None
     if segments is not None and horizontal and len(horizontal) == 1:
         found_second = _second_facade(segments, horizontal[0], vertical, size)
@@ -502,21 +565,24 @@ def perturbed(cam: Camera, which: str, degrees: float = 0.0, focal_scale: float 
 def rechecked(cam: Camera) -> Camera:
     """A stored camera under the current focal rules: its pairs of vanishing points tested again
     for conditioning (a camera stored before a rule changed keeps whatever focal it had then).
-    The same camera when nothing changes."""
-    if cam.focal_source != "vp":
-        return cam
+    The same camera when nothing changes. Its vertical is tested again too (_settled_vertical)."""
     horizontal, facades = observed(cam)
     long_edge = float(max(cam.width, cam.height))
     checks = {k: v for k, v in cam.focal_checks.items() if k not in ("vp", "vp_rejected", "agree", "second_facade")}
-    estimates, rejected = _pair_estimates(horizontal, cam.vertical, cam.centre, long_edge)
+    vertical, horizontal, facades = _settled_vertical(cam.vertical, horizontal, facades, cam.centre, long_edge, checks)
+    settled = vertical is not cam.vertical
+    if not settled and cam.focal_source != "vp":
+        return cam
+    estimates, rejected = _pair_estimates(horizontal, vertical, cam.centre, long_edge)
     if rejected:
         checks["vp_rejected"] = rejected
     focal, source = _choose_focal(estimates, checks.get("exif"), long_edge, checks)
     # Stored vanishing points are rounded: the same pairs give the same focal to within that.
-    if source == "vp" and abs(focal - cam.focal) <= 0.01 * cam.focal:
+    if not settled and source == "vp" and abs(focal - cam.focal) <= 0.01 * cam.focal:
         return cam
-    checks["rechecked"] = f"stored focal {round(cam.focal_35mm, 1)} mm failed today's conditioning test"
-    found = Camera(width=cam.width, height=cam.height, focal=focal, focal_source=source, vertical=cam.vertical,
+    if not settled:
+        checks["rechecked"] = f"stored focal {round(cam.focal_35mm, 1)} mm failed today's conditioning test"
+    found = Camera(width=cam.width, height=cam.height, focal=focal, focal_source=source, vertical=vertical,
                    horizontal=horizontal, facades=facades, focal_checks=checks)
     if len(found.horizontal) == 1 and source in ("vp", "exif"):
         _add_square_facade(found)

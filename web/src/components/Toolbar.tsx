@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
 
 import type { Region, Tool } from "../types";
 
@@ -12,15 +12,55 @@ function svg(children: ReactNode) {
   );
 }
 
-// Grouped by what they act on: picking, painting an area, shaping a line, asking the model again.
+// Grouped by what they act on: picking what is there, adding something new from the photo,
+// painting an area, shaping a line, and measuring or placing.
 const GROUPS: ToolSpec[][] = [
   [
     {
       id: "select",
       label: "Select",
       key: "S",
-      hint: "Click a line or area on the photo to select it",
+      hint: "Pick something already on the photo: a line, an area, or the house (tap its roof). Tap empty space to clear. Delete removes the picked line or area.",
       icon: svg(<path d="M5 3l15 8.5-6.4 1.4L11 20z" />),
+    },
+    {
+      id: "house",
+      label: "House",
+      key: "H",
+      hint: "Tap a roof to add it to the house being quoted, or tap it again to take it out. The roof lines are redrawn.",
+      icon: svg(
+        <>
+          <path d="M4 10.5 12 4l8 6.5" />
+          <path d="M6 9.5V20h12V9.5" />
+        </>,
+      ),
+    },
+  ],
+  [
+    {
+      id: "click",
+      label: "Add object",
+      key: "A",
+      hint: "Tap something new on the photo (a hedge, a tree, a window) to outline it as a new area. Alt-click an outline to remove it.",
+      icon: svg(
+        <>
+          <circle cx="12" cy="12" r="7.5" strokeDasharray="3 2.5" />
+          <path d="M12 8.5v7M8.5 12h7" />
+        </>,
+      ),
+    },
+    {
+      id: "find",
+      label: "Find lines",
+      key: "F",
+      hint: "Drag a box where roof lines were missed; the lines inside it are detected and added. Nothing already there changes.",
+      icon: svg(
+        <>
+          <rect x="3.5" y="3.5" width="12" height="12" rx="1.5" strokeDasharray="3 2.5" />
+          <circle cx="16" cy="16" r="3.2" />
+          <path d="m18.4 18.4 2.6 2.6" />
+        </>,
+      ),
     },
   ],
   [
@@ -82,37 +122,9 @@ const GROUPS: ToolSpec[][] = [
   ],
   [
     {
-      id: "box",
-      label: "Box",
-      hint: "Drag a box around something to mask it again",
-      icon: svg(<rect x="4.5" y="4.5" width="15" height="15" rx="1.5" strokeDasharray="4 3" />),
-    },
-    {
-      id: "click",
-      label: "Click object",
-      hint: "Click an object to mask it; Alt-click a mask to remove it",
-      icon: svg(
-        <>
-          <circle cx="12" cy="12" r="3" />
-          <path d="M12 2v4M12 18v4M2 12h4M18 12h4" />
-        </>,
-      ),
-    },
-    {
-      id: "find",
-      label: "Find in box",
-      hint: "Drag a box where roof lines were missed; the lines inside it are detected and added. Nothing already there changes.",
-      icon: svg(
-        <>
-          <rect x="3.5" y="3.5" width="12" height="12" rx="1.5" strokeDasharray="3 2.5" />
-          <circle cx="16" cy="16" r="3.2" />
-          <path d="m18.4 18.4 2.6 2.6" />
-        </>,
-      ),
-    },
-    {
       id: "measure",
       label: "Measure",
+      key: "R",
       hint: "Give the photo real scale: tap both ends of a feature you know the size of, or pick an eave, and type its length.",
       icon: svg(
         <>
@@ -124,22 +136,12 @@ const GROUPS: ToolSpec[][] = [
     {
       id: "wreath",
       label: "Wreath",
+      key: "W",
       hint: "Tap where a wreath goes. It is drawn at its real size (36 in; change it in the list). Needs a measurement first.",
       icon: svg(
         <>
           <circle cx="12" cy="12" r="7" />
           <circle cx="12" cy="12" r="3.5" />
-        </>,
-      ),
-    },
-    {
-      id: "house",
-      label: "House",
-      hint: "Tap a roof to add it to the house being quoted, or tap it again to take it out. The roof lines are redrawn.",
-      icon: svg(
-        <>
-          <path d="M4 10.5 12 4l8 6.5" />
-          <path d="M6 9.5V20h12V9.5" />
         </>,
       ),
     },
@@ -152,49 +154,159 @@ interface DockProps {
   brushSize: number;
   setBrushSize: (size: number) => void;
   active: Region | undefined;
-  // The photo was detected with TARGET_HOUSE_ONLY on, so its roof planes can be tapped in or
-  // out. Off, or detected before the flag, there is nothing stored to tap and the tool hides.
+  // The photo has stored roof planes to tap in or out. Every detection stores them now; a photo
+  // detected before that has none, and the tool stays disabled until it is detected again.
   houseAvailable: boolean;
   // Opens the current tool's how-to card.
   onHelp?: () => void;
+  // Opens the keyboard shortcuts list.
+  onShortcuts?: () => void;
 }
 
-// A floating vertical dock docked over the canvas, so the tools that act on it read as part of
-// it rather than a disconnected bar of text buttons above.
-export function ToolDock({ tool, setTool, brushSize, setBrushSize, active, houseAvailable, onHelp }: DockProps) {
+const DOCK_KEY = "ld-dock-position";
+
+function savedPosition(): { x: number; y: number } | null {
+  try {
+    const saved = JSON.parse(localStorage.getItem(DOCK_KEY) ?? "null");
+    return saved && Number.isFinite(saved.x) && Number.isFinite(saved.y) ? saved : null;
+  } catch {
+    return null;
+  }
+}
+
+// A floating vertical dock over the canvas, so the tools that act on it read as part of it rather
+// than a disconnected bar of text buttons above. Dragged by its grip to wherever it hides least of
+// the house; the place is remembered in this browser, and a double-click on the grip puts it back.
+export function ToolDock({ tool, setTool, brushSize, setBrushSize, active, houseAvailable, onHelp, onShortcuts }: DockProps) {
+  // Why a tool cannot be used yet, said in the dock on a tap (a tooltip never shows on a tablet),
+  // and what the current tool is waiting for.
+  const [note, setNote] = useState<string | null>(null);
+  useEffect(() => {
+    if (!note) return;
+    const timer = window.setTimeout(() => setNote(null), 4500);
+    return () => window.clearTimeout(timer);
+  }, [note]);
+  const current = GROUPS.flat().find((item) => item.id === tool);
+  const waiting = current?.needs && active?.geometry !== current.needs
+    ? `Select ${current.needs === "line" ? "a line" : "an area"} on the photo to use ${current.label}.`
+    : null;
+  const dockRef = useRef<HTMLDivElement>(null);
+  const [position, setPosition] = useState<{ x: number; y: number } | null>(savedPosition);
+  const dragRef = useRef<{ dx: number; dy: number } | null>(null);
+
+  // Kept inside the canvas area: on a drag, and when the window (so the area) gets smaller.
+  const clamp = (x: number, y: number) => {
+    const dock = dockRef.current;
+    const area = dock?.parentElement;
+    if (!dock || !area) return { x, y };
+    return {
+      x: Math.round(Math.min(Math.max(0, x), Math.max(0, area.clientWidth - dock.offsetWidth))),
+      y: Math.round(Math.min(Math.max(0, y), Math.max(0, area.clientHeight - dock.offsetHeight))),
+    };
+  };
+  useEffect(() => {
+    if (!position) return;
+    const refit = () => setPosition((current) => (current ? clamp(current.x, current.y) : current));
+    refit();
+    window.addEventListener("resize", refit);
+    return () => window.removeEventListener("resize", refit);
+  }, [position === null]);
+  useEffect(() => {
+    try {
+      if (position) localStorage.setItem(DOCK_KEY, JSON.stringify(position));
+      else localStorage.removeItem(DOCK_KEY);
+    } catch {
+      // Storage blocked: the dock still moves, it just starts at its corner next time.
+    }
+  }, [position]);
+
+  const onGripDown = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const dock = dockRef.current;
+    if (!dock) return;
+    event.preventDefault();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    dragRef.current = { dx: event.clientX - dock.offsetLeft, dy: event.clientY - dock.offsetTop };
+  };
+  const onGripMove = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const drag = dragRef.current;
+    if (drag) setPosition(clamp(event.clientX - drag.dx, event.clientY - drag.dy));
+  };
+  const onGripUp = (event: ReactPointerEvent<HTMLDivElement>) => {
+    dragRef.current = null;
+    event.currentTarget.releasePointerCapture(event.pointerId);
+  };
+
   return (
-    <div className="tool-dock" role="toolbar" aria-label="Editing tools" aria-orientation="vertical">
+    <div
+      ref={dockRef}
+      className={position ? "tool-dock moved" : "tool-dock"}
+      style={position ? { left: position.x, top: position.y } : undefined}
+      role="toolbar"
+      aria-label="Editing tools"
+      aria-orientation="vertical"
+    >
+      <div
+        className="dock-grip"
+        title="Drag to move the tools; double-click to put them back"
+        onPointerDown={onGripDown}
+        onPointerMove={onGripMove}
+        onPointerUp={onGripUp}
+        onDoubleClick={() => setPosition(null)}
+      >
+        <svg viewBox="0 0 24 8" aria-hidden="true">
+          {[4, 9, 14, 19].flatMap((x) => [2, 6].map((y) => <circle key={`${x}-${y}`} cx={x + 0.5} cy={y} r="1.3" />))}
+        </svg>
+      </div>
       {GROUPS.map((group, index) => (
         <div key={index} className="dock-group">
-          {group.filter((item) => item.id !== "house" || houseAvailable).map((item) => {
+          {group.map((item) => {
             const missing = item.needs && active?.geometry !== item.needs;
+            const noPlanes = item.id === "house" && !houseAvailable;
             const hint = missing
               ? `Select ${item.needs === "line" ? "a line" : "an area"} first`
-              : item.key
-                ? `${item.hint} (${item.key})`
-                : item.hint;
+              : noPlanes
+                ? "This photo has no roofs to pick yet: press Re-detect, then tap roofs in or out of the house"
+                : item.key
+                  ? `${item.hint} (${item.key})`
+                  : item.hint;
+            const unavailable = Boolean(missing || noPlanes);
             return (
               <button
                 key={item.id}
                 title={hint}
                 aria-pressed={tool === item.id}
-                className={tool === item.id ? "dock-tool active" : "dock-tool"}
-                disabled={missing}
-                onClick={() => setTool(item.id)}
+                aria-disabled={unavailable || undefined}
+                aria-keyshortcuts={item.key}
+                className={`dock-tool${tool === item.id ? " active" : ""}${unavailable ? " unavailable" : ""}`}
+                onClick={() => (unavailable ? setNote(hint) : setTool(item.id))}
               >
                 {item.icon}
                 <span>{item.label}</span>
+                {item.key && <kbd className="dock-key" aria-hidden="true">{item.key}</kbd>}
               </button>
             );
           })}
         </div>
       ))}
 
-      {onHelp && (
-        <button className="dock-help" title="How this tool works" aria-label="How this tool works" onClick={onHelp}>
-          ?
-        </button>
+      {(note || waiting) && (
+        <p className="dock-note" role="status">
+          {note ?? waiting}
+        </p>
       )}
+
+      <div className="dock-help-row">
+        {onHelp && (
+          <button className="dock-help" title="How this tool works" onClick={onHelp}>
+            How to
+          </button>
+        )}
+        {onShortcuts && (
+          <button className="dock-help" title="Keyboard shortcuts (?)" aria-label="Keyboard shortcuts" onClick={onShortcuts}>
+            ⌨
+          </button>
+        )}
+      </div>
 
       {(tool === "brush" || tool === "erase") && (
         <label className="slider dock-slider" title="Brush size ([ and ])">
@@ -213,21 +325,20 @@ export function ToolDock({ tool, setTool, brushSize, setBrushSize, active, house
   );
 }
 
-const ZOOM_STEPS = [1, 1.5, 2, 3, 4];
+const ZOOM_STEPS = [1, 1.5, 2, 3, 4, 6];
 
 interface ViewportProps {
   zoom: number;
   setZoom: (zoom: number) => void;
-  history: { canUndo: boolean; canRedo: boolean };
-  onUndo: () => void;
-  onRedo: () => void;
+  // Night preview: the photo darkened and only the lights, glowing, as the customer will see them.
+  night: { on: boolean; set: (on: boolean) => void };
   // Real lengths on the photo's lines; offered once the photo has a measurement.
   lengths?: { on: boolean; set: (on: boolean) => void } | null;
 }
 
-// Zoom and history sit in their own floating strip, bottom-left over the canvas, so the tool
-// dock above stays about the drawing tools only.
-export function ViewportControls({ zoom, setZoom, history, onUndo, onRedo, lengths }: ViewportProps) {
+// Zoom sits in its own floating strip, bottom-left over the canvas, so the tool dock stays about
+// the drawing tools only (the mouse wheel over the photo zooms too). Undo and redo are on the bar.
+export function ViewportControls({ zoom, setZoom, night, lengths }: ViewportProps) {
   const zoomIn = ZOOM_STEPS.find((step) => step > zoom + 1e-6);
   const zoomOut = [...ZOOM_STEPS].reverse().find((step) => step < zoom - 1e-6);
 
@@ -237,14 +348,24 @@ export function ViewportControls({ zoom, setZoom, history, onUndo, onRedo, lengt
         <button title="Zoom out" aria-label="Zoom out" disabled={!zoomOut} onClick={() => zoomOut && setZoom(zoomOut)}>
           −
         </button>
-        <button title="Fit the whole photo" className="zoom-level" onClick={() => setZoom(1)}>
+        <button title="Fit the whole photo (the mouse wheel over the photo zooms; drag with Space held to move round)" className="zoom-level" onClick={() => setZoom(1)}>
           {zoom === 1 ? "Fit" : `${Math.round(zoom * 100)}%`}
         </button>
         <button title="Zoom in" aria-label="Zoom in" disabled={!zoomIn} onClick={() => zoomIn && setZoom(zoomIn)}>
           +
         </button>
       </div>
-      {lengths && (
+      <div className="tool-group">
+        <button
+          title={night.on ? "Back to editing (N)" : "See the lights at night, as the customer will (N)"}
+          aria-pressed={night.on}
+          className={night.on ? "active night-toggle" : "night-toggle"}
+          onClick={() => night.set(!night.on)}
+        >
+          {night.on ? "☾ Night" : "☾ Night preview"}
+        </button>
+      </div>
+      {lengths && !night.on && (
         <div className="tool-group">
           <button
             title={lengths.on ? "Hide the real lengths on the lines" : "Show each line's real length on the photo"}
@@ -256,14 +377,38 @@ export function ViewportControls({ zoom, setZoom, history, onUndo, onRedo, lengt
           </button>
         </div>
       )}
-      <div className="tool-group">
-        <button title="Undo (Ctrl/Cmd+Z)" disabled={!history.canUndo} onClick={onUndo}>
-          Undo
-        </button>
-        <button title="Redo (Shift+Ctrl/Cmd+Z)" disabled={!history.canRedo} onClick={onRedo}>
-          Redo
-        </button>
-      </div>
+    </div>
+  );
+}
+
+interface HistoryProps {
+  canUndo: boolean;
+  canRedo: boolean;
+  onUndo: () => void;
+  onRedo: () => void;
+}
+
+// Undo and redo on the bar: every change to the lines and areas (painting, moving a line, a type
+// or side picked in the list, a line or area added or deleted), newest first.
+export function HistoryButtons({ canUndo, canRedo, onUndo, onRedo }: HistoryProps) {
+  return (
+    <div className="history-buttons" role="group" aria-label="Undo and redo">
+      <button className="icon-button" title="Undo (Ctrl/Cmd+Z)" aria-label="Undo" disabled={!canUndo} onClick={onUndo}>
+        {svg(
+          <>
+            <path d="M9 14 4 9l5-5" />
+            <path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H11" />
+          </>,
+        )}
+      </button>
+      <button className="icon-button" title="Redo (Ctrl/Cmd+Y or Shift+Ctrl/Cmd+Z)" aria-label="Redo" disabled={!canRedo} onClick={onRedo}>
+        {svg(
+          <>
+            <path d="m15 14 5-5-5-5" />
+            <path d="M20 9H9.5a5.5 5.5 0 0 0 0 11H13" />
+          </>,
+        )}
+      </button>
     </div>
   );
 }

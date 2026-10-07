@@ -69,6 +69,11 @@ class Settings(BaseSettings):
     v3_missed_coverage: float = Field(default=0.15, ge=0.0, le=1.0)
     v3_missed_min_area: float = Field(default=0.03, ge=0.0, le=1.0)
     v3_missed_padding: float = Field(default=0.25, ge=0.0, le=1.0)
+    # ... and a plane whose top outline (its highest pixel in every column, where no object hides
+    # it) has under V3_MISSED_TOP_COVERAGE of its length near a line is missed at the top: its
+    # ridge, hip or wall junction was not drawn (11 of 29 missed edges on 17 annotated photos were
+    # ridges). It gets a second call too, within the same V3_MISSED_MAX_CALLS. 0 turns it off.
+    v3_missed_top_coverage: float = Field(default=0.5, ge=0.0, le=1.0)
     # Cache V3 answers on disk under STORAGE_DIR/v3_cache, keyed by image, crop, model and prompt,
     # so the same detection is never billed twice.
     v3_cache: bool = True
@@ -79,6 +84,17 @@ class Settings(BaseSettings):
     # quality in [0, 1] a snap must reach before anything moves.
     v3_snap_radius: float = Field(default=0.008, ge=0.0, le=0.05)
     v3_snap_min_quality: float = Field(default=0.55, ge=0.0, le=1.0)
+    # Each end of a V3 line slides along the line to where the photo's edge under it starts or
+    # stops: out over an edge that continues, back off a stretch with none (fusion.refine_ends).
+    # V3's own ends were off on 40 of 52 bad endpoints on 17 annotated photos. Off: V3's ends.
+    v3_refine_ends: bool = True
+    # A V3 line whose visible part shows less edge than this (mean gradient across it against the
+    # photo's strong edges, in [0, 1]) is dropped: on 17 annotated photos the true lines' lowest
+    # tenth was 0.61, the false lines' 0.28. 0 keeps every line.
+    v3_min_edge_support: float = Field(default=0.3, ge=0.0, le=1.0)
+    # Two lines of one V3 answer along the same edge (roofline_match_* below) are one: the one
+    # with less edge under it is dropped.
+    v3_dedupe: bool = True
     # Find in Box: a found line is the same edge as one already on the photo, and so not added,
     # within these (distance as a share of the roof extent, never under 5 px).
     roofline_match_distance: float = Field(default=0.012, gt=0.0, le=0.1)
@@ -154,15 +170,24 @@ class Settings(BaseSettings):
     detect_blockers: bool = True
     # Doors and garage doors are a standard size: segmented with the roof whatever the instruction
     # lights, they give the scale an independent check (services/checks.py: a typed length that
-    # makes a garage door 5 ft wide is flagged). Costs two more detection requests per roof photo.
-    scale_doors: bool = False
+    # makes a garage door 5 ft wide is flagged; their heights second-guess the typed length).
+    # Costs two more detection requests per roof photo.
+    scale_doors: bool = True
+    # Which wall distances place the lines (services/scale.py WALL_SOLVES): "propagate", corner by
+    # corner, or "linear", every link at once by a robust least-squares fit. Both are computed and
+    # compared in the debug record either way.
+    scale_wall_solve: str = "propagate"
+    # Lit palm fronds: strands run along each frond from the crown to its tip (services/palm.py
+    # frond_paths), as installers string them. Off: mini lights scattered over the fronds' area.
+    palm_frond_lines: bool = True
 
     # On: roof lines only for the house being quoted. Detection still returns every roof plane;
     # services/target.py picks the planes that belong to the target house, only those get
     # lines, and only their segments decide which vanishing points stand and where. Every plane
     # is stored, so a tap in the editor can move one into or out of the house without a new
     # detection call. Off: every plane gets lines and the whole photo decides the vanishing
-    # points, as before, and taps are refused.
+    # points, as before; the planes are still stored, all in the house, so the editor's House
+    # tool can still take a neighbour's out with a tap.
     target_house_only: bool = False
 
     # Off: draw hips that fall inside a single mask, where two roof planes came back merged and

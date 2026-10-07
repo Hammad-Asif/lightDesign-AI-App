@@ -1,3 +1,4 @@
+import base64
 import logging
 import time
 import uuid
@@ -9,7 +10,8 @@ from app.config import get_settings
 from app.models import Region as RegionRow
 from app.providers.base import get_provider
 from app.schemas import (
-    CreateRegionRequest, DetectRequest, FindLinesRequest, PhotoDetail, RefineRequest, Region, RegionPatch, TargetTap,
+    CreateRegionRequest, DetectRequest, FindLinesRequest, PhotoDetail, RefineRequest, Region, RegionPatch,
+    RestoreRegionRequest, TargetTap,
 )
 from app.routers import photos as photos_router
 from app.services import (
@@ -377,15 +379,18 @@ def run_detection(photo_id: str, body: DetectRequest, store: Store = Depends(get
         keep = target.select(roof_masks, image) if roof_masks and (settings.target_house_only or use_v3) else None
         house = keep if settings.target_house_only else None
         vp_region = target.evidence_region(roof_masks, house) if house is not None else None
-        if house is not None:
+        if roof_masks:
             # Every plane is stored with its keep flag, so a tap in the editor can move one in or
-            # out of the house without another detection call.
+            # out of the house without another detection call. Stored with TARGET_HOUSE_ONLY off
+            # too, so the House tool works on every photo: then nothing was filtered, every plane
+            # starts in the house, and the first tap is what takes a neighbour out.
             store.write_planes(photo.id, working_roofs)
+            flags = house if house is not None else [True] * len(roof_masks)
             target_info = {
                 # Scores unrounded: the partition ranks planes by them, and a tap must redraw the
                 # lines from exactly what detection used.
                 "planes": [{"outline": outline, "keep": keep_it, "score": float(score)}
-                           for outline, keep_it, score in zip(target.outlines(roof_masks), house, scores)],
+                           for outline, keep_it, score in zip(target.outlines(roof_masks), flags, scores)],
                 "sides": parsed.sides,
                 "edges": parsed.edges,
             }
@@ -399,10 +404,13 @@ def run_detection(photo_id: str, body: DetectRequest, store: Store = Depends(get
             if crop is None:
                 # SAM found no roof plane: V3 still gets the photo rather than nothing.
                 crop, basis = rooflines.CropBox(0, 0, image.width, image.height), "whole_photo"
-            v3 = fusion.run_v3(image, crop, settings, basis)
+            # V3 is told which house to draw: the box of the target house's planes.
+            house_box = rooflines.house_box(roof_masks, keep) if roof_masks else None
+            v3 = fusion.run_v3(image, crop, settings, basis, house=house_box)
             if settings.v3_missed_planes and v3.usable:
                 # Second calls for target-house planes the first answer left without lines.
-                v3.meta["missed_planes"] = fusion.run_missed_planes(image, v3, roof_masks, keep, blockers, sky, settings)
+                v3.meta["missed_planes"] = fusion.run_missed_planes(image, v3, roof_masks, keep, blockers, sky, settings,
+                                                                    house=house_box)
             detection_run = {**v3.meta, "detector": "v3_sol", "status": v3.status, "error": v3.error,
                              "fallback_used": not v3.usable, "side_review_required": bool(parsed.sides)}
             extra_costs = [call.meta.get("cost_usd") for call in v3.extra]
@@ -494,13 +502,12 @@ def tap_target_plane(photo_id: str, body: TargetTap, store: Store = Depends(get_
     Lighting already confirmed carries over to the redrawn lines.
     """
     settings = get_settings()
-    if not settings.target_house_only:
-        # The flag switches the whole feature off, taps included.
-        raise HTTPException(409, "TARGET_HOUSE_ONLY is off. Turn it on and detect again to pick the house's planes.")
+    # Works whatever TARGET_HOUSE_ONLY says: detection stores the planes either way, and a tap
+    # decides the house for this photo (with the flag off, every plane started in it).
     photo = store.photo(photo_id)
     info = (photo.interpreted or {}).get("target")
     if not info or not info.get("planes"):
-        raise HTTPException(409, "This photo has no stored roof planes. Detect it with TARGET_HOUSE_ONLY on.")
+        raise HTTPException(409, "This photo has no stored roof planes. Detect it again to pick the house.")
     if settings.edge_extractor == "partition" and settings.partition_engine == "reference":
         raise HTTPException(409, "Tapping planes redraws lines with this repo's engine: set PARTITION_ENGINE=port.")
     working = store.read_planes(photo.id, len(info["planes"]))
@@ -511,9 +518,13 @@ def tap_target_plane(photo_id: str, body: TargetTap, store: Store = Depends(get_
     if index is None:
         raise HTTPException(404, "No roof plane there. Tap on a roof.")
     keep = [bool(plane["keep"]) for plane in info["planes"]]
+    # Planes the salesperson took out by hand: their lines go with them, gutters included
+    # (fusion.plane_filter), which the automatic pick's tolerant rules would keep.
+    tapped_out = [bool(plane.get("tapped_out")) for plane in info["planes"]]
     moved = not keep[index]
     for plane in target.copies_of(masks, index):
         keep[plane] = moved
+        tapped_out[plane] = not moved
     if not any(keep):
         raise HTTPException(400, "The house needs at least one roof plane.")
 
@@ -535,10 +546,12 @@ def tap_target_plane(photo_id: str, body: TargetTap, store: Store = Depends(get_
     result = fusion.unify(
         image=image, settings=settings, parsed=parsed, roof_masks=masks, keep=keep, blockers=blockers,
         partition_lines=partition_lines, v3=v3, vp_region=vp_region, crop=v3.crop if v3 else None,
+        tapped_out=tapped_out,
     )
     extra = _roofline_extra(result, image, store, photo)
     extra["roofline"] = {**extra["roofline"], "v3_reused": v3 is not None}
-    changes: dict = {"target": {**info, "planes": [{**plane, "keep": keep_it} for plane, keep_it in zip(info["planes"], keep)]},
+    changes: dict = {"target": {**info, "planes": [{**plane, "keep": keep_it, "tapped_out": out}
+                                                   for plane, keep_it, out in zip(info["planes"], keep, tapped_out)]},
                      **extra}
     if result.details.get("pitch") is not None:
         changes["pitch"] = {str(k): v for k, v in result.details["pitch"].items()}
@@ -804,6 +817,38 @@ def refine(photo_id: str, body: RefineRequest, store: Store = Depends(get_store)
 
     if _blocks(region.kind):
         store.rejoin_behind_blockers(photo)
+    return region_dict(region)
+
+
+@router.post("/regions/restore", response_model=Region)
+def restore_region(photo_id: str, body: RestoreRegionRequest, store: Store = Depends(get_store)):
+    """Undo of a delete (or redo of an add): the region comes back with its id, source, type and
+    path, and an area with its mask. Lines behind a restored object and confirmed lighting are
+    worked out again, as after any other change."""
+    photo = store.photo(photo_id)
+    try:
+        region_id = uuid.UUID(body.id)
+    except ValueError:
+        raise HTTPException(400, "Not a region id")
+    if any(r.id == region_id for r in store.regions(photo)):
+        raise HTTPException(409, "That line or area is already there")
+    if body.geometry == "line" and (not body.polyline or len(body.polyline) < 2):
+        raise HTTPException(400, "A line region needs a polyline")
+    fields = body.model_dump(exclude={"id", "mask"})
+    region = RegionRow(id=region_id, mask_url=None, **fields)
+    if body.geometry == "area":
+        data = (body.mask or "").split(",", 1)[-1]
+        try:
+            region.mask_url = store.write_mask_bytes(photo.id, region_id, base64.b64decode(data, validate=True))
+        except (ValueError, OSError):
+            region.mask_url = store.write_mask(photo.id, region_id, np.zeros((photo.height, photo.width), dtype=bool))
+    region = store.add_region(photo, region)
+    if _blocks(region.kind):
+        store.rejoin_behind_blockers(photo)
+    elif region.geometry == "line":
+        store.refresh_hidden(photo)
+    if region.geometry == "line" and region.kind == "roof":
+        _relight(store, photo)
     return region_dict(region)
 
 

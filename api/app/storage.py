@@ -1,4 +1,5 @@
 import io
+import shutil
 import time
 import uuid
 from pathlib import Path
@@ -45,6 +46,7 @@ def photo_dict(photo: Photo) -> dict:
     return {
         "id": str(photo.id),
         "prompt": photo.prompt,
+        "name": photo.name or "",
         "width": photo.width,
         "height": photo.height,
         "image_url": f"/files/photos/{photo.id}/original.png",
@@ -117,7 +119,7 @@ class Store:
 
     # -- photos ----------------------------------------------------------------
 
-    def create_photo(self, data: bytes, prompt: str, max_edge: int) -> Photo:
+    def create_photo(self, data: bytes, prompt: str, max_edge: int, name: str = "") -> Photo:
         upload = Image.open(io.BytesIO(data))
         # Read before the orientation fix and the PNG save, both of which drop EXIF.
         focal_35mm = exif_focal_35mm(upload)
@@ -129,6 +131,7 @@ class Store:
             id=uuid.uuid4(),
             owner_id=self.user.id,
             prompt=prompt,
+            name=name,
             width=image.width,
             height=image.height,
             focal_35mm=focal_35mm,
@@ -139,7 +142,19 @@ class Store:
 
         self.db.add(photo)
         self.db.commit()
+        try:
+            self.thumbnail(photo)
+        except OSError:
+            pass  # made on first request instead
         return photo
+
+    def delete_photo(self, photo: Photo) -> None:
+        """The photo, its lines and areas (cascade), its design, and every file kept for it."""
+        directory = self.photo_dir(photo.id)
+        self.db.execute(delete(Design).where(Design.photo_id == photo.id))
+        self.db.delete(photo)
+        self.db.commit()
+        shutil.rmtree(directory, ignore_errors=True)
 
     def update_photo(self, photo: Photo, **fields) -> Photo:
         for name, value in fields.items():
@@ -149,6 +164,24 @@ class Store:
 
     def load_image(self, photo: Photo) -> Image.Image:
         return Image.open(self.photo_dir(photo.id) / "original.png").convert("RGB")
+
+    def has_image(self, photo: Photo) -> bool:
+        return (self.photo_dir(photo.id) / "original.png").is_file()
+
+    # A project card shows the photo this big: the original is up to MAX_IMAGE_EDGE and a PNG.
+    THUMBNAIL_EDGE = 480
+
+    def thumbnail(self, photo: Photo) -> Path:
+        """The photo as a small JPEG for the projects list, made once and kept beside the original
+        (the original never changes after upload)."""
+        path = self.photo_dir(photo.id) / "thumb.jpg"
+        if not path.is_file():
+            if not self.has_image(photo):
+                raise HTTPException(404, "File not found")
+            image = self.load_image(photo)
+            image.thumbnail((self.THUMBNAIL_EDGE, self.THUMBNAIL_EDGE), Image.LANCZOS)
+            image.save(path, format="JPEG", quality=82, optimize=True)
+        return path
 
     # -- regions ---------------------------------------------------------------
 

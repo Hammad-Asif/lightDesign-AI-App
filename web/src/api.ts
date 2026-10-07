@@ -11,6 +11,8 @@ import type {
   PhotoDetail,
   Product,
   ProductDraft,
+  ProjectPage,
+  ProjectStatus,
   Region,
   RegionKind,
   ScaleCheckInput,
@@ -50,6 +52,8 @@ const ACTIVITY: [RegExp, string, string?][] = [
   [/\/detect$/, "Detecting"],
   [/\/find-lines$/, "Finding lines"],
   [/\/regions\/refine$/, "Refining"],
+  [/\/regions\/restore$/, "Restoring"],
+  [/^\/photos\/projects/, "Loading projects"],
   [/\/target$/, "Picking house"],
   [/\/interpret$/, "Reading prompt"],
   [/\/scale\/overrides\//, "Saving length"],
@@ -130,14 +134,32 @@ export async function logout(): Promise<void> {
   await request("/auth/logout", { method: "POST" });
 }
 
-export async function uploadPhoto(file: File, prompt: string): Promise<Photo> {
+export async function uploadPhoto(file: File, prompt: string, name = ""): Promise<Photo> {
   const form = new FormData();
   form.append("file", file);
   form.append("prompt", prompt);
+  form.append("name", name);
   return json<Photo>(await request("/photos", { method: "POST", body: form }));
 }
 
 export const getPhoto = (id: string) => send<PhotoDetail>(`/photos/${id}`, "GET");
+
+// One page of the signed-in account's projects, newest first; photos whose image is gone are left out.
+export const listProjects = (offset = 0, limit = 10, filter: { status?: ProjectStatus | null; q?: string } = {}) => {
+  const query = new URLSearchParams({ offset: String(offset), limit: String(limit) });
+  if (filter.status) query.set("status", filter.status);
+  if (filter.q?.trim()) query.set("q", filter.q.trim());
+  return send<ProjectPage>(`/photos/projects?${query}`, "GET");
+};
+
+// The project's name: the customer or the address.
+export const renamePhoto = (id: string, name: string) => send<Photo>(`/photos/${id}`, "PATCH", { name });
+
+export async function deletePhoto(id: string): Promise<void> {
+  const response = await request(`/photos/${id}`, { method: "DELETE" });
+  if (response.status === 401) throw new UnauthorizedError("Sign in required");
+  if (!response.ok) throw new Error(`Could not delete the project (${response.status})`);
+}
 
 export const setMode = (id: string, mode: MaskingMode) =>
   send<Photo>(`/photos/${id}/mode`, "PUT", { mode });
@@ -238,6 +260,26 @@ export const putDesign = (id: string, requests: DesignRequest[]) =>
 
 export const approvePhoto = (id: string) => send<PhotoDetail>(`/photos/${id}/approve`, "POST");
 export const reopenPhoto = (id: string) => send<PhotoDetail>(`/photos/${id}/reopen`, "POST");
+
+// Undo of a delete (or redo of an add): the region back as it was, same id; an area with its mask.
+export const restoreRegion = (id: string, region: Region, mask: string | null) =>
+  send<Region>(`/photos/${id}/regions/restore`, "POST", {
+    id: region.id,
+    kind: region.kind,
+    role: region.role ?? "target",
+    label: region.label,
+    geometry: region.geometry,
+    source: region.source,
+    color: region.color,
+    score: region.score ?? 1,
+    visible: region.visible,
+    side: region.side ?? null,
+    edge: region.edge ?? null,
+    polyline: region.polyline ?? null,
+    confidence: region.confidence ?? null,
+    sources: region.sources ?? null,
+    mask,
+  });
 
 export async function deleteRegion(id: string, regionId: string): Promise<void> {
   const response = await request(`/photos/${id}/regions/${regionId}`, { method: "DELETE" });

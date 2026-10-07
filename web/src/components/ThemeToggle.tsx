@@ -5,12 +5,14 @@ interface Props {
   onChange: (theme: Theme) => void;
 }
 
+// A sun in dark mode, a moon in light mode: the icon is the mode a click switches to.
 export function ThemeToggle({ theme, onChange }: Props) {
   const next = theme === "dark" ? "light" : "dark";
   return (
     <button
-      className="theme-toggle"
+      className="theme-toggle icon-button"
       title={`Switch to ${next} mode`}
+      aria-label={`Switch to ${next} mode`}
       onClick={() => onChange(next)}
     >
       {theme === "dark" ? (
@@ -23,7 +25,6 @@ export function ThemeToggle({ theme, onChange }: Props) {
           <path d="M20 14.2A8.2 8.2 0 1 1 9.8 4a6.6 6.6 0 0 0 10.2 10.2Z" strokeLinejoin="round" />
         </svg>
       )}
-      {next === "light" ? "Light" : "Dark"}
     </button>
   );
 }

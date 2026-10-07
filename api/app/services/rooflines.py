@@ -104,6 +104,17 @@ def sky_start(union: np.ndarray, sky: np.ndarray, x0: int, x1: int) -> int | Non
     return int((lowest[seen] + 1).min())
 
 
+def house_box(masks: list[np.ndarray], keep: list[bool] | None) -> CropBox | None:
+    """The bounding box of the target house's roof planes, unpadded; None without planes."""
+    chosen = [m for m, k in zip(masks, keep if keep is not None else [True] * len(masks)) if k and m.any()]
+    if not chosen:
+        return None
+    union = np.logical_or.reduce(chosen)
+    rows = np.flatnonzero(union.any(axis=1))
+    cols = np.flatnonzero(union.any(axis=0))
+    return CropBox(int(cols[0]), int(rows[0]), int(cols[-1]) + 1, int(rows[-1]) + 1)
+
+
 def target_crop(masks: list[np.ndarray], keep: list[bool] | None, size: tuple[int, int],
                 padding: float, sky: np.ndarray | None = None,
                 sky_max_rise: float = 0.5) -> tuple[CropBox | None, str]:
@@ -116,13 +127,11 @@ def target_crop(masks: list[np.ndarray], keep: list[bool] | None, size: tuple[in
 
     `masks` and `sky` are photo-sized; `keep` is target.select's answer (None: every plane counts).
     """
-    chosen = [m for m, k in zip(masks, keep if keep is not None else [True] * len(masks)) if k and m.any()]
-    if not chosen:
+    house = house_box(masks, keep)
+    if house is None:
         return None, "padding"
-    union = np.logical_or.reduce(chosen)
-    rows = np.flatnonzero(union.any(axis=1))
-    cols = np.flatnonzero(union.any(axis=0))
-    x0, y0, x1, y1 = int(cols[0]), int(rows[0]), int(cols[-1]) + 1, int(rows[-1]) + 1
+    union = np.logical_or.reduce([m for m, k in zip(masks, keep if keep is not None else [True] * len(masks)) if k and m.any()])
+    x0, y0, x1, y1 = house.as_list()
     crop = padded_box(x0, y0, x1, y1, padding, size)
     if sky is None or not sky.any():
         return crop, "padding"

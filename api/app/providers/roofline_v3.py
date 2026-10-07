@@ -114,6 +114,23 @@ def image_url(image: Image.Image) -> str:
     return f"data:{mime};base64,{encoded.decode()}"
 
 
+def target_text(house: tuple[int, int, int, int] | None, size: tuple[int, int]) -> str:
+    """The prompt's TARGET HOUSE paragraph: which building to draw, as a box in the posted image's
+    pixels, or (no box) the house the image shows. V3 was told to draw "background" roofs and drew
+    the neighbours: 34 of 71 false lines on 17 annotated photos."""
+    if house is None:
+        return ("Annotate every roof that belongs to the house this image shows, with all its "
+                "parts. Do not annotate the roofs of other buildings.")
+    width, height = size
+    x0, y0, x1, y1 = house
+    x0, x1 = min(max(int(x0), 0), width - 1), min(max(int(x1), 0), width - 1)
+    y0, y1 = min(max(int(y0), 0), height - 1), min(max(int(y1), 0), height - 1)
+    return (f"The house being quoted is the building whose roof lies within x {x0} to {x1} and "
+            f"y {y0} to {y1} of this image. Annotate only that house's roof edges. Its edges may run "
+            "a little past this box: follow them to where they really end. Do not annotate the roofs "
+            "of neighbouring or background buildings, even where they are visible or touch it.")
+
+
 def validate(data: dict, size: tuple[int, int]) -> list[dict]:
     # Structural shape (fields, types, the enum) is Pydantic's job; only the parts that depend
     # on this particular image -- in-bounds coordinates, no zero-length edge -- stay hand-checked.
@@ -141,15 +158,17 @@ def _digest(image: Image.Image) -> str:
     return hashlib.sha256(f"{rgb.width}x{rgb.height}:".encode() + rgb.tobytes()).hexdigest()
 
 
-def cache_key(image: Image.Image, box: tuple[int, int, int, int], crop: Image.Image, settings: Settings) -> str:
-    """Deterministic key of a V3 request: whole photo, crop box and crop pixels, model, reasoning
-    and prompt. Any change to the crop, prompt or model is a different key."""
+def cache_key(image: Image.Image, box: tuple[int, int, int, int], crop: Image.Image, settings: Settings,
+              house: tuple[int, int, int, int] | None = None) -> str:
+    """Deterministic key of a V3 request: whole photo, crop box and crop pixels, the target house's
+    box, model, reasoning and prompt. Any change to the crop, house, prompt or model is a different key."""
     template = PROMPT_PATH.read_text(encoding="utf-8")
     parts = {
         "version": CACHE_VERSION,
         "image": _digest(image),
         "crop": _digest(crop),
         "box": [int(v) for v in box],
+        "house": [int(v) for v in house] if house is not None else None,
         "model": settings.roofline_model,
         "reasoning": settings.roofline_reasoning,
         "prompt": hashlib.sha256(template.encode()).hexdigest(),
@@ -160,17 +179,20 @@ def cache_key(image: Image.Image, box: tuple[int, int, int, int], crop: Image.Im
 
 
 def detect_crop(image: Image.Image, box: tuple[int, int, int, int], settings: Settings,
-                cache_dir: Path | None = None) -> tuple[list[dict], dict]:
+                cache_dir: Path | None = None,
+                house: tuple[int, int, int, int] | None = None) -> tuple[list[dict], dict]:
     """V3 on one crop of the photo: lines in the crop's own pixel frame, and the run's metadata.
 
-    `box` is (x0, y0, x1, y1) in photo pixels, x1/y1 exclusive. The answer is cached by
-    cache_key when `cache_dir` is given: a repeated detection of the same crop returns the stored
-    lines and makes no call. Only complete, validated answers are stored; a failure is never
-    cached, so it does not stick.
+    `box` is (x0, y0, x1, y1) in photo pixels, x1/y1 exclusive; `house`, in photo pixels too, is
+    the target house the model is told to draw (None: the house the crop shows). The answer is
+    cached by cache_key when `cache_dir` is given: a repeated detection of the same crop returns
+    the stored lines and makes no call. Only complete, validated answers are stored; a failure is
+    never cached, so it does not stick.
     """
     x0, y0, x1, y1 = (int(v) for v in box)
     crop = image.crop((x0, y0, x1, y1))
-    key = cache_key(image, (x0, y0, x1, y1), crop, settings)
+    inside = None if house is None else (int(house[0]) - x0, int(house[1]) - y0, int(house[2]) - x0, int(house[3]) - y0)
+    key = cache_key(image, (x0, y0, x1, y1), crop, settings, inside)
     path = cache_dir / f"{key}.json" if cache_dir is not None else None
     if path is not None and path.is_file():
         try:
@@ -182,8 +204,9 @@ def detect_crop(image: Image.Image, box: tuple[int, int, int, int], settings: Se
             return lines, meta
         except (OSError, ValueError, KeyError, TypeError):
             pass  # an unreadable entry is a miss, and is overwritten below
-    lines, meta = detect(crop, settings)
-    meta = {**meta, "cache": "miss" if path is not None else "off", "cache_key": key, "crop_box": [x0, y0, x1, y1]}
+    lines, meta = detect(crop, settings, inside)
+    meta = {**meta, "cache": "miss" if path is not None else "off", "cache_key": key, "crop_box": [x0, y0, x1, y1],
+            "house_box": list(house) if house is not None else None}
     if path is not None:
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -195,13 +218,17 @@ def detect_crop(image: Image.Image, box: tuple[int, int, int, int], settings: Se
     return lines, meta
 
 
-def detect(image: Image.Image, settings: Settings) -> tuple[list[dict], dict]:
+def detect(image: Image.Image, settings: Settings,
+           house: tuple[int, int, int, int] | None = None) -> tuple[list[dict], dict]:
+    """V3 on `image`; `house` is the target house's box in `image`'s pixels (None: the house it shows)."""
     if not settings.openrouter_api_key.strip():
         raise RuntimeError("V3 roof detection requires OPENROUTER_API_KEY on the API server")
     template = PROMPT_PATH.read_text(encoding="utf-8")
     # Everything the model is told, and everything it answers, is in the posted copy's space.
     posted, factor = for_upload(image)
-    prompt = template.replace("{width}", str(posted.width)).replace("{height}", str(posted.height))
+    posted_house = None if house is None else tuple(int(round(v / factor)) for v in house)
+    prompt = (template.replace("{width}", str(posted.width)).replace("{height}", str(posted.height))
+              .replace("{target}", target_text(posted_house, posted.size)))
     payload = {
         "model": settings.roofline_model,
         "messages": [

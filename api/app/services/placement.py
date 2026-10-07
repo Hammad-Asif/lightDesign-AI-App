@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from app.schemas import LightingSettings, Pattern, PatternStep
-from app.services import patterns, products, scale
+from app.services import palm, patterns, products, scale
 from app.services.camera import Camera
 
 LINE_CATEGORIES = {"c9", "c7", "mini", "icicle", "garland"}
@@ -313,6 +313,11 @@ DRAW_CAP = 4000                    # at most this many scattered bulbs are drawn
 TRUNK_WIDTH_ROWS = (0.2, 0.8)      # the trunk's width is its median over this middle band of height
 WREATH_RING = 0.42                 # bulbs sit on a ring this share of the wreath's diameter out
 DEFAULT_WREATH_IN = 36             # Lukas: default wreath size
+# A turn of the wrap is a circle round the trunk, seen from below: an ellipse whose near half rises
+# above its far half. Flat at eye level, at the base, and opening up towards the crown; as a share
+# of the trunk's width.
+WRAP_TILT = (0.06, 0.22)
+STEM_REACH = 0.15                  # of the fronds' size: how far a trunk's top may be from its fronds
 
 
 def wall_scale(camera: Camera, solution: scale.Solution, lines: dict, pixel) -> tuple[float, str] | None:
@@ -391,9 +396,12 @@ def spiral(mask: np.ndarray, settings: LightingSettings, product, kind: str, per
             near = rows[np.argmin(np.abs(rows - row))]
             xs = np.flatnonzero(mask[near])
         centre, half = (xs[0] + xs[-1]) / 2, (xs[-1] - xs[0] + 1) / 2
-        # Angle 0 is the trunk's right edge; the near half faces the camera (sin > 0).
-        bulbs.append([float(centre + half * np.cos(angle)), float(y), float(product.bulb_diameter_in or 0.2) * per_inch,
-                      None, bool(np.sin(angle) < 0)])
+        # Angle 0 is the trunk's right edge; the near half faces the camera (sin > 0) and, seen
+        # from below, sits higher than the far half: the strand slants across the trunk as it does
+        # in a photo, rather than running in flat bands.
+        tilt = WRAP_TILT[0] + (WRAP_TILT[1] - WRAP_TILT[0]) * float(np.clip((bottom - y) / height_px, 0.0, 1.0))
+        bulbs.append([float(centre + half * np.cos(angle)), float(y - tilt * 2 * half * np.sin(angle)),
+                      float(product.bulb_diameter_in or 0.2) * per_inch, None, bool(np.sin(angle) < 0)])
         turn_of.append(int(angle // (2 * np.pi)))
     for bulb, colour in zip(bulbs, _colours_for(settings, product, kind, len(bulbs), turn_of)):
         bulb[3] = colour
@@ -429,6 +437,64 @@ def scatter(mask: np.ndarray, settings: LightingSettings, product, kind: str, pe
             "estimate": estimate, "area_sqft": round(area_sqft, 1), "density": preset, "drawn": drawn}
 
 
+def along_fronds(mask: np.ndarray, settings: LightingSettings, product, kind: str, per_inch: float,
+                 override: dict, stem: np.ndarray | None = None) -> dict | None:
+    """Mini lights strung along each frond from the crown to its tip, at the product's spacing.
+    The strand length is the fronds' traced length at the local scale, an estimate the salesperson
+    can replace (override `strand_ft`): the bulbs then spread evenly over the same fronds. None
+    when no frond can be traced, for the caller to scatter instead."""
+    paths = palm.frond_paths(mask, stem)
+    lengths = [float(np.linalg.norm(np.diff(path, axis=0), axis=1).sum()) for path in paths]
+    total_px = sum(lengths)
+    if not paths or total_px <= 0:
+        return None
+    estimate_in = total_px / per_inch
+    strand_in = float(override["strand_ft"]) * 12 if override.get("strand_ft") else estimate_in
+    spacing = float(product.spacing_in or 4.0)
+    count = max(len(paths), int(round(strand_in / spacing)))
+    size = float(product.bulb_diameter_in or 0.2) * per_inch
+
+    bulbs = []
+    for path, length in zip(paths, lengths):
+        # The bulbs this frond carries, its share of the strand, from just off the crown to the tip.
+        share = max(1, int(round(count * length / total_px)))
+        segments = np.linalg.norm(np.diff(path, axis=0), axis=1)
+        along = np.concatenate(([0.0], np.cumsum(segments)))
+        for k in range(share):
+            distance = (k + 0.5) * length / share
+            x = float(np.interp(distance, along, path[:, 0]))
+            y = float(np.interp(distance, along, path[:, 1]))
+            bulbs.append([x, y, size, None, False])
+    for bulb, colour in zip(bulbs, _colours_for(settings, product, kind, len(bulbs))):
+        bulb[3] = colour
+    return {"bulbs": bulbs, "count": len(bulbs), "hidden": 0, "estimated": not override.get("strand_ft"),
+            "strand_ft": round(strand_in / 12, 1), "strand_estimate_ft": round(estimate_in / 12, 1),
+            "strand_set": bool(override.get("strand_ft")),
+            "fronds": {"count": len(paths), "paths": [[[round(float(x), 1), round(float(y), 1)] for x, y in path[::4]]
+                                                      + [[round(float(path[-1][0]), 1), round(float(path[-1][1]), 1)]]
+                                                      for path in paths]}}
+
+
+def _stem_for(frond: np.ndarray, stems: list[np.ndarray]) -> np.ndarray | None:
+    """The trunk (or collar) the fronds grow from: the one whose top is nearest the fronds."""
+    ys, xs = np.nonzero(frond)
+    if not xs.size:
+        return None
+    size = float(max(np.ptp(xs), np.ptp(ys), 1))
+    picks = np.linspace(0, len(xs) - 1, min(len(xs), 4000)).astype(int)
+    best = None
+    for stem in stems:
+        if stem is None or stem.shape != frond.shape or not stem.any():
+            continue
+        sy, sx = np.nonzero(stem)
+        top = sy.min()
+        cx = float(sx[sy <= top + 2].mean())
+        distance = float(np.min(np.hypot(xs[picks] - cx, ys[picks] - top)))
+        if distance <= STEM_REACH * size and (best is None or distance < best[0]):
+            best = (distance, stem)
+    return best[1] if best else None
+
+
 def wreath(centre, product, size_in: float, per_inch: float) -> dict:
     """A wreath where the salesperson tapped: a ring of its bulbs, at the local scale."""
     count = int(getattr(product, "bulb_count", None) or 100)
@@ -445,10 +511,13 @@ def wreath(centre, product, size_in: float, per_inch: float) -> dict:
 
 
 def place_areas(camera: Camera, regions: list, settings_by_region: dict, products_by_id: dict,
-                solution: scale.Solution, overrides: dict, masks: dict) -> dict:
-    """Bulbs for lit palm trunks and collars (spirals), canopies, fronds and hedges (estimates), and
-    every wreath (tapped, lit or not: Lukas's default is a 36 in warm-white one), by region id."""
+                solution: scale.Solution, overrides: dict, masks: dict, frond_lines: bool = True) -> dict:
+    """Bulbs for lit palm trunks and collars (spirals), fronds (strands along each frond, or
+    scattered with `frond_lines` off), canopies and hedges (estimates), and every wreath (tapped,
+    lit or not: Lukas's default is a 36 in warm-white one), by region id. `masks` may carry unlit
+    trunks and collars too: the fronds are traced from the top of theirs."""
     lines = {str(r.id): r.polyline for r in regions if r.geometry == "line" and r.polyline}
+    stems = [masks.get(str(r.id)) for r in regions if r.kind in patterns.WRAP_KINDS]
     wreaths = {int(p.diameter_in): p for p in products_by_id.values()
                if p.category == "wreath" and p.owner_id is None and p.diameter_in and not getattr(p, "archived", False)}
     out: dict = {}
@@ -477,8 +546,12 @@ def place_areas(camera: Camera, regions: list, settings_by_region: dict, product
             out[region_id] = {"needs": "measurement"}
             continue
         parsed = LightingSettings(**settings)
+        strung = (along_fronds(mask, parsed, product, region.kind, local[0], override, _stem_for(mask, stems))
+                  if frond_lines and region.kind == "palm_frond" else None)
         if region.kind in patterns.WRAP_KINDS:
             out[region_id] = spiral(mask, parsed, product, region.kind, local[0], override)
+        elif strung is not None:
+            out[region_id] = strung
         else:
             out[region_id] = scatter(mask, parsed, product, region.kind, local[0], override, region_id)
         out[region_id]["scale_from"] = f"the {local[1]} wall"

@@ -3,7 +3,8 @@
     SAM3: roof planes + blockers + every other requested kind
       -> target house (services/target.py) -> padded crop
       -> V3 on the crop (cached) -> normalize_v3_line (crop -> photo pixels) -> RoofLine
-      -> conservative geometry: snap, vanishing-point facade, neighbour-plane filter, corners
+      -> conservative geometry: snap, ends, vanishing-point facade, neighbour-plane filter,
+         weak-edge filter, duplicates, corners
       -> occlusion against SAM's blockers -> confidence -> the editor's region rows
 
 The roof lines come from ONE source: the first in ROOFLINE_SOURCES that answers. With
@@ -14,8 +15,10 @@ lines only when it is the configured source, or as the fallback when V3 fails.
 Rules this module keeps:
 
 - Geometry refines V3, it does not redraw it. Snapping moves an endpoint only on strong, local,
-  roof-consistent evidence; vanishing points and facades are metadata and never move a line; the
-  plane filter rejects only on strong evidence of a neighbour's plane. Every V3 line keeps its raw
+  roof-consistent evidence; an end slides along its own line only to where the photo's edge under
+  it starts or stops; vanishing points and facades are metadata and never move a line; the plane
+  filter rejects only on strong evidence of a neighbour's plane, the edge filter only a line with
+  next to no edge under it. Every V3 line keeps its raw
   answer, and with ROOFLINE_DEBUG every stage is recorded so the first stage that damaged a good
   V3 line can be found (Recorder).
 - V3 failing (no key, timeout, HTTP error, bad JSON, no lines) is a status, never a failed
@@ -52,6 +55,19 @@ SNAP_MIN_LENGTH = 12.0          # px: shorter lines have too little edge to read
 SNAP_MAX_TURN_DEG = 2.5
 SNAP_AGREE_PX = 1.5             # a sample agrees with the snap when its own best edge is this close
 SNAP_ALREADY_ON = 0.9           # the line already sits on an edge this strong (share of the best)
+# Ends (refine_ends): how far an end may go out over a continuing edge or come back off a stretch
+# with none. On 17 annotated photos V3's bad ends were about half short and half past the corner,
+# by a median 22% of the line.
+END_OUT_L = 0.04                # of the roof extent: the farthest an end goes out
+END_OUT_SHARE = 0.35            # of the line's length: ... and never further than this
+END_IN_SHARE = 0.3              # of the line's length: the most an end comes back
+END_LEVEL = 0.5                 # of the line's own median edge strength: a sample this strong is on its edge
+END_MIN_LEVEL = 0.2             # ... and at least this outright; a line with less has no edge to follow
+END_GAP_PX = 6.0                # a weaker stretch this short does not stop an end going out
+END_MIN_MOVE_PX = 2.0
+# Filters (filter_lines): an "unknown" line shorter than this share of the roof extent is dropped.
+# On 17 annotated photos the short unknowns (0.03-0.07) were all false, the long ones (0.11+) true.
+UNKNOWN_MIN_L = 0.08
 # Plane filter: a V3 line is a neighbour's when this much of it lies on excluded planes and
 # almost none on the house's, both judged within a tolerance, never pixel-exact.
 PLANE_TOLERANCE_L = 0.01
@@ -60,6 +76,10 @@ PLANE_KEPT_SHARE = 0.25
 # ... and only when this little of it lies within the house's columns: vertically in line with the
 # kept roofs is the same house, only a line beside them can be a neighbour's.
 PLANE_WITHIN_HOUSE_SHARE = 0.5
+# A roof the salesperson tapped out of the house takes its lines with it, gutters included: a line
+# whose median distance to that roof is within this reach (of the roof extent) and clearly nearer
+# it than to the house's roofs. The house-width rule above never brings such a line back.
+TAPPED_OUT_REACH_L = 0.03
 # Corners: reach, the least angle two lines need to make a corner, and how much a line may shrink.
 CORNER_REACH_L = 0.012
 CORNER_MIN_ANGLE_DEG = 15.0
@@ -87,7 +107,8 @@ class V3Outcome:
     error: str | None = None
     meta: dict = field(default_factory=dict)
     # Where the crop came from: "target_house(_sky)", "whole_photo" (SAM found no roof planes),
-    # "find_in_box", or "missed_plane_<n>" for a second call on a plane the first one missed.
+    # "find_in_box", or "missed_plane_<n>" / "missed_top_<n>" for a second call on a plane the first
+    # one missed, wholly or at its top.
     crop_basis: str | None = None
     # Second calls on planes this call missed (V3_MISSED_PLANES), each with its own crop.
     extra: list["V3Outcome"] = field(default_factory=list)
@@ -119,12 +140,15 @@ def cache_dir(settings) -> Path | None:
     return Path(settings.storage_dir) / "v3_cache" if settings.v3_cache else None
 
 
-def run_v3(image: Image.Image, crop: CropBox, settings, crop_basis: str = "target_house") -> V3Outcome:
-    """V3 on one crop of the photo. Never raises: a failure is returned as a status."""
+def run_v3(image: Image.Image, crop: CropBox, settings, crop_basis: str = "target_house",
+           house: CropBox | None = None) -> V3Outcome:
+    """V3 on one crop of the photo, told which house to draw (`house`, photo pixels; None: the
+    house the crop shows). Never raises: a failure is returned as a status."""
     if not settings.openrouter_api_key.strip():
         return V3Outcome("failed", crop, error="OPENROUTER_API_KEY is not set on the API server", crop_basis=crop_basis)
     try:
-        lines, meta = roofline_v3.detect_crop(image, crop.as_list(), settings, cache_dir(settings))
+        lines, meta = roofline_v3.detect_crop(image, crop.as_list(), settings, cache_dir(settings),
+                                              house=house.as_list() if house is not None else None)
     except RuntimeError as exc:
         # The provider's messages carry no response body or key (see roofline_v3.detect).
         log.warning("V3 unavailable, falling back to partition: %s", exc)
@@ -157,42 +181,74 @@ def plane_coverage(plane: np.ndarray, lines: list[RoofLine], blockers: np.ndarra
     return float((outline & drawn.astype(bool)).sum()) / total
 
 
+def top_coverage(plane: np.ndarray, lines: list[RoofLine], blockers: np.ndarray | None, reach: float) -> float | None:
+    """Share of a plane's top outline lying within `reach` px of any of the lines, or None when
+    none of it is visible. The top outline is the plane's highest pixel in each of its columns,
+    leaving out the columns where an object covers it or the photo's top edge cuts it: where the
+    plane's ridge, hips, rakes or wall junction run."""
+    columns = np.flatnonzero(plane.any(axis=0))
+    if not columns.size:
+        return None
+    rows = plane[:, columns].argmax(axis=0)
+    visible = rows > 0
+    if blockers is not None:
+        visible &= ~blockers[rows, columns]
+    if not visible.any():
+        return None
+    drawn = np.zeros(plane.shape, np.uint8)
+    thickness = max(1, int(round(2 * reach + 1)))
+    for line in lines:
+        points = np.rint(np.asarray(line.points, float)).astype(np.int32)
+        cv2.polylines(drawn, [points.reshape(-1, 1, 2)], False, 1, thickness)
+    return float(drawn[rows[visible], columns[visible]].mean())
+
+
 def run_missed_planes(image: Image.Image, v3: V3Outcome, roof_masks: list[np.ndarray], keep: list[bool] | None,
-                      blockers: np.ndarray | None, sky: np.ndarray | None, settings) -> dict:
+                      blockers: np.ndarray | None, sky: np.ndarray | None, settings,
+                      house: CropBox | None = None) -> dict:
     """Ask V3 again, once per target-house plane its first answer missed (V3_MISSED_PLANES).
 
     A plane is missed when under V3_MISSED_COVERAGE of its visible outline lies near any line of
-    the first answer. Planes under V3_MISSED_MIN_AREA of the house's roof area are ignored; the
-    rest are taken largest first, each on its own crop (the plane's box, V3_MISSED_PADDING, sky-
-    bounded top, at least MISSED_MIN_CROP_PX), skipping one whose crop is already mostly inside an
-    earlier second call's, up to V3_MISSED_MAX_CALLS calls. Each call is cached and
-    never raises. The answers go on `v3.extra`; the return value is the run's record.
+    the first answer, or missed at the top when under V3_MISSED_TOP_COVERAGE of its top outline
+    does (its ridge or hips were not drawn). Planes under V3_MISSED_MIN_AREA of the house's roof
+    area are ignored; wholly missed planes come first, largest first, then those missed at the top,
+    most undrawn top first. Each gets its own crop (the plane's box, V3_MISSED_PADDING, sky-bounded
+    top, at least MISSED_MIN_CROP_PX), skipping one whose crop is already mostly inside an earlier
+    second call's, up to V3_MISSED_MAX_CALLS calls. Each call is told the same target house
+    (`house`), is cached and never raises. The answers go on `v3.extra`; the return value is the
+    run's record.
     """
     report: dict = {"checked": 0, "missed": [], "calls": []}
     if not v3.usable or not roof_masks:
         return report
     size = image.size
     flags = keep if keep is not None else [True] * len(roof_masks)
-    house = [i for i, (mask, k) in enumerate(zip(roof_masks, flags)) if k and mask.any()]
-    if not house:
+    planes = [i for i, (mask, k) in enumerate(zip(roof_masks, flags)) if k and mask.any()]
+    if not planes:
         return report
-    extent = partition.roof_extent([roof_masks[i] for i in house])
+    extent = partition.roof_extent([roof_masks[i] for i in planes])
     reach = max(6.0, PLANE_TOLERANCE_L * extent)
     first = [line for i, raw in enumerate(v3.raw_lines, 1)
              if (line := normalize_v3_line(raw, i, v3.crop, size)) is not None]
-    house_area = float(sum(roof_masks[i].sum() for i in house))
-    candidates = []
-    for index in house:
+    house_area = float(sum(roof_masks[i].sum() for i in planes))
+    candidates, tops = [], []
+    for index in planes:
         plane = roof_masks[index].astype(bool)
         report["checked"] += 1
         if float(plane.sum()) < settings.v3_missed_min_area * house_area:
             continue
         coverage = plane_coverage(plane, first, blockers, reach)
         if coverage is not None and coverage < settings.v3_missed_coverage:
-            candidates.append((float(plane.sum()), index, coverage))
+            candidates.append((float(plane.sum()), index, coverage, "plane"))
+            continue
+        top = top_coverage(plane, first, blockers, reach) if settings.v3_missed_top_coverage > 0 else None
+        if top is not None and top < settings.v3_missed_top_coverage:
+            undrawn = (1.0 - top) * float(np.flatnonzero(plane.any(axis=0)).size)
+            tops.append((undrawn, index, top, "top"))
     done: list[CropBox] = []
-    for area, index, coverage in sorted(candidates, reverse=True):
-        entry = {"plane": index, "coverage": round(coverage, 3), "area": int(area)}
+    for _, index, coverage, why in sorted(candidates, reverse=True) + sorted(tops, reverse=True):
+        area = float(roof_masks[index].sum())
+        entry = {"plane": index, "coverage": round(coverage, 3), "area": int(area), "missed": why}
         report["missed"].append(entry)
         if len(v3.extra) >= settings.v3_missed_max_calls:
             entry["skipped"] = "max_calls"
@@ -203,7 +259,7 @@ def run_missed_planes(image: Image.Image, v3: V3Outcome, roof_masks: list[np.nda
         if any(overlap_share(crop, earlier) >= MISSED_INSIDE_SHARE for earlier in done):
             entry["skipped"] = "inside_earlier_crop"
             continue
-        call = run_v3(image, crop, settings, crop_basis=f"missed_plane_{index}")
+        call = run_v3(image, crop, settings, crop_basis=f"missed_{why}_{index}", house=house)
         done.append(crop)
         v3.extra.append(call)
         entry["call"] = len(v3.extra)
@@ -221,13 +277,16 @@ class Context:
     """The photo, its planes and blockers, and the maps geometry and confidence read, lazily."""
 
     def __init__(self, image: Image.Image, settings, roof_masks: list[np.ndarray], keep: list[bool] | None,
-                 blockers: np.ndarray | None, vp_region: np.ndarray | None = None, crop: CropBox | None = None):
+                 blockers: np.ndarray | None, vp_region: np.ndarray | None = None, crop: CropBox | None = None,
+                 tapped_out: list[bool] | None = None):
         self.image = image
         self.settings = settings
         self.size = image.size
         self.width, self.height = image.size
         self.roof_masks = [m.astype(bool) for m in roof_masks]
         self.keep = keep
+        # Planes the salesperson took out of the house with the House tool (None: none were).
+        self.tapped_out = tapped_out
         self.blockers = blockers
         self.vp_region = vp_region
         self.crop = crop
@@ -280,6 +339,14 @@ class Context:
 
     def excluded_distance(self) -> np.ndarray | None:
         return self._distance("excluded", self.plane_masks(False))
+
+    def tapped_out_distance(self) -> np.ndarray | None:
+        """Distance to the planes the salesperson tapped out of the house, or None."""
+        if "tapped_out" not in self._maps:
+            flags = self.tapped_out or []
+            chosen = [m for m, out in zip(self.roof_masks, flags) if out and m.any()]
+            return self._distance("tapped_out", np.logical_or.reduce(chosen) if chosen else None)
+        return self._maps["tapped_out"]
 
     def cut_excluded_distance(self) -> np.ndarray | None:
         """Distance to the excluded planes the photo's left or right edge cuts off: neighbours, by
@@ -443,6 +510,91 @@ def snap_line(line: RoofLine, ctx: Context) -> RoofLine:
     return line
 
 
+# -- geometry: ends ------------------------------------------------------------------------------
+
+
+def refine_ends(line: RoofLine, ctx: Context) -> RoofLine:
+    """Slide each end of a V3 line along the line to where the photo's edge under it starts or stops.
+
+    The line's own edge strength (the median across its visible length) sets what "on the edge"
+    means. Out: an end goes on over samples that are still on the edge (gaps up to END_GAP_PX),
+    up to END_OUT_L of the roof's extent and END_OUT_SHARE of the line, never onto an object and
+    never off the roof. Back: an end with no edge under it comes back to the first sample that is
+    on it, at most END_IN_SHARE of the line, never through an object (a stretch behind one is
+    occlusion's business). A line with too little edge under it keeps its ends. The direction and
+    type never change; corners are closed later (close_corners).
+    """
+    if len(line.points) != 2 or line.length < SNAP_MIN_LENGTH:
+        line.evidence["ends"] = {"reason": "too_short"}
+        return line
+    a, b = np.asarray(line.points[0], float), np.asarray(line.points[1], float)
+    length = float(np.linalg.norm(b - a))
+    along = (b - a) / length
+    out = min(END_OUT_SHARE * length, END_OUT_L * ctx.extent)
+    start, stop = a - along * out, b + along * out
+    offsets = np.arange(-EDGE_BAND_PX, EDGE_BAND_PX + 0.25, 0.5)
+    values, t, _ = _across(ctx, start, stop, offsets)
+    strength = np.minimum(1.0, values.max(axis=1) / ctx.gradients[2])
+    strength = np.convolve(np.pad(strength, 1, mode="edge"), np.ones(3) / 3, mode="valid")
+    s = t * (length + 2 * out) - out                      # px along the line from its first end
+    points = start[None, :] + t[:, None] * (stop - start)[None, :]
+    blocked = ctx.lookup(ctx.blockers, points).astype(bool) if ctx.blockers is not None else np.zeros(len(s), bool)
+    roof_distance = ctx.roof_distance()
+    tolerance = max(6.0, PLANE_TOLERANCE_L * ctx.extent)
+    on_roof = ctx.lookup(roof_distance, points) <= tolerance if roof_distance is not None else np.ones(len(s), bool)
+    inside = (s >= 0) & (s <= length) & ~blocked
+    level = float(np.median(strength[inside])) if inside.any() else 0.0
+    if level < END_MIN_LEVEL:
+        line.evidence["ends"] = {"reason": "no_edge", "level": round(level, 3)}
+        return line
+    on = strength >= max(END_MIN_LEVEL, END_LEVEL * level)
+
+    def outward(order) -> int | None:
+        reached, gap = None, 0.0
+        for i in order:
+            if blocked[i] or not on_roof[i]:
+                break
+            if on[i]:
+                reached, gap = i, 0.0
+            else:
+                gap += SAMPLE_STEP
+                if gap > END_GAP_PX:
+                    break
+        return reached
+
+    def inward(order) -> int | None:
+        for i in order:
+            if blocked[i]:
+                return None
+            if on[i]:
+                return i
+        return None
+
+    moves = []
+    for index, end_s in ((0, 0.0), (1, length)):
+        if index == 0:
+            beyond = np.flatnonzero(s < 0)[::-1]
+            within = np.flatnonzero((s >= 0) & (s <= END_IN_SHARE * length))
+        else:
+            beyond = np.flatnonzero(s > length)
+            within = np.flatnonzero((s <= length) & (s >= (1 - END_IN_SHARE) * length))[::-1]
+        found = outward(beyond)
+        if found is not None and abs(s[found] - end_s) >= END_MIN_MOVE_PX:
+            moves.append({"to": float(s[found]), "way": "out"})
+            continue
+        found = inward(within)
+        if found is not None and abs(s[found] - end_s) >= END_MIN_MOVE_PX:
+            moves.append({"to": float(s[found]), "way": "back"})
+        else:
+            moves.append({"to": end_s, "way": "kept"})
+    line.evidence["ends"] = {"level": round(level, 3),
+                             "moved": [round(abs(m["to"] - e), 1) for m, e in zip(moves, (0.0, length))],
+                             "way": [m["way"] for m in moves]}
+    if any(m["way"] != "kept" for m in moves):
+        line.points = [(a + along * moves[0]["to"]).tolist(), (a + along * moves[1]["to"]).tolist()]
+    return line
+
+
 # -- geometry: vanishing points and facades (metadata only) ---------------------------------------
 
 
@@ -553,8 +705,18 @@ def plane_filter(line: RoofLine, ctx: Context) -> bool:
         return True
     tolerance = max(6.0, PLANE_TOLERANCE_L * ctx.extent)
     coords = ctx.samples(line)
-    on_excluded = float(np.mean(ctx.lookup(excluded, coords) <= tolerance))
     to_kept = ctx.lookup(kept, coords) if kept is not None else np.full(len(coords), np.inf)
+    tapped = ctx.tapped_out_distance()
+    if tapped is not None:
+        # The salesperson's own choice: the nearest roof decides, not the tolerant rules below.
+        # A line the house shares with that roof (both near) stays with the house.
+        near_out, near_kept = float(np.median(ctx.lookup(tapped, coords))), float(np.median(to_kept))
+        if near_out <= max(tolerance, TAPPED_OUT_REACH_L * ctx.extent) and near_out + tolerance < near_kept:
+            line.plane_status = "rejected:tapped_out_plane"
+            line.evidence["plane"] = {"to_tapped_out": round(near_out, 1),
+                                      "distance_to_mask": round(near_kept, 1) if np.isfinite(near_kept) else None}
+            return False
+    on_excluded = float(np.mean(ctx.lookup(excluded, coords) <= tolerance))
     on_kept = float(np.mean(to_kept <= tolerance))
     line.evidence["plane"] = {"on_excluded": round(on_excluded, 3), "on_kept": round(on_kept, 3),
                               "distance_to_mask": round(float(np.median(to_kept)), 1) if np.isfinite(to_kept).any() else None}
@@ -710,6 +872,55 @@ def dedupe_against(candidates: list[RoofLine], existing: list[RoofLine], ctx: Co
         if not repeats:
             kept.append(line)
     return kept
+
+
+def filter_lines(lines: list[RoofLine], ctx: Context) -> tuple[list[RoofLine], dict[str, str]]:
+    """V3's lines without the ones with no edge under them, and without the short "unknown" ones.
+
+    A line whose visible part shows less edge than V3_MIN_EDGE_SUPPORT is not on an edge the photo
+    shows (a line wholly behind objects has no say and stays). An "unknown" line, which V3 itself
+    could not type, shorter than UNKNOWN_MIN_L of the roof extent is a fragment. Returns the lines
+    kept and, per dropped line, why.
+    """
+    minimum = ctx.settings.v3_min_edge_support
+    kept, dropped = [], {}
+    for line in lines:
+        support = _edge_support(line, ctx) if minimum > 0 else None
+        line.evidence["edge_support"] = round(support, 3) if support is not None else None
+        if support is not None and support < minimum:
+            dropped[line.source_id] = "weak_edge"
+        elif line.line_type == "unknown" and line.length < UNKNOWN_MIN_L * ctx.extent:
+            dropped[line.source_id] = "short_unknown"
+        else:
+            kept.append(line)
+    return kept, dropped
+
+
+def dedupe_within(lines: list[RoofLine], ctx: Context) -> tuple[list[RoofLine], dict[str, str]]:
+    """One line per edge within one answer: of two lines along the same edge (roofline_match_*),
+    the one with less edge under it goes (the shorter, when equal). Returns the lines kept and, per
+    dropped line, the line it repeated."""
+    limit = max(5.0, ctx.settings.roofline_match_distance * ctx.extent)
+    support = {id(line): line.evidence.get("edge_support") for line in lines}
+    for line in lines:
+        if support[id(line)] is None:
+            support[id(line)] = _edge_support(line, ctx) or 0.0
+    order = sorted(lines, key=lambda l: (support[id(l)], l.length), reverse=True)
+    kept, dropped = [], {}
+    for line in order:
+        for other in kept:
+            if not _types_compatible(line.line_type, other.line_type):
+                continue
+            r = relation(line, other)
+            if (r["angle"] <= ctx.settings.roofline_match_angle_deg and r["distance"] <= limit
+                    and r["overlap"] >= ctx.settings.roofline_match_overlap):
+                dropped[line.source_id] = other.source_id
+                line.evidence["duplicate_of"] = other.source_id
+                break
+        else:
+            kept.append(line)
+    survivors = {id(line) for line in kept}
+    return [line for line in lines if id(line) in survivors], dropped
 
 
 # -- occlusion on the source's lines ---------------------------------------------------------------------
@@ -885,12 +1096,13 @@ class Recorder:
     """Counts for every run; with ROOFLINE_DEBUG, every stage's lines and each V3 line's lifecycle.
 
     The lifecycle answers "was this line wrong when V3 produced it, or did a stage make it
-    wrong?": A raw V3 -> B coordinates -> C snap -> D vanishing points -> E plane filter ->
-    F corners -> H occlusion -> I final. P holds partition's lines when partition is the source.
+    wrong?": A raw V3 -> B coordinates -> C snap -> C2 ends -> D vanishing points -> E plane
+    filter -> E2 weak-edge and short-unknown filter -> E3 duplicates -> F corners -> H occlusion
+    -> I final. P holds partition's lines when partition is the source.
     """
 
-    STAGES = ("A_raw_v3", "B_converted", "C_snapped", "D_vp", "E_plane_filter", "F_corners",
-              "H_occlusion", "P_partition", "I_final")
+    STAGES = ("A_raw_v3", "B_converted", "C_snapped", "C2_ends", "D_vp", "E_plane_filter", "E2_filtered",
+              "E3_deduped", "F_corners", "H_occlusion", "P_partition", "I_final")
 
     def __init__(self, enabled: bool):
         self.enabled = enabled
@@ -937,8 +1149,9 @@ PartitionLines = Callable[[object], tuple[list[tuple], list[tuple], dict]]
 
 
 def refine_v3(outcome: V3Outcome, ctx: Context, recorder: Recorder, *, filter_planes: bool = True) -> list[RoofLine]:
-    """Stages A-F for V3's lines: normalise into photo pixels, snap, vanishing points, plane
-    filter, corners. Each stage is recorded; a line's raw answer is never lost."""
+    """Stages A-F for V3's lines: normalise into photo pixels, snap, ends, vanishing points, plane
+    filter, weak-edge filter, duplicates, corners. Each stage is recorded; a line's raw answer is
+    never lost."""
     counts = recorder.counts.setdefault("v3", {})
     calls = [(prefix, call) for prefix, call in outcome.calls() if call.usable]
     counts["raw_lines"] = sum(len(call.raw_lines) for _, call in calls)
@@ -981,6 +1194,14 @@ def refine_v3(outcome: V3Outcome, ctx: Context, recorder: Recorder, *, filter_pl
     counts["snapped"] = sum(1 for l in lines if l.snapped)
     recorder.stage("C_snapped", lines)
 
+    if ctx.settings.v3_refine_ends:
+        for line in lines:
+            refine_ends(line, ctx)
+            ends = line.evidence.get("ends") or {}
+            recorder.note(line.source_id, ends_way=ends.get("way"), ends_moved=ends.get("moved"))
+        counts["ends_moved"] = sum(1 for l in lines if any(w != "kept" for w in (l.evidence.get("ends") or {}).get("way") or []))
+        recorder.stage("C2_ends", lines)
+
     for line in lines:
         assign_vanishing_point(line, ctx)
     assign_facade_by_adjacency(lines, ctx)
@@ -1004,6 +1225,20 @@ def refine_v3(outcome: V3Outcome, ctx: Context, recorder: Recorder, *, filter_pl
     counts["rejected_excluded_plane"] = len(lines) - len(kept)
     recorder.stage("E_plane_filter", kept)
 
+    kept, dropped = filter_lines(kept, ctx)
+    for line_id, why in dropped.items():
+        recorder.note(line_id, final=False, dropped_at=f"E2_{why}")
+    counts["dropped_weak_edge"] = sum(1 for why in dropped.values() if why == "weak_edge")
+    counts["dropped_short_unknown"] = sum(1 for why in dropped.values() if why == "short_unknown")
+    recorder.stage("E2_filtered", kept)
+
+    if ctx.settings.v3_dedupe:
+        kept, repeats = dedupe_within(kept, ctx)
+        for line_id, other in repeats.items():
+            recorder.note(line_id, final=False, dropped_at="E3_duplicate", duplicate_of=other)
+        counts["dropped_duplicates"] = len(repeats)
+        recorder.stage("E3_deduped", kept)
+
     counts["corners_closed"] = close_corners(kept, ctx)
     recorder.stage("F_corners", kept)
     return kept
@@ -1021,6 +1256,7 @@ def unify(
     v3: V3Outcome | None,
     vp_region: np.ndarray | None = None,
     crop: CropBox | None = None,
+    tapped_out: list[bool] | None = None,
 ) -> Result:
     """The roof lines for one detection (or a House tap re-running it without V3 calls).
 
@@ -1029,11 +1265,12 @@ def unify(
     never extra lines. `keep` is the target house's plane selection (None: every plane counts);
     `partition_lines(parsed) -> (spans, unrequested, details)` runs the partition geometry, already
     restricted to the house when TARGET_HOUSE_ONLY is on, and is only called when partition is the
-    source; `v3` is V3's outcome for the crop, or None when V3 is not a source.
+    source; `v3` is V3's outcome for the crop, or None when V3 is not a source. `tapped_out` flags
+    the planes the salesperson took out with the House tool: their lines go, gutters included.
     """
     sources = list(settings.roofline_sources)
     recorder = Recorder(settings.roofline_debug)
-    ctx = Context(image, settings, roof_masks, keep, blockers, vp_region=vp_region, crop=crop)
+    ctx = Context(image, settings, roof_masks, keep, blockers, vp_region=vp_region, crop=crop, tapped_out=tapped_out)
     recorder.counts["sam"] = {"roof_masks": len(roof_masks), "blockers": bool(blockers is not None and blockers.any())}
     recorder.counts["target_house"] = {"planes": int(sum(keep)) if keep is not None else len(roof_masks),
                                        "of": len(roof_masks), "crop": crop.as_list() if crop else None,

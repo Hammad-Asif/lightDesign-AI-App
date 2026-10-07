@@ -84,8 +84,12 @@ interface Guide {
 const GUIDES: Partial<Record<Tool, Guide>> = {
   select: {
     title: "Select",
-    line: "Pick a line or an area to see and change it.",
-    steps: ["Click a line or an area on the photo.", "Its details open in the list on the right.", "Press S to come back to this tool."],
+    line: "Pick something already on the photo to see and change it.",
+    steps: [
+      "Click a line or an area: its details open in the list on the right.",
+      "Tap the roof itself to select the whole house; tap empty space to clear.",
+      "Press Delete to remove the picked line or area. S comes back to this tool.",
+    ],
     scene: (
       <House>
         <line x1="55" y1="95" x2="305" y2="95" stroke={ACCENT} strokeWidth="4" opacity="1">
@@ -153,27 +157,14 @@ const GUIDES: Partial<Record<Tool, Guide>> = {
       </House>
     ),
   },
-  box: {
-    title: "Box",
-    line: "Find an object by drawing a box around it.",
-    steps: ["Drag a box around the object, such as a hedge.", "It is found and outlined inside the box.", "Correct the result with Brush and Erase."],
-    scene: (
-      <House>
-        <rect x="24" y="158" width="84" height="36" fill="none" stroke={ACCENT} strokeWidth="2" strokeDasharray="6 4">
-          <Animate attributeName="width" values="0;84;84;84" keyTimes="0;0.45;0.5;1" />
-          <Animate attributeName="height" values="0;36;36;36" keyTimes="0;0.45;0.5;1" />
-        </rect>
-        <rect x="30" y="166" width="72" height="22" rx="10" fill={ACCENT} opacity="0.45">
-          <Animate attributeName="opacity" values="0;0;0.45;0.45" keyTimes="0;0.5;0.6;1" />
-        </rect>
-        <Cursor at="108,194" path="24,158; 108,194; 108,194; 108,194" />
-      </House>
-    ),
-  },
   click: {
-    title: "Click object",
-    line: "Click an object and it is outlined for you.",
-    steps: ["Click once on the object, such as a hedge.", "It is found and outlined.", "Alt-click an outline to remove it."],
+    title: "Add object",
+    line: "Add something new from the photo: tap it and it is outlined for you.",
+    steps: [
+      "Tap once on something not outlined yet, such as a hedge.",
+      "It is found and outlined as a new area. (To pick something already there, use Select.)",
+      "Alt-click an outline to remove it.",
+    ],
     scene: (
       <House>
         <rect x="30" y="166" width="72" height="22" rx="10" fill={ACCENT} opacity="0.45" stroke={ACCENT} strokeWidth="2">
@@ -184,7 +175,7 @@ const GUIDES: Partial<Record<Tool, Guide>> = {
     ),
   },
   find: {
-    title: "Find in box",
+    title: "Find lines",
     line: "Find roof lines that detection missed.",
     steps: ["Drag a box where a roof edge has no line.", "The lines inside the box are found and added.", "Nothing already on the photo changes."],
     scene: (

@@ -1175,8 +1175,8 @@ try:
     check("flag off: detect responds", client.post(f"/photos/{house}/detect", json={}).status_code == 200)
     off_detail, off_roof, off_masks = house_now(house)
     check("flag off: the neighbour's roof gets lines, as before", any(on_neighbour(line) for line in off_roof))
-    check("flag off: no planes are stored and a tap has nothing to move",
-          not off_detail["interpreted"].get("target") and tap([450, 200]).status_code == 409)
+    check("flag off: the planes are stored, every one on the house (the House tool can start from them)",
+          [plane["keep"] for plane in off_detail["interpreted"]["target"]["planes"]] == [True, True])
 
     settings.target_house_only = True
     check("flag on: detect responds", client.post(f"/photos/{house}/detect", json={}).status_code == 200)
